@@ -88,14 +88,27 @@ pub fn block(project: Option<&str>, roles: &Roles, notes: Option<&str>) -> Strin
     b
 }
 
+/// Join codes are credentials: refuse to write anything that contains one.
+pub fn check_no_secrets(fields: &[&str]) -> Result<()> {
+    if fields.iter().any(|f| f.contains("AGENTLAN1-")) {
+        bail!("refusing to write a join code into project files (they're shared and committed); leave it out of roles and notes");
+    }
+    Ok(())
+}
+
 /// Insert or replace the AgentLAN block in each file. Returns (file, outcome).
 pub fn write(root: &Path, files: &[String], block: &str) -> Result<Vec<(String, &'static str)>> {
+    check_no_secrets(&[block])?;
     let mut out = vec![];
     for f in files {
         if !FILES.contains(&f.as_str()) {
             bail!("setup only writes {} (got '{f}')", FILES.join(" or "));
         }
         let path = root.join(f);
+        // Never follow a link (it could point outside the project).
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file()) {
+            bail!("{} is not a regular file (symlink?); not touching it", path.display());
+        }
         let cur = match std::fs::read_to_string(&path) {
             Ok(s) => Some(s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -124,13 +137,31 @@ pub fn write(root: &Path, files: &[String], block: &str) -> Result<Vec<(String, 
             },
         };
         if what != "unchanged" {
-            let tmp = path.with_extension("md.agentlan-tmp");
-            std::fs::write(&tmp, &next)?;
-            std::fs::rename(&tmp, &path)?;
+            // A fresh, exclusive temp file (create_new fails on any existing path,
+            // including a planted symlink), then an atomic rename over the target.
+            use std::io::Write;
+            let tmp = root.join(format!(".{f}.agentlan-{}-{:x}.tmp", std::process::id(), rand_suffix()));
+            let mut fh = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            if let Err(e) = fh.write_all(next.as_bytes()).and_then(|_| fh.sync_all()) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            drop(fh);
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
         }
         out.push((f.clone(), what));
     }
     Ok(out)
+}
+
+fn rand_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.finish()
 }
 
 #[cfg(test)]
@@ -155,6 +186,15 @@ mod tests {
         assert_eq!(s.matches(BEGIN).count(), 1);
         assert!(!s.contains("API and DB"));
         assert!(write(&dir, &["../evil.md".into()], &b2).is_err());
+        assert!(check_no_secrets(&["see AGENTLAN1-eyJ..."]).is_err());
+        #[cfg(unix)]
+        {
+            let outside = dir.join("outside.txt");
+            std::fs::write(&outside, "keep").unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("AGENTS.md")).unwrap();
+            assert!(write(&dir, &["AGENTS.md".into()], &b2).is_err(), "symlinked target refused");
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

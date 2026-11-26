@@ -244,7 +244,9 @@ enum HooksCmd {
     Print {
         /// claude
         runner: String,
-        #[arg(long)]
+        /// A pre-made profile, or `auto` (default): the identity this Claude session
+        /// registered through the MCP tools, else the profile matching the repository.
+        #[arg(long, default_value = "auto")]
         agent: String,
     },
 }
@@ -404,8 +406,13 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 let node_home = home.to_path_buf();
                 let node_task = tokio::spawn(async move { agentlan_node::run(&node_home).await });
                 tokio::select! {
-                    r = hub_task => r??,
-                    r = node_task => r??,
+                    r = &mut hub_task => r??,
+                    r = node_task => {
+                        r??;
+                        // `agentlan node stop` stopped only the node; keep serving the others.
+                        println!("(this PC's node stopped; the server keeps running)");
+                        hub_task.await??;
+                    }
                 }
             }
         }

@@ -97,6 +97,8 @@ struct Session {
     fence: Option<u64>,
     /// Process hosting the adapter (e.g. a Claude Code session); hooks look identities up by it.
     host_pid: Option<u32>,
+    /// The adapter (or other client) process that holds this session.
+    client_pid: Option<u32>,
 }
 
 struct Conn {
@@ -241,7 +243,7 @@ impl NodeState {
         })
     }
 
-    pub fn run(mut self, mut rx: mpsc::UnboundedReceiver<NCmd>) {
+    pub fn run(mut self, mut rx: mpsc::UnboundedReceiver<NCmd>, stop: tokio::sync::oneshot::Sender<()>) {
         while let Some(c) = rx.blocking_recv() {
             if let Err(e) = self.handle(c) {
                 warn!("node: command failed: {e:#}");
@@ -249,9 +251,10 @@ impl NodeState {
             if self.stopping {
                 info!("node: stopping (requested over IPC)");
                 // Every write is its own transaction, so nothing is half-done here; give the
-                // IPC writer a moment to deliver the reply, then exit the process.
+                // IPC writer a moment to deliver the reply, then end the node's tasks.
                 std::thread::sleep(Duration::from_millis(200));
-                std::process::exit(0);
+                let _ = stop.send(());
+                return;
             }
         }
     }
@@ -1043,11 +1046,23 @@ impl NodeState {
                 let p = match agent {
                     Some(a) => self.agent_for(conn, Some(&a))?,
                     None => {
-                        // The identity registered from the nearest host process (earliest
-                        // registration wins when a session also registered subagents).
-                        let hit = host_pids
-                            .iter()
-                            .find_map(|hp| self.sessions.iter().filter(|(_, s)| s.host_pid == Some(*hp)).min_by_key(|(_, s)| s.since).map(|(a, _)| a.clone()));
+                        // The identity registered from the nearest host process. Subagents of
+                        // one session share its adapter: the earliest registration is the main
+                        // agent. If several adapters share that host (one process hosting several
+                        // sessions), we can't tell which is ours: report nothing.
+                        let mut hit = None;
+                        for hp in &host_pids {
+                            let m: Vec<(&String, &Session)> = self.sessions.iter().filter(|(_, s)| s.host_pid == Some(*hp)).collect();
+                            if m.is_empty() {
+                                continue;
+                            }
+                            let adapters: HashSet<Option<u32>> = m.iter().map(|(_, s)| s.client_pid).collect();
+                            if adapters.len() > 1 {
+                                return Err(IpcErr("AMBIGUOUS_IDENTITY", "several AgentLAN sessions share this host process".into()));
+                            }
+                            hit = m.iter().min_by_key(|(_, s)| s.since).map(|(a, _)| (*a).clone());
+                            break;
+                        }
                         let a = hit.ok_or(IpcErr("NOT_REGISTERED", "no AgentLAN identity is registered from this session".into()))?;
                         self.agent_for(conn, Some(&a))?
                     }
@@ -1137,7 +1152,7 @@ impl NodeState {
             self.push(old, "session", json!({"status": "ended", "reason": "takeover"}));
         }
         let sid = agentlan_proto::ids::session_id();
-        self.sessions.insert(p.agent_id.clone(), Session { session_id: sid.clone(), conn, since: now(), fence: None, host_pid });
+        self.sessions.insert(p.agent_id.clone(), Session { session_id: sid.clone(), conn, since: now(), fence: None, host_pid, client_pid: pid });
         if let Some(c) = self.conns.get_mut(&conn) {
             c.attached = Some(p.agent_id.clone());
         }
@@ -1177,8 +1192,8 @@ impl NodeState {
     ) -> R<Value> {
         use agentlan_proto::ids::normalize_name;
         let role = normalize_name(&role);
-        if role.is_empty() || role.len() > 40 {
-            return Err(IpcErr("INVALID", "role must be 1-40 letters, digits or dashes (e.g. \"backend\", \"reviewer\")".into()));
+        if role.is_empty() || role.len() > 32 {
+            return Err(IpcErr("INVALID", "role must be 1-32 letters, digits or dashes (e.g. \"backend\", \"reviewer\")".into()));
         }
         let explicit = match name.as_deref().map(normalize_name) {
             Some(n) if n.is_empty() || n.len() > 40 => {
@@ -1223,44 +1238,44 @@ impl NodeState {
             }));
         }
 
-        // Pick a name: the requested one, else the role, then role-2, role-3, …
+        // Pick a name and write the profile in one locked step, so a concurrent
+        // `agent add` (e.g. a worker profile with the same name) can't slip in between.
+        // Requested name: reuse that offline interactive profile (keeps its recorded id).
+        // No name: the role, then role-2, role-3, … reusing an offline profile only when
+        // it's for the same project (never another project's identity by accident).
+        let live: HashSet<String> = self.sessions.keys().cloned().collect();
         let base = explicit.clone().unwrap_or_else(|| role.clone());
-        let mut chosen = None;
-        for i in 1..=99 {
-            let cand = if i == 1 { base.clone() } else { format!("{base}-{i}") };
-            match self.profiles.iter().find(|p| p.name == cand) {
-                None => {
-                    chosen = Some(cand);
-                    break;
-                }
-                // Worker/script profiles are set up by the user; agents can't claim them.
-                Some(p) if p.mode != AgentMode::Interactive => {
-                    if explicit.is_some() {
-                        return Err(IpcErr(
-                            "RESERVED",
-                            format!("'{cand}' is a {:?} profile set up by the user on this PC; choose another name", p.mode).to_lowercase(),
-                        ));
-                    }
-                }
-                Some(p) if self.sessions.contains_key(&p.agent_id) => {
-                    if explicit.is_some() {
-                        return Err(IpcErr(
-                            "AGENT_BUSY",
-                            format!("'{cand}' is in use by another live session; choose another name (e.g. {cand}-2) or omit name"),
-                        ));
-                    }
-                }
-                Some(_) => {
-                    chosen = Some(cand);
-                    break;
-                }
-            }
-        }
-        let name = chosen.ok_or(IpcErr("AGENT_BUSY", format!("too many live sessions named {base}-…")))?;
-        let created = !self.profiles.iter().any(|p| p.name == name);
+        let stem: String = base.chars().take(36).collect();
         let r2 = runner.clone();
-        let p = self.save_profile(|pf| {
-            if let Some(a) = pf.agents.iter_mut().find(|a| a.name == name) {
+        let picked = crate::update_profiles(&self.home, |pf| {
+            for i in 1..=99 {
+                let cand = if i == 1 { base.clone() } else { format!("{stem}-{i}") };
+                let Some(a) = pf.agents.iter_mut().find(|a| a.name == cand) else {
+                    let p = AgentProfile {
+                        agent_id: agentlan_proto::ids::agent_id(),
+                        name: cand,
+                        role,
+                        project,
+                        runner: r2,
+                        mode: AgentMode::Interactive,
+                        capabilities: vec![],
+                        description,
+                    };
+                    pf.agents.push(p.clone());
+                    return Ok(Ok((p, true)));
+                };
+                let busy = live.contains(&a.agent_id);
+                if explicit.is_some() {
+                    // Worker/script profiles are set up by the user; agents can't claim them.
+                    if a.mode != AgentMode::Interactive {
+                        return Ok(Err(IpcErr("RESERVED", format!("'{cand}' is a {:?} profile set up by the user on this PC; choose another name", a.mode).to_lowercase())));
+                    }
+                    if busy {
+                        return Ok(Err(IpcErr("AGENT_BUSY", format!("'{cand}' is in use by another live session; choose another name (e.g. {cand}-2) or omit name"))));
+                    }
+                } else if a.mode != AgentMode::Interactive || busy || a.project != project {
+                    continue;
+                }
                 // A returning agent keeps its recorded id.
                 a.role = role;
                 a.runner = r2;
@@ -1270,21 +1285,16 @@ impl NodeState {
                 if description.is_some() {
                     a.description = description;
                 }
-                return Ok(a.clone());
+                return Ok(Ok((a.clone(), false)));
             }
-            let p = AgentProfile {
-                agent_id: agentlan_proto::ids::agent_id(),
-                name,
-                role,
-                project,
-                runner: r2,
-                mode: AgentMode::Interactive,
-                capabilities: vec![],
-                description,
-            };
-            pf.agents.push(p.clone());
-            Ok(p)
-        })?;
+            Ok(Err(IpcErr("AGENT_BUSY", format!("too many agents named {stem}-…; pass a different name"))))
+        });
+        let (p, created) = match picked {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(IpcErr("PROFILE_WRITE", format!("{e:#}"))),
+        };
+        self.reload_profiles();
         // Upsert before AgentUp (same link, so the hub learns the new role first).
         self.register_changed_profiles();
         let mut v = self.attach_session(conn, p, Some(runner), pid, host_pid, false)?;

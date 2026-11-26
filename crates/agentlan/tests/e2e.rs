@@ -570,7 +570,18 @@ fn agents_connect_and_register_themselves() {
     let w = a.tool("whoami", serde_json::json!({}));
     assert_eq!(w["structuredContent"]["agent"]["handle"], "backend@pc-one", "{w}");
 
-    // Hooks find this session's identity through the process tree (no --agent).
+    // Hooks find this session's identity through the process tree (no --agent). Here two
+    // adapters (sessions) share one host process (this test), so the hook can't tell which
+    // session it belongs to and stays silent; with one left, it finds it.
+    assert!(hook(&e, "n1", "session-start", "auto", "s0").is_none(), "ambiguous host: no context");
+    // A role matching an offline profile ("backend-tests", project shop) from another project
+    // gets a new name instead of that agent's identity and mail.
+    let other = b.tool("register", serde_json::json!({"role": "backend-tests", "project": "other-repo"}));
+    assert_eq!(other["structuredContent"]["registered"]["handle"], "backend-tests-2@pc-one", "no cross-project reuse: {other}");
+    drop(b);
+    wait_until("session b ended", T, || {
+        e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|x| x["handle"] == "backend-2@pc-one" && x["state"] == "offline")
+    });
     let h = hook(&e, "n1", "session-start", "auto", "s1").expect("session-start context");
     assert!(h["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("backend@pc-one"), "{h}");
 
@@ -1100,4 +1111,13 @@ fn up_and_connect_one_liners() {
     // port is taken.
     let again_up = e.cmd("srv", &["up"]).output().unwrap();
     assert!(!again_up.status.success(), "second up must not start a second server");
+
+    // `node stop` on the server PC stops only its node; the server keeps serving pc2.
+    e.run("srv", &["node", "stop"]);
+    wait_until("srv node down", T, || !e.cmd_ok(&srv));
+    e.run("pc2", &["agent", "add", "helper2", "--role", "helper"]);
+    let r = e.json("pc2", &["send", "--as", "helper", "@helper2@pc-two", "still here", "--json"]);
+    assert_eq!(r["local"], 1, "{r}");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(e.status("pc2")["hub"], "ready", "server still up after the srv node stopped");
 }

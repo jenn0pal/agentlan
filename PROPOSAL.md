@@ -1067,3 +1067,22 @@ Where the code differs from this spec, and why:
   - Worker profiles only, with the loop-guard budgets.
   - Bind each worker profile to its Codex session id.
 
+**Self-registration (2026-11-26, user request).**
+- **What the user asked for:**
+  - Installing the MCP tool takes no agent or role.
+  - Agents connect with the server's code and assign themselves a role after seeing the registry.
+  - Every session and every subagent gets its own identity.
+  - A `setup` tool writes project instructions.
+- **What was built:**
+  - Tools `connect`, `register`, `leave` and `setup`, and an `as` parameter.
+  - The node's `IpcOp::Register` and `Shutdown` ops.
+  - Background node start.
+  - Host-pid identity lookup for hooks.
+- **Limits:**
+  - **Worker mode stays user-only.** `register` always creates interactive profiles and can't claim `--mode worker` or `script` profiles, so Stop-hook continuation and wake remain opt-in by the user.
+  - **Live sessions can't be claimed.** `register` won't take a name a live session is using.
+  - **A joined PC can't be moved.** `connect` won't move it to another server.
+  - **`setup` writes only `CLAUDE.md` or `AGENTS.md`,** in the git root, inside markers. It neutralises marker text in model input and never writes join codes.
+- **Join code:** unchanged. About 260 characters, one PC, 15 minutes. A real `codex exec` session passed it through intact. A short id can't carry the server's public key, so a shorter code would need discovery, such as mDNS (Phase 3), plus a fingerprint check.
+- **Subagents share their host's adapter process.** MCP calls don't say which agent made them, so identities are chosen explicitly with `as`. With more than one registered, calls without `as` are refused rather than guessed.
+

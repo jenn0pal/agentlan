@@ -25,6 +25,22 @@ struct Live {
     reader: tokio::task::AbortHandle,
 }
 
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 /// What a client's connection is bound to on the node.
 #[derive(Clone, Debug)]
 pub enum Bind {
@@ -151,10 +167,16 @@ impl NodeClient {
             .abort_handle()
         };
         let live = Live { stream, pending, alive, wlock, reader };
+        // If this future is dropped mid-bind (the host cancelled the call), close the
+        // half-open connection instead of leaving a session the adapter doesn't know about.
+        let guard = AbortOnDrop(Some(live.reader.clone()));
         let bind = self.bind.lock().unwrap().clone();
         let pid = Some(std::process::id());
         let op = match &bind {
-            Bind::None => return Ok((live, Value::Null)),
+            Bind::None => {
+                guard.disarm();
+                return Ok((live, Value::Null));
+            }
             Bind::Attach(agent) => IpcOp::Attach { agent: agent.clone(), runner: Some(self.runner.clone()), pid, takeover: false, host_pid: self.host_pid },
             Bind::Register(a) => IpcOp::Register {
                 name: a.name.clone(),
@@ -168,11 +190,9 @@ impl NodeClient {
         };
         let attached = match self.raw(&live, op).await {
             Ok(v) => v,
-            Err(e) => {
-                live.reader.abort();
-                anyhow::bail!("{}: {}", e.code, e.msg);
-            }
+            Err(e) => anyhow::bail!("{}: {}", e.code, e.msg), // guard closes the connection
         };
+        guard.disarm();
         // After a node restart, re-register under the name we got (keeps the recorded id).
         if let Bind::Register(mut a) = bind
             && let Some(n) = attached["agent"]["name"].as_str()

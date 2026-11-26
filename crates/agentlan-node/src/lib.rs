@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use interprocess::local_socket::Name;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tracing::info;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -136,11 +137,15 @@ pub async fn is_running(home: &Path) -> bool {
 
 /// Start `agentlan node run` for this home as a background process that outlives the
 /// caller (e.g. an MCP adapter whose host session ends), logging to node/node.log.
-/// Returns once the node answers on IPC. Another starter winning the race is fine.
-pub async fn ensure_running(home: &Path) -> Result<()> {
+/// Returns once the node answers on IPC (another starter winning the race is fine), with
+/// whether it will outlive the caller's host (false only on Windows when the host's job
+/// object doesn't allow breakaway: then the node stops when the host exits).
+pub async fn ensure_running(home: &Path) -> Result<bool> {
     if is_running(home).await {
-        return Ok(());
+        return Ok(true);
     }
+    #[allow(unused_mut)]
+    let mut persistent = true;
     load_config(home)?; // must have joined first
     let dir = node_dir(home);
     ensure_private_dir(&dir)?;
@@ -162,9 +167,11 @@ pub async fn ensure_running(home: &Path) -> Result<()> {
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
         if cmd.spawn().is_err() {
-            // The host's job object may not allow breakaway.
+            // The host's job object doesn't allow breakaway: the node still runs, but
+            // only as long as the host does.
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
             cmd.spawn()?;
+            persistent = false;
         }
     }
     #[cfg(not(windows))]
@@ -172,7 +179,7 @@ pub async fn ensure_running(home: &Path) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
         if is_running(home).await {
-            return Ok(());
+            return Ok(persistent);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -228,11 +235,21 @@ pub fn ipc_name(home: &Path) -> std::io::Result<Name<'static>> {
 
 /// `agentlan join <code>`: create this PC's key, enrol with the hub and record it.
 pub async fn join(home: &Path, code: &JoinCode, alias: &str) -> Result<(String, String)> {
+    let dir = node_dir(home);
+    ensure_private_dir(&dir)?;
+    // One join at a time per home (two agent sessions may `connect` at once): check and
+    // create the key + config under a lock, so the saved config matches the enrolled key.
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("join.lock"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lock.try_lock().is_err() {
+        if std::time::Instant::now() > deadline {
+            bail!("another join for this PC is still in progress");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if config_path(home).exists() {
         bail!("this PC already joined a network ({}); remove it first to re-join", config_path(home).display());
     }
-    let dir = node_dir(home);
-    ensure_private_dir(&dir)?;
     let key = StaticKey::load_or_create(&dir.join("node.key"))?;
     let hub_key = keys::from_b32(&code.hub_key)?;
     let mut last_err = None;
@@ -330,13 +347,14 @@ pub async fn run(home: &Path) -> Result<()> {
     })
     .await?;
     let st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx)?;
-    std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx))?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx, stop_tx))?;
 
     // Local IPC first: same-machine messaging works even if the hub never answers.
     let listener = ipc::listen(home)?;
     println!("agentlan node '{}' ready (machine {}); IPC up", cfg.alias, cfg.machine_id);
     let ticker = cmd_tx.clone();
-    tokio::spawn(async move {
+    let tick = tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_millis(100));
         loop {
             iv.tick().await;
@@ -345,6 +363,17 @@ pub async fn run(home: &Path) -> Result<()> {
             }
         }
     });
-    tokio::spawn(link::run(cfg, key, cmd_tx.clone(), ctl_rx, env_ms("AGENTLAN_BACKOFF_MAX_MS", 30_000)));
-    ipc::serve(listener, cmd_tx).await
+    let link = tokio::spawn(link::run(cfg, key, cmd_tx.clone(), ctl_rx, env_ms("AGENTLAN_BACKOFF_MAX_MS", 30_000)));
+    // `agentlan node stop` ends only the node: when it shares a process with the server
+    // (`agentlan up`), the server keeps running.
+    let r = tokio::select! {
+        r = ipc::serve(listener, cmd_tx) => r,
+        _ = stop_rx => {
+            info!("node: stopped");
+            Ok(())
+        }
+    };
+    tick.abort();
+    link.abort();
+    r
 }

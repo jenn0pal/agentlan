@@ -537,9 +537,10 @@ impl Adapter {
                 }
             }
         }
-        if let Err(e) = agentlan_node::ensure_running(&self.home).await {
-            return self.error("NODE_DOWN", &format!("{e:#}"));
-        }
+        let persistent = match agentlan_node::ensure_running(&self.home).await {
+            Ok(p) => p,
+            Err(e) => return self.error("NODE_DOWN", &format!("{e:#}")),
+        };
         // Give a freshly started node a moment to reach the server.
         let mut status = Value::Null;
         for _ in 0..50 {
@@ -569,7 +570,7 @@ impl Adapter {
             status["alias"].as_str().unwrap_or("?"),
             status["hub"].as_str().unwrap_or("?"),
         );
-        let (text, mut structured) = match &reg {
+        let (mut text, mut structured) = match &reg {
             Some(v) => {
                 let (t, st) = self.registered_view(v, &names);
                 (format!("{head}\n{t}"), st)
@@ -581,6 +582,10 @@ impl Adapter {
         structured["machineId"] = status["machineId"].clone();
         structured["hub"] = status["hub"].clone();
         structured["joinedNow"] = json!(joined_now);
+        if !persistent {
+            text.push_str("\n\nNote: this host doesn't let the AgentLAN node outlive it; the node stops when this session ends. Run `agentlan connect` in a terminal to keep the PC connected.");
+            structured["warning"] = json!("this host doesn't let the AgentLAN node outlive it: the node stops when this session ends. To keep the PC connected, run `agentlan connect` in a terminal.");
+        }
         structured["identities"] = json!(names);
         structured["nextStep"] = json!(self.next_step(names.len()));
         self.result(text, structured, &json!({"count": null}))
@@ -612,6 +617,12 @@ impl Adapter {
                 .unwrap_or_default(),
         );
         let project = arg(args, "project").map(String::from).or_else(|| setup::project_of(&self.cwd));
+        let mut fields: Vec<&str> = roles.0.iter().map(|(_, d)| d.as_str()).collect();
+        fields.extend(arg(args, "notes"));
+        fields.extend(project.as_deref());
+        if let Err(e) = setup::check_no_secrets(&fields) {
+            return self.error("SECRET_REFUSED", &format!("{e:#}"));
+        }
         let root = setup::project_root(&self.cwd);
         let block = setup::block(project.as_deref(), &roles, arg(args, "notes"));
         match setup::write(&root, &files, &block) {
