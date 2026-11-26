@@ -14,7 +14,7 @@ use agentlan_proto::ipc::IpcOp;
 use anyhow::{Result, bail};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData, Implementation, InitializeResult, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, Tool,
+    PaginatedRequestParams, ServerCapabilities, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -71,11 +71,36 @@ pub async fn serve(home: PathBuf, agent: String, runner: Runner) -> Result<()> {
     Ok(())
 }
 
+/// Honest MCP hints so hosts (e.g. Codex) can decide approvals sensibly.
+fn hints(read_only: bool, idempotent: bool, open_world: bool) -> ToolAnnotations {
+    let mut a = ToolAnnotations::new();
+    a.read_only_hint = Some(read_only);
+    a.destructive_hint = Some(false); // nothing here deletes or overwrites data
+    a.idempotent_hint = Some(idempotent);
+    a.open_world_hint = Some(open_world); // send/reply reach other agents
+    a
+}
+
 fn schema(v: Value) -> Arc<Map<String, Value>> {
     Arc::new(v.as_object().cloned().unwrap_or_default())
 }
 
 fn tools() -> Vec<Tool> {
+    tool_list()
+        .into_iter()
+        .map(|t| {
+            let a = match t.name.as_ref() {
+                "whoami" | "list_agents" | "list_machines" => hints(true, true, false),
+                "inbox" | "ack" => hints(false, true, false),
+                "wait_for_message" => hints(false, false, false),
+                _ => hints(false, false, true), // send, reply
+            };
+            t.annotate(a)
+        })
+        .collect()
+}
+
+fn tool_list() -> Vec<Tool> {
     let target_desc = "Recipient: \"@name@machine\" (one agent), \"agt_…\" (agent id), \"role:R\" or \"role:R@project\", \"project:P\", \"machine:M\", or \"all\".";
     vec![
         Tool::new("whoami", "Your AgentLAN identity (agent id, handle, role, project, machine), the server status and your unread count.", schema(json!({"type":"object","properties":{}}))),

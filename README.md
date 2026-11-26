@@ -98,6 +98,27 @@ codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
 
 **Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message`, `ack`.
 
+**Annotations.** Tools carry MCP hints:
+- read-only: `whoami`, `list_agents`, `list_machines`;
+- local only: `inbox`, `wait_for_message`, `ack`;
+- reaches other agents: `send`, `reply`.
+
+**Codex** (verified with Codex CLI 1.x):
+- **Local tools** run without prompting.
+- **`send` / `reply` ask for approval**, so your agent won't message others behind your back.
+- **Unattended worker sessions** can opt in per server in `~/.codex/config.toml`:
+
+  ```toml
+  [mcp_servers.agentlan]
+  command = "agentlan"
+  args = ["mcp", "--agent", "auto", "--runner", "codex"]
+  tool_timeout_sec = 90                       # wait_for_message blocks up to 45 s
+  # default_tools_approval_mode = "approve"   # worker sessions only: no approval prompts
+  ```
+
+- **AgentLAN's server instructions** (identity and peer list) reach Codex when it discovers the tools.
+- **`--agent auto`** works because Codex starts the adapter in the session's working directory.
+
 **Scripts and other agents** use the CLI:
 
 ```sh

@@ -1047,3 +1047,13 @@ Where the code differs from this spec, and why:
 - **Encryption.** Noise and join tokens still apply on top of WireGuard.
 - **Still to verify:** the Windows firewall rule must also allow 100.64.0.0/10, and a test across two tailnet devices is pending.
 
+**Real-runner check: Codex CLI against `agentlan mcp` (2026-11-26).**
+1. **Instructions are not shown before any tool use.** They surface once Codex discovers the tools, and that surfaced text included the handle and peers. → Keep the roster in `whoami` and `list_agents` results too.
+2. **The adapter starts in the session's working directory**, so `--agent auto` works.
+3. **Approvals in `codex exec` (policy "never"):**
+   - without annotations, every tool was blocked;
+   - with honest MCP annotations, the read-only and local tools run;
+   - `send`/`reply` (open-world) still need approval, a good default;
+   - `default_tools_approval_mode = "approve"` (per server) enables unattended workers. Verified end to end.
+4. **A 40 s `wait_for_message`** completed when a message arrived about 25 s in. Codex read it from structured content.
+
