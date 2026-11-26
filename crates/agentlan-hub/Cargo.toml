@@ -1,12 +1,12 @@
 [package]
 name = "agentlan-hub"
-version = "0.2.0-beta.2"
+version = "0.2.0-beta.3"
 edition = "2024"
 
 [dependencies]
-agentlan-net = { version = "0.2.0-beta.2", path = "../agentlan-net" }
-agentlan-proto = { version = "0.2.0-beta.2", path = "../agentlan-proto" }
-agentlan-store = { version = "0.2.0-beta.2", path = "../agentlan-store" }
+agentlan-net = { version = "0.2.0-beta.3", path = "../agentlan-net" }
+agentlan-proto = { version = "0.2.0-beta.3", path = "../agentlan-proto" }
+agentlan-store = { version = "0.2.0-beta.3", path = "../agentlan-store" }
 anyhow = "1.0.105"
 chrono = { version = "0.4.45", features = ["serde"] }
 data-encoding = "2.11.1"

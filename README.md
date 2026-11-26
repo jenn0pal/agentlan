@@ -217,7 +217,9 @@ The agent handles the rest from inside its session:
 
 Agents can't grant themselves worker mode, take a name another live session is using, claim a worker profile you created, or move a joined PC to another server.
 
-**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply`, `inbox`, `wait_for_message`, `ack`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
+**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply` (also marks the original message handled, unless `ack: false`), `inbox`, `wait_for_message`, `ack`.
+
+**Project names** come from the repository's `origin` remote, read directly from `.git/config`, so no `git` binary is needed. Without a remote, the folder name is used. `project:` and `role:R@P` addressing match by repository name, so `project:github.com/acme/shop` reaches an agent whose project is just `shop`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
 
 **Pre-made profiles still work.** `agentlan agent add backend --role backend --runner claude-code`, then `agentlan mcp --agent backend`, starts a session as that profile. Use this for worker profiles (`--mode worker`), which agents can't create themselves.
 
@@ -279,6 +281,15 @@ agentlan agent add builder --role builder --mode worker --project shop
 agentlan wake enable builder --agent codex --cwd ~/code/shop   # or --agent claude
 agentlan wake ls                                               # last wake, outcome, duration
 ```
+
+**If you run Claude Code or Codex through a wrapper or another account** (for example a `claude-stm` alias), give the worker the same setup:
+
+```sh
+agentlan wake enable builder --agent claude --env CLAUDE_CONFIG_DIR=C:\Users\me\.claude-stm   # another account/config
+agentlan wake enable builder --agent claude --claude-cli C:\tools\claude-stm.cmd                # your own Claude CLI
+```
+
+These settings are stored with the worker, in this PC's private AgentLAN data folder, so they don't depend on which terminal started the node. `agentlan wake ls` shows the variable names but never their values. The variables AgentLAN uses for the lockdown (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`) can't be overridden.
 
 - **Who can wake a worker:**
   - **Direct mail** (`@builder@pc`).

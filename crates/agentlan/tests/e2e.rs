@@ -556,6 +556,15 @@ fn agents_connect_and_register_themselves() {
             .any(|x| x["handle"] == "backend@pc-one" && x["role"] == "backend" && x["description"] == "orders API" && x["state"] == "online")
     });
 
+    // Project names match by repository name: backend's project is "shop" (a folder with
+    // no git remote), a sender may say the full github.com/acme/shop.
+    let pj = r2.tool("send", serde_json::json!({"to": "project:github.com/acme/shop", "intent": "status", "text": "ci green"}));
+    assert_eq!(pj["structuredContent"]["sent"]["remote"]["status"], "accepted", "{pj}");
+    assert!(pj["structuredContent"]["sent"]["remote"]["count"].as_u64().unwrap() >= 1, "{pj}");
+    let bk = a.tool("inbox", serde_json::json!({"as": "backend"}));
+    let ci = bk["structuredContent"]["messages"].as_array().unwrap().iter().find(|m| m["parts"][0]["text"] == "ci green").cloned().expect("project-addressed mail");
+    a.tool("ack", serde_json::json!({"as": "backend", "messageId": ci["id"]}));
+
     // Messages flow between self-registered identities (by role).
     let sent = a.tool("send", serde_json::json!({"as": "backend", "to": "role:reviewer", "subject": "PR 7", "text": "please review"}));
     assert_eq!(sent["structuredContent"]["sent"]["remote"]["status"], "accepted", "{sent}");
@@ -659,6 +668,10 @@ fn mcp_adapters_claude_and_codex_roundtrip() {
     // Codex replies; recipient and thread come from the original.
     let rep = rev.tool("reply", serde_json::json!({"messageId": req_id, "text": "lgtm, one nit on token expiry"}));
     assert_eq!(rep["structuredContent"]["sent"]["remote"]["status"], "accepted", "{rep}");
+    // Replying marks the original handled: nothing left in the reviewer's inbox.
+    assert_eq!(rep["structuredContent"]["acked"], true, "{rep}");
+    let left = rev.tool("inbox", serde_json::json!({}));
+    assert!(left["structuredContent"]["messages"].as_array().unwrap().is_empty(), "{left}");
 
     // Claude reads it wrapped as untrusted peer content.
     let mut inbox = Value::Null;
@@ -1145,7 +1158,10 @@ fn worker_wake_over_acp() {
     let work = e.root.join("builder-proj");
     std::fs::create_dir_all(&work).unwrap();
     let fake = format!("\"{BIN}\" dev fake-acp --log \"{}\"", log.display());
-    e.run("n2", &["wake", "enable", "builder", "--agent", "custom", "--command", &fake, "--cwd", work.to_str().unwrap(), "--timeout", "60"]);
+    e.run("n2", &["wake", "enable", "builder", "--agent", "custom", "--command", &fake, "--cwd", work.to_str().unwrap(), "--timeout", "60", "--env", "AGENTLAN_FAKE_MARK=per-worker"]);
+    // Lockdown variables can't be overridden per worker.
+    let bad_env = e.cmd("n2", &["wake", "enable", "builder", "--agent", "custom", "--command", &fake, "--env", "CODEX_CONFIG={}"]).output().unwrap();
+    assert!(!bad_env.status.success() && String::from_utf8_lossy(&bad_env.stderr).contains("can't be overridden"));
     // Only worker profiles can be woken.
     let bad = e.cmd("n2", &["wake", "enable", "helper", "--agent", "custom", "--command", &fake]).output().unwrap();
     assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("not a worker"));
@@ -1163,6 +1179,7 @@ fn worker_wake_over_acp() {
     wait_until("reply from the woken worker", Duration::from_secs(20), || lead_replies(&e).iter().any(|t| t == "fake reply: build the shop"));
     let l = log_lines();
     assert!(l.contains("session/new "), "{l}");
+    assert!(l.contains("env AGENTLAN_FAKE_MARK=per-worker"), "the worker's --env reaches the agent: {l}");
     assert!(l.contains("permission no"), "messages-only wake rejects a file edit: {l}");
     // The prompt points at the mail (who, how many) but never carries peer-written text.
     let prompt = l.lines().find(|x| x.starts_with("prompt ")).unwrap();
@@ -1186,6 +1203,7 @@ fn worker_wake_over_acp() {
     //    wake-enabled worker, and the reply comes back to the waiting request.
     let r = e.json("n1", &["request", "--as", "lead", "role:builder", "ship it?", "--wait", "25", "--json"]);
     assert_eq!(r["reply"]["parts"][0]["text"], "fake reply: ship it?", "{r}");
+    assert_eq!(r["sent"]["remote"]["status"], "accepted", "request reports the hub's verdict, not 'queued': {r}");
 
     // 4. The same from this PC: the node picks its own wake-enabled worker.
     let r = e.json("n2", &["request", "--as", "helper", "role:builder", "local ask", "--wait", "25", "--json"]);

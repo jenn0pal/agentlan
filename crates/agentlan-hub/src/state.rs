@@ -719,12 +719,14 @@ impl Hub {
         let all = self.agent_records("WHERE a.retired=0", None)?;
         let remote = |a: &&AgentRecord| a.machine_id != mid && a.profile.agent_id != agent_id;
         let online = |a: &&AgentRecord| a.state == PresenceState::Online;
-        let project_ok = |a: &AgentRecord, pr: &Option<String>| pr.as_ref().is_none_or(|p| a.profile.project.as_deref() == Some(p.as_str()));
+        let project_ok = |a: &AgentRecord, pr: &Option<String>| pr.as_ref().is_none_or(|p| agentlan_proto::ids::project_matches(a.profile.project.as_deref(), p));
         let mut recips: Vec<AgentRecord> = match &env.to {
             Target::Agent { agent } => all.iter().filter(remote).filter(|a| &a.profile.agent_id == agent).cloned().collect(),
             Target::Handle { handle } => all.iter().filter(remote).filter(|a| a.handle == handle.trim_start_matches('@')).cloned().collect(),
             Target::Role { role, project, .. } => all.iter().filter(remote).filter(online).filter(|a| &a.profile.role == role && project_ok(a, project)).cloned().collect(),
-            Target::Project { project, .. } => all.iter().filter(remote).filter(online).filter(|a| a.profile.project.as_deref() == Some(project.as_str())).cloned().collect(),
+            Target::Project { project, .. } => {
+                all.iter().filter(remote).filter(online).filter(|a| agentlan_proto::ids::project_matches(a.profile.project.as_deref(), project)).cloned().collect()
+            }
             Target::Machine { machine } => {
                 all.iter().filter(remote).filter(online).filter(|a| &a.machine_id == machine || a.handle.ends_with(&format!("@{machine}"))).cloned().collect()
             }
@@ -746,7 +748,7 @@ impl Hub {
                 // (its node starts it). Broadcasts never wake anyone.
                 let wanted = |a: &AgentRecord| match &env.to {
                     Target::Role { role, project, .. } => &a.profile.role == role && project_ok(a, project),
-                    Target::Project { project, .. } => a.profile.project.as_deref() == Some(project.as_str()),
+                    Target::Project { project, .. } => agentlan_proto::ids::project_matches(a.profile.project.as_deref(), project),
                     _ => false,
                 };
                 recips = all

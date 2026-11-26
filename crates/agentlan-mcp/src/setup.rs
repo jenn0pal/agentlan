@@ -12,8 +12,76 @@ const END: &str = "<!-- agentlan:end -->";
 /// The only files `setup` may write, relative to the project root.
 pub const FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
-/// The git work tree containing `cwd`, else `cwd` itself.
+/// The nearest directory at or above `cwd` containing `.git`, and the git config file
+/// that applies to it (a `.git` file points to the real git dir; linked worktrees share
+/// the main repository's config through `commondir`).
+fn find_git(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut d = Some(cwd);
+    while let Some(dir) = d {
+        let g = dir.join(".git");
+        if g.is_dir() {
+            return Some((dir.to_path_buf(), g.join("config")));
+        }
+        if g.is_file() {
+            let s = std::fs::read_to_string(&g).ok()?;
+            let gd = s.lines().find_map(|l| l.trim().strip_prefix("gitdir:")).map(|p| p.trim().to_string())?;
+            let gd = if Path::new(&gd).is_absolute() { PathBuf::from(&gd) } else { dir.join(&gd) };
+            let common = std::fs::read_to_string(gd.join("commondir"))
+                .ok()
+                .map(|c| {
+                    let c = c.trim();
+                    if Path::new(c).is_absolute() { PathBuf::from(c) } else { gd.join(c) }
+                })
+                .unwrap_or(gd);
+            return Some((dir.to_path_buf(), common.join("config")));
+        }
+        d = dir.parent();
+    }
+    None
+}
+
+/// `[remote "origin"] url = …` from a git config file.
+fn origin_url(config: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(config).ok()?;
+    let mut in_origin = false;
+    for line in s.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_origin = l.replace([' ', '\t'], "").eq_ignore_ascii_case("[remote\"origin\"]");
+            continue;
+        }
+        if in_origin
+            && let Some((k, v)) = l.split_once('=')
+            && k.trim().eq_ignore_ascii_case("url")
+        {
+            return Some(v.trim().to_string()).filter(|u| !u.is_empty());
+        }
+    }
+    None
+}
+
+/// The project name from the repository's `origin` remote. Reads the git config directly
+/// (runners such as Codex may start MCP servers without `git` on PATH); falls back to
+/// running `git`.
+pub fn git_project(cwd: &Path) -> Option<String> {
+    let url = find_git(cwd).and_then(|(_, cfg)| origin_url(&cfg)).or_else(|| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    })?;
+    Some(agentlan_proto::ids::project_from_remote(&url)).filter(|p| !p.is_empty())
+}
+
+/// The work tree containing `cwd` (where `.git` is), else `cwd` itself.
 pub fn project_root(cwd: &Path) -> PathBuf {
+    if let Some((root, _)) = find_git(cwd) {
+        return root;
+    }
     std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -28,16 +96,7 @@ pub fn project_root(cwd: &Path) -> PathBuf {
 
 /// Project name for `cwd`: from the git `origin` remote, else the project folder's name.
 pub fn project_of(cwd: &Path) -> Option<String> {
-    let remote = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| agentlan_proto::ids::project_from_remote(String::from_utf8_lossy(&o.stdout).trim()))
-        .filter(|p| !p.is_empty());
-    remote.or_else(|| project_root(cwd).file_name().map(|n| n.to_string_lossy().to_string()).filter(|n| !n.is_empty()))
+    git_project(cwd).or_else(|| project_root(cwd).file_name().map(|n| n.to_string_lossy().to_string()).filter(|n| !n.is_empty()))
 }
 
 /// Keep model-supplied text from forging or closing our markers, and bound its size.
@@ -167,6 +226,31 @@ fn rand_suffix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_from_git_config_without_git() {
+        let root = std::env::temp_dir().join(format!("agl-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(root.join("repo/src/deep")).unwrap();
+        std::fs::write(
+            root.join("repo/.git/config"),
+            "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = https://github.com/other/x.git\n[remote \"origin\"]\n\turl = git@github.com:acme/shop.git\n",
+        )
+        .unwrap();
+        assert_eq!(git_project(&root.join("repo/src/deep")).as_deref(), Some(agentlan_proto::ids::project_from_remote("git@github.com:acme/shop.git").as_str()));
+        assert_eq!(project_root(&root.join("repo/src/deep")), root.join("repo"));
+        // A linked worktree: `.git` is a file pointing at the main repository.
+        std::fs::create_dir_all(root.join("repo/.git/worktrees/wt")).unwrap();
+        std::fs::write(root.join("repo/.git/worktrees/wt/commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::write(root.join("wt/.git"), format!("gitdir: {}\n", root.join("repo/.git/worktrees/wt").display())).unwrap();
+        assert_eq!(git_project(&root.join("wt")), git_project(&root.join("repo")));
+        // No repository: the folder name.
+        std::fs::create_dir_all(root.join("plain/agentlan")).unwrap();
+        assert_eq!(project_of(&root.join("plain/agentlan")).as_deref(), Some("agentlan"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn block_is_replaced_not_duplicated() {

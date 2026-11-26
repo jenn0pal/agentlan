@@ -1,15 +1,15 @@
 [package]
 name = "agentlan"
-version = "0.2.0-beta.2"
+version = "0.2.0-beta.3"
 edition = "2024"
 
 [dependencies]
-agentlan-hub = { version = "0.2.0-beta.2", path = "../agentlan-hub" }
-agentlan-mcp = { version = "0.2.0-beta.2", path = "../agentlan-mcp" }
-agentlan-net = { version = "0.2.0-beta.2", path = "../agentlan-net" }
-agentlan-node = { version = "0.2.0-beta.2", path = "../agentlan-node" }
-agentlan-proto = { version = "0.2.0-beta.2", path = "../agentlan-proto" }
-agentlan-store = { version = "0.2.0-beta.2", path = "../agentlan-store" }
+agentlan-hub = { version = "0.2.0-beta.3", path = "../agentlan-hub" }
+agentlan-mcp = { version = "0.2.0-beta.3", path = "../agentlan-mcp" }
+agentlan-net = { version = "0.2.0-beta.3", path = "../agentlan-net" }
+agentlan-node = { version = "0.2.0-beta.3", path = "../agentlan-node" }
+agentlan-proto = { version = "0.2.0-beta.3", path = "../agentlan-proto" }
+agentlan-store = { version = "0.2.0-beta.3", path = "../agentlan-store" }
 anyhow = "1.0.105"
 chrono = "0.4.45"
 clap = { version = "4.6.10", features = ["derive", "env"] }

@@ -92,3 +92,38 @@ mod tests {
         assert_eq!(project_from_remote("ssh://git@host.example:2222/x/y.git"), "host.example:2222/x/y");
     }
 }
+
+/// Do two project names refer to the same project? Exact (case-insensitive) match, or the
+/// same repository name: `github.com/acme/shop` matches `shop`, since a checkout without
+/// a git remote (or a runner that can't read it) falls back to the folder name.
+pub fn same_project(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('/').trim_end_matches(".git").to_ascii_lowercase();
+    let (a, b) = (norm(a), norm(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let last = |s: &str| s.rsplit(['/', ':', '\\']).next().unwrap_or("").to_string();
+    a == b || last(&a) == last(&b)
+}
+
+/// Does an agent's project match a wanted one (`project:P`, `role:R@P`)?
+pub fn project_matches(have: Option<&str>, want: &str) -> bool {
+    have.is_some_and(|h| same_project(h, want))
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn projects_match_by_repository_name() {
+        assert!(same_project("github.com/jenn0pal/agentlan", "agentlan"));
+        assert!(same_project("github.com/jenn0pal/agentlan", "GitHub.com/jenn0pal/agentlan/"));
+        assert!(same_project("agentlan", "agentlan.git"));
+        assert!(!same_project("github.com/jenn0pal/agentlan", "ailink"));
+        assert!(!same_project("", "x"));
+        assert!(project_matches(Some("C:\\Workspace\\ai\\agentlan"), "github.com/x/agentlan"));
+        assert!(!project_matches(None, "agentlan"));
+    }
+}
+
