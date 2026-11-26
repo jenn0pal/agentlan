@@ -26,6 +26,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// One command for the server PC: sets everything up on first run, starts the server
+    /// and this PC's node, and prints the `agentlan connect …` line for other PCs.
+    Up {
+        #[arg(long, default_value = "home-lab")]
+        name: String,
+        #[arg(long, default_value = "0.0.0.0:47820")]
+        listen: String,
+        /// Address(es) other PCs should use (default: LAN, then Tailscale). Repeatable.
+        #[arg(long)]
+        advertise: Vec<String>,
+        /// Advertise only this PC's Tailscale name/IPs.
+        #[arg(long, conflicts_with = "advertise")]
+        tailscale: bool,
+        /// This PC's name on the network (default: hostname).
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// One command for every other PC: joins on first run (needs the join code), then runs the node.
+    Connect {
+        code: Option<String>,
+        /// This PC's name on the network (default: hostname).
+        #[arg(long)]
+        alias: Option<String>,
+    },
     /// Server (hub) commands — run them on whichever PC you pick as the server.
     Hub {
         #[command(subcommand)]
@@ -239,6 +263,79 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             }
             HubCmd::Run { listen } => agentlan_hub::run(home, listen).await?,
         },
+        Cmd::Up { name, listen, advertise, tailscale, alias } => {
+            if !agentlan_hub::hub_dir(home).join("hub.json").exists() {
+                let info = agentlan_hub::init(home, &name, &listen)?;
+                eprintln!("✓ created server '{name}' (key {})", info.fingerprint);
+            }
+            let hf = agentlan_hub::load(home)?;
+            let port: u16 = hf.listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(agentlan_hub::DEFAULT_PORT);
+            let hub_home = home.to_path_buf();
+            let mut hub_task = tokio::spawn(async move { agentlan_hub::run(&hub_home, None).await });
+            // Wait for the server to accept connections (or fail fast if it couldn't start).
+            let started = std::time::Instant::now();
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    break;
+                }
+                if hub_task.is_finished() {
+                    return match (&mut hub_task).await {
+                        Ok(Err(e)) => Err(e),
+                        _ => Err(anyhow!("the server stopped during startup")),
+                    };
+                }
+                if started.elapsed() > Duration::from_secs(10) {
+                    bail!("the server did not start listening on port {port}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // First run: join this PC's own node over loopback.
+            if agentlan_node::load_config(home).is_err() {
+                let code = agentlan_hub::invite(home, vec![format!("127.0.0.1:{port}")], Duration::from_secs(300))?;
+                let alias = alias.unwrap_or_else(|| agentlan_node::machine_info(false).hostname);
+                let (_, alias) = agentlan_node::join(home, &code, &alias).await?;
+                eprintln!("✓ this PC joined as '{alias}'");
+            }
+            let addrs = if advertise.is_empty() {
+                let scope = if tailscale { agentlan_node::netif::InviteScope::Tailscale } else { agentlan_node::netif::InviteScope::Default };
+                agentlan_node::netif::invite_addrs(port, scope)
+            } else {
+                advertise
+            };
+            if addrs.is_empty() {
+                bail!("no LAN or Tailscale address found for other PCs; pass --advertise HOST:PORT");
+            }
+            let code = agentlan_hub::invite(home, addrs.clone(), Duration::from_secs(15 * 60))?;
+            println!("✓ AgentLAN is up on this PC (server + node). Other PCs reach it at: {}", addrs.join(", "));
+            println!("\nOn each other PC, run (code valid 15 min; `agentlan hub invite` makes more):\n\n  agentlan connect {}\n", code.encode());
+            println!("Add an agent here:  agentlan agent add <name> --role <role> --runner claude-code|codex");
+            let node_home = home.to_path_buf();
+            let node_task = tokio::spawn(async move { agentlan_node::run(&node_home).await });
+            tokio::select! {
+                r = hub_task => r??,
+                r = node_task => r??,
+            }
+        }
+        Cmd::Connect { code, alias } => {
+            match agentlan_node::load_config(home) {
+                Ok(cfg) => {
+                    if code.is_some() {
+                        eprintln!("(this PC already joined '{}' as {}; ignoring the code)", cfg.net, cfg.alias);
+                    }
+                }
+                Err(_) => {
+                    let Some(code) = code else {
+                        bail!("this PC hasn't joined yet: run `agentlan connect <join code>` (the server PC prints one with `agentlan up` or `agentlan hub invite`)");
+                    };
+                    let code = JoinCode::decode(&code).map_err(|e| anyhow!(e))?;
+                    let alias = alias.unwrap_or_else(|| agentlan_node::machine_info(false).hostname);
+                    let (_, alias) = agentlan_node::join(home, &code, &alias).await?;
+                    println!("✓ joined network '{}' as {alias}", code.net);
+                }
+            }
+            println!("✓ node running. Add an agent:  agentlan agent add <name> --role <role> --runner claude-code|codex");
+            agentlan_node::run(home).await?;
+        }
         Cmd::Join { code, alias } => {
             let code = JoinCode::decode(&code).map_err(|e| anyhow!(e))?;
             let alias = alias.unwrap_or_else(|| agentlan_node::machine_info(false).hostname);
