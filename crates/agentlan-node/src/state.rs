@@ -71,6 +71,26 @@ pub enum NCmd {
     HubFrame(HubToNode),
     HubDown,
     Tick,
+    /// A wake (see `wake.rs`) finished.
+    WakeDone { agent_id: String, result: crate::wake::WakeResult },
+}
+
+/// Worker wake limits (env-overridable).
+struct WakeLimits {
+    per_hour: i64,
+    concurrent: usize,
+    debounce: Duration,
+}
+
+impl WakeLimits {
+    fn from_env() -> WakeLimits {
+        let get = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        WakeLimits {
+            per_hour: get("AGENTLAN_WAKE_PER_HOUR", 12) as i64,
+            concurrent: get("AGENTLAN_WAKE_CONCURRENT", 2) as usize,
+            debounce: Duration::from_millis(get("AGENTLAN_WAKE_DEBOUNCE_MS", 1500)),
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -164,6 +184,13 @@ pub struct NodeState {
     inflight: HashMap<i64, Instant>,
     /// Set by a Shutdown request: the state loop exits after replying.
     stopping: bool,
+    /// Worker wake: due time per agent (debounced), in-flight wakes, and agents that got
+    /// new mail while their wake was running.
+    wake_due: HashMap<String, Instant>,
+    wake_inflight: HashMap<String, (Instant, tokio::task::AbortHandle)>,
+    wake_again: HashSet<String>,
+    cmd_tx: mpsc::UnboundedSender<NCmd>,
+    rt: tokio::runtime::Handle,
 }
 
 fn ok(id: u64, v: Value) -> IpcOut {
@@ -213,7 +240,15 @@ pub fn canonical_msg_id(sender: &str, client_id: &str) -> String {
 }
 
 impl NodeState {
-    pub fn new(home: PathBuf, db: Connection, cfg: NodeFile, reported: MachineReported, link: mpsc::UnboundedSender<LinkCtl>) -> Result<NodeState> {
+    pub fn new(
+        home: PathBuf,
+        db: Connection,
+        cfg: NodeFile,
+        reported: MachineReported,
+        link: mpsc::UnboundedSender<LinkCtl>,
+        cmd_tx: mpsc::UnboundedSender<NCmd>,
+        rt: tokio::runtime::Handle,
+    ) -> Result<NodeState> {
         agentlan_store::migrate(&db, SCHEMA)?;
         let profiles = crate::load_profiles(&home)?.agents;
         Ok(NodeState {
@@ -240,6 +275,11 @@ impl NodeState {
             pending: HashMap::new(),
             inflight: HashMap::new(),
             stopping: false,
+            wake_due: HashMap::new(),
+            wake_inflight: HashMap::new(),
+            wake_again: HashSet::new(),
+            cmd_tx,
+            rt,
         })
     }
 
@@ -250,6 +290,10 @@ impl NodeState {
             }
             if self.stopping {
                 info!("node: stopping (requested over IPC)");
+                // Stop running wakes (dropping a wake kills its agent process).
+                for (_, (_, h)) in self.wake_inflight.drain() {
+                    h.abort();
+                }
                 // Every write is its own transaction, so nothing is half-done here; give the
                 // IPC writer a moment to deliver the reply, then end the node's tasks.
                 std::thread::sleep(Duration::from_millis(200));
@@ -299,6 +343,7 @@ impl NodeState {
                 }
                 self.push_all("hub", json!({"status": "offline"}));
             }
+            NCmd::WakeDone { agent_id, result } => self.wake_done(&agent_id, result)?,
             NCmd::Tick => {
                 self.ticks += 1;
                 if self.ticks % 10 == 0 {
@@ -310,6 +355,7 @@ impl NodeState {
                     }
                 }
                 self.tick();
+                self.fire_wakes()?;
                 self.pump()?;
             }
         }
@@ -885,6 +931,7 @@ impl NodeState {
     }
 
     fn notify(&mut self, agent: &str, env: &Amf) -> Result<()> {
+        self.maybe_wake(agent, env)?;
         self.offer_to_waiters(agent, env)?;
         let handle = self.profiles.iter().find(|p| p.agent_id == agent).map(|p| self.handle_of(p)).unwrap_or_default();
         for (id, c) in &self.conns {
@@ -909,6 +956,33 @@ impl NodeState {
             }
             IpcOp::Register { name, role, project, description, runner, pid, host_pid } => {
                 self.register(conn, name, role, project, description, runner, pid, host_pid).map(Some)
+            }
+            IpcOp::WakeNow { agent } => {
+                let p = self.agent_for(conn, Some(&agent))?;
+                if self.wake_enabled(&p.agent_id).is_none() {
+                    return Err(IpcErr("NOT_WAKEABLE", format!("{} has no wake configured (`agentlan wake enable`)", self.handle_of(&p))));
+                }
+                if self.unread_count(&p.agent_id)? == 0 {
+                    return Err(IpcErr("NO_MAIL", format!("{} has no unread messages", self.handle_of(&p))));
+                }
+                if self.sessions.contains_key(&p.agent_id) && !self.wake_inflight.contains_key(&p.agent_id) {
+                    return Err(IpcErr("AGENT_BUSY", format!("{} is running; it reads its own mail", self.handle_of(&p))));
+                }
+                self.wake_due.insert(p.agent_id.clone(), Instant::now());
+                Ok(Some(json!({"scheduled": self.handle_of(&p)})))
+            }
+            IpcOp::WakeStatus => {
+                let wf = crate::load_wake(&self.home).map_err(|e| IpcErr("WAKE_CONFIG", format!("{e:#}")))?;
+                let mut out = vec![];
+                for (id, c) in wf.workers {
+                    let handle = self.profiles.iter().find(|p| p.agent_id == id).map(|p| self.handle_of(p)).unwrap_or_else(|| c.name.clone());
+                    out.push(json!({
+                        "agentId": id, "handle": handle, "config": c,
+                        "running": self.wake_inflight.contains_key(&id), "due": self.wake_due.contains_key(&id),
+                        "online": self.sessions.contains_key(&id), "unread": self.unread_count(&id)?,
+                    }));
+                }
+                Ok(Some(json!({"workers": out})))
             }
             IpcOp::Shutdown => {
                 self.stopping = true;
@@ -1303,6 +1377,125 @@ impl NodeState {
         Ok(v)
     }
 
+    // ------------------------------------------------------------------ worker wake
+
+    fn wake_enabled(&self, agent: &str) -> Option<AgentProfile> {
+        self.profiles.iter().find(|p| p.agent_id == agent && p.mode == AgentMode::Worker && p.capabilities.iter().any(|c| c == "wake")).cloned()
+    }
+
+    /// New mail for a local agent: if it's an idle wake-enabled worker, schedule a wake
+    /// (debounced, so a burst of mail is one wake).
+    fn maybe_wake(&mut self, agent: &str, env: &Amf) -> Result<()> {
+        if self.wake_enabled(agent).is_none() {
+            return Ok(());
+        }
+        if self.wake_inflight.contains_key(agent) {
+            self.wake_again.insert(agent.to_string());
+            return Ok(());
+        }
+        if self.sessions.contains_key(agent) {
+            return Ok(()); // a live session will handle it
+        }
+        // Never wake for a thread the loop guard paused.
+        let paused: Option<String> = self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![format!("thread:{}", env.thread_id)], |r| r.get(0)).optional()?;
+        if paused.is_some() {
+            return Ok(());
+        }
+        let due = Instant::now() + WakeLimits::from_env().debounce;
+        self.wake_due.entry(agent.to_string()).or_insert(due);
+        Ok(())
+    }
+
+    fn record_wake(&self, agent: &str, outcome: &str, seconds: f64, session: Option<Option<String>>) {
+        let rec = crate::wake::WakeRecord { at: now().to_rfc3339(), outcome: outcome.to_string(), seconds };
+        let r = crate::update_wake(&self.home, |wf| {
+            if let Some(c) = wf.workers.get_mut(agent) {
+                c.last = Some(rec);
+                if let Some(sid) = session {
+                    c.session_id = sid;
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            warn!("wake: could not record the outcome for {agent}: {e:#}");
+        }
+    }
+
+    fn fire_wakes(&mut self) -> Result<()> {
+        if self.wake_due.is_empty() {
+            return Ok(());
+        }
+        let limits = WakeLimits::from_env();
+        let now_i = Instant::now();
+        let mut due: Vec<(String, Instant)> = self.wake_due.iter().filter(|(_, t)| **t <= now_i).map(|(a, t)| (a.clone(), *t)).collect();
+        due.sort_by_key(|(_, t)| *t);
+        for (agent, _) in due {
+            if self.wake_inflight.len() >= limits.concurrent {
+                break; // stays due; fires when a slot frees up
+            }
+            self.wake_due.remove(&agent);
+            let Some(p) = self.wake_enabled(&agent) else { continue };
+            if self.sessions.contains_key(&agent) || self.wake_inflight.contains_key(&agent) {
+                continue;
+            }
+            let unread = self.unread_count(&agent)?;
+            if unread == 0 {
+                continue;
+            }
+            let Some(cfg) = crate::load_wake(&self.home).ok().and_then(|w| w.workers.get(&agent).cloned()) else { continue };
+            let hour = now().timestamp() / 3600;
+            let key = format!("wake:{agent}");
+            if self.budget_used(&key, hour)? >= limits.per_hour {
+                warn!("wake: {} skipped: {} wakes this hour (AGENTLAN_WAKE_PER_HOUR)", self.handle_of(&p), limits.per_hour);
+                self.record_wake(&agent, &format!("skipped: reached {} wakes this hour", limits.per_hour), 0.0, None);
+                continue;
+            }
+            self.db.execute("INSERT INTO budget(key, window, count) VALUES(?1,?2,1) ON CONFLICT(key, window) DO UPDATE SET count=count+1", params![key, hour])?;
+            let latest: Option<Amf> = self
+                .db
+                .query_row(
+                    "SELECT m.envelope FROM inbox i JOIN messages m USING(msg_id) WHERE i.agent_id=?1 AND i.state!='acked' ORDER BY i.rowid DESC LIMIT 1",
+                    params![agent],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|e| serde_json::from_str(&e).ok());
+            let job = crate::wake::WakeJob {
+                agent_id: agent.clone(),
+                name: p.name.clone(),
+                handle: self.handle_of(&p),
+                role: p.role.clone(),
+                home: self.home.clone(),
+                cfg,
+                unread,
+                latest_from: latest.as_ref().and_then(|m| m.from.handle.clone()),
+                latest_intent: latest.as_ref().map(|m| m.intent.clone()),
+            };
+            info!("wake: starting {} ({unread} unread)", job.handle);
+            let tx = self.cmd_tx.clone();
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentlan"));
+            let id = agent.clone();
+            let h = self.rt.spawn(async move {
+                let result = crate::wake::run(job, exe).await;
+                let _ = tx.send(NCmd::WakeDone { agent_id: id, result });
+            });
+            self.wake_inflight.insert(agent, (now_i, h.abort_handle()));
+        }
+        Ok(())
+    }
+
+    fn wake_done(&mut self, agent: &str, result: crate::wake::WakeResult) -> Result<()> {
+        self.wake_inflight.remove(agent);
+        self.record_wake(agent, &result.outcome, result.seconds, Some(result.session_id.clone()));
+        // Mail that arrived while it ran gets another wake (budget permitting); mail it
+        // left unread from before doesn't (no wake loops on a message it won't handle).
+        if self.wake_again.remove(agent) && self.unread_count(agent)? > 0 {
+            self.wake_due.insert(agent.to_string(), Instant::now() + WakeLimits::from_env().debounce);
+        }
+        Ok(())
+    }
+
     fn pair_paused(&self, sender: &str, peer: &str) -> Result<Option<String>> {
         Ok(self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![format!("pair:{sender}>{peer}")], |r| r.get(0)).optional()?)
     }
@@ -1424,6 +1617,25 @@ impl NodeState {
                 keep.push(p);
             }
             local = keep;
+        }
+        // Single-recipient sends (e.g. `request` to a role) with nobody live to take them:
+        // fall back to a wake-enabled worker here, unless the roster shows a live match on
+        // another PC (the hub applies the same fallback for remote workers).
+        if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) && local.is_empty() {
+            let matches = |p: &AgentProfile| match &env.to {
+                Target::Role { role, project, .. } => &p.role == role && project.as_ref().is_none_or(|pr| p.project.as_deref() == Some(pr.as_str())),
+                Target::Project { project, .. } => p.project.as_deref() == Some(project.as_str()),
+                _ => false,
+            };
+            let live_remote = self.base_agents.values().any(|a| a.machine_id != self.cfg.machine_id && a.state == PresenceState::Online && matches(&a.profile));
+            if !live_remote {
+                let mut cands: Vec<AgentProfile> =
+                    self.profiles.iter().filter(|p| p.agent_id != sender.agent_id && matches(p) && self.wake_enabled(&p.agent_id).is_some()).cloned().collect();
+                cands.retain(|p| self.pair_paused(&sender.agent_id, &p.agent_id).ok().flatten().is_none());
+                if let Some(p) = cands.into_iter().next() {
+                    local = vec![p];
+                }
+            }
         }
         if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) && !local.is_empty() {
             local.truncate(1);

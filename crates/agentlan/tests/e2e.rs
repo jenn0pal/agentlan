@@ -1126,3 +1126,79 @@ fn up_and_connect_one_liners() {
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(e.status("pc2")["hub"], "ready", "server still up after the srv node stopped");
 }
+
+/// Worker wake over ACP, with a fake ACP agent: direct mail wakes an idle worker and its
+/// reply comes back; the next wake resumes the same session; a single-recipient request to
+/// a role with nobody online reaches the wake-enabled worker (through the hub, and through
+/// the node for a same-PC sender); broadcasts don't wake; a messages-only wake refuses
+/// other actions; the hourly wake budget holds.
+#[test]
+fn worker_wake_over_acp() {
+    let mut e = Env::new();
+    e.extra_env.push(("AGENTLAN_WAKE_DEBOUNCE_MS", "200".into()));
+    e.extra_env.push(("AGENTLAN_WAKE_PER_HOUR", "4".into()));
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "lead", "--role", "lead"]);
+    e.run("n2", &["agent", "add", "builder", "--role", "builder", "--mode", "worker", "--project", "shop"]);
+    e.run("n2", &["agent", "add", "helper", "--role", "helper"]);
+    let log = e.root.join("fake-acp.log");
+    let work = e.root.join("builder-proj");
+    std::fs::create_dir_all(&work).unwrap();
+    let fake = format!("\"{BIN}\" dev fake-acp --log \"{}\"", log.display());
+    e.run("n2", &["wake", "enable", "builder", "--agent", "custom", "--command", &fake, "--cwd", work.to_str().unwrap(), "--timeout", "60"]);
+    // Only worker profiles can be woken.
+    let bad = e.cmd("n2", &["wake", "enable", "helper", "--agent", "custom", "--command", &fake]).output().unwrap();
+    assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("not a worker"));
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+    wait_until("builder known on pc-one", T, || e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "builder@pc-two"));
+    let log_lines = || std::fs::read_to_string(&log).unwrap_or_default();
+    let lead_replies = |e: &Env| -> Vec<String> {
+        e.json("n1", &["inbox", "--as", "lead", "--json"])["messages"].as_array().unwrap().iter().filter_map(|m| m["parts"][0]["text"].as_str().map(String::from)).collect()
+    };
+
+    // 1. Direct mail to the idle worker wakes it; its reply reaches the sender.
+    e.run("n1", &["send", "--as", "lead", "@builder@pc-two", "build the shop"]);
+    wait_until("reply from the woken worker", Duration::from_secs(20), || lead_replies(&e).iter().any(|t| t == "fake reply: build the shop"));
+    let l = log_lines();
+    assert!(l.contains("session/new "), "{l}");
+    assert!(l.contains("permission no"), "messages-only wake rejects a file edit: {l}");
+    // The prompt points at the mail (who, how many) but never carries peer-written text.
+    let prompt = l.lines().find(|x| x.starts_with("prompt ")).unwrap();
+    assert!(prompt.contains("you are builder@pc-two") && prompt.contains("1 unread") && prompt.contains("from lead@pc-one"), "{prompt}");
+    assert!(!prompt.contains("build the shop"), "pointer-only prompt: {prompt}");
+    let sid = l.lines().find_map(|x| x.strip_prefix("session/new ")).unwrap().to_string();
+    wait_until("wake recorded", T, || e.json("n2", &["wake", "ls", "--json"])["workers"][0]["config"]["sessionId"] == sid.as_str());
+
+    // 2. The next wake resumes the same session.
+    e.run("n1", &["send", "--as", "lead", "@builder@pc-two", "and test it"]);
+    wait_until("second reply", Duration::from_secs(20), || lead_replies(&e).iter().any(|t| t == "fake reply: and test it"));
+    assert!(log_lines().contains(&format!("session/resume {sid}")), "{}", log_lines());
+
+    // 3. A request to the role from another PC, nobody online: the hub picks the
+    //    wake-enabled worker, and the reply comes back to the waiting request.
+    let r = e.json("n1", &["request", "--as", "lead", "role:builder", "ship it?", "--wait", "25", "--json"]);
+    assert_eq!(r["reply"]["parts"][0]["text"], "fake reply: ship it?", "{r}");
+
+    // 4. The same from this PC: the node picks its own wake-enabled worker.
+    let r = e.json("n2", &["request", "--as", "helper", "role:builder", "local ask", "--wait", "25", "--json"]);
+    assert_eq!(r["reply"]["parts"][0]["text"], "fake reply: local ask", "{r}");
+    let wakes = log_lines().matches("prompt ").count();
+    assert_eq!(wakes, 4, "{}", log_lines());
+
+    // 5. Broadcasts to the role don't wake anyone.
+    e.run("n1", &["send", "--as", "lead", "role:builder", "fyi"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(log_lines().matches("prompt ").count(), 4, "a broadcast woke the worker");
+
+    // 6. The hourly budget (4 here) stops the next wake and records why.
+    e.run("n1", &["send", "--as", "lead", "@builder@pc-two", "one more"]);
+    wait_until("budget recorded", T, || {
+        e.json("n2", &["wake", "ls", "--json"])["workers"][0]["config"]["last"]["outcome"].as_str().is_some_and(|o| o.starts_with("skipped: reached 4"))
+    });
+    assert_eq!(log_lines().matches("prompt ").count(), 4);
+    // The worker never stays online after a wake.
+    let b = e.json("n2", &["ls", "--json"])["agents"].as_array().unwrap().iter().find(|a| a["handle"] == "builder@pc-two").cloned().unwrap();
+    assert_eq!(b["state"], "offline", "{b}");
+}

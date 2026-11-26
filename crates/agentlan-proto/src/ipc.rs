@@ -53,6 +53,10 @@ pub enum IpcOp {
     },
     /// Stop the node daemon (local clients only; the IPC endpoint is private to this user).
     Shutdown,
+    /// Wake a wake-enabled worker now (it must have unread mail and not be running).
+    WakeNow { agent: String },
+    /// Wake configuration and state of this node's workers.
+    WakeStatus,
     Detach,
     Whoami,
     Status,

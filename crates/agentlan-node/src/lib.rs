@@ -6,6 +6,7 @@ mod ipc;
 mod link;
 pub mod netif;
 mod state;
+pub mod wake;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -123,6 +124,85 @@ pub fn add_agent(home: &Path, name: &str, role: &str, project: Option<String>, r
         };
         pf.agents.push(prof.clone());
         Ok(prof)
+    })
+}
+
+/// Wake settings for worker profiles (`agentlan wake enable`), node-local.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeFile {
+    #[serde(default)]
+    pub workers: std::collections::BTreeMap<String, wake::WakeConfig>,
+}
+
+fn wake_path(home: &Path) -> PathBuf {
+    node_dir(home).join("wake.json")
+}
+
+pub fn load_wake(home: &Path) -> Result<WakeFile> {
+    let p = wake_path(home);
+    if !p.exists() {
+        return Ok(WakeFile::default());
+    }
+    Ok(serde_json::from_str(&std::fs::read_to_string(&p)?)?)
+}
+
+/// Locked read-modify-write of wake.json (the CLI and the node both write it).
+pub fn update_wake<T>(home: &Path, f: impl FnOnce(&mut WakeFile) -> Result<T>) -> Result<T> {
+    ensure_private_dir(&node_dir(home))?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(node_dir(home).join("wake.lock"))?;
+    lock.lock()?;
+    let mut wf = load_wake(home)?;
+    let out = f(&mut wf)?;
+    let path = wake_path(home);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&wf)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(out)
+}
+
+/// Turn wake on for a worker profile: the node starts this agent through ACP when mail
+/// arrives and it isn't running. Marks the profile with the `wake` capability so
+/// single-recipient requests to its role can reach it while it's offline.
+pub fn enable_wake(home: &Path, name: &str, cfg: wake::WakeConfig) -> Result<AgentProfile> {
+    let prof = load_profiles(home)?.agents.into_iter().find(|p| p.name == name).ok_or_else(|| anyhow::anyhow!("no agent profile '{name}' on this PC"))?;
+    if prof.mode != AgentMode::Worker {
+        bail!("'{name}' is not a worker profile; wake is only for profiles created with `agentlan agent add {name} --mode worker`");
+    }
+    let id = prof.agent_id.clone();
+    update_wake(home, |wf| {
+        let mut c = cfg;
+        // Keep the session to resume if only settings changed.
+        if let Some(old) = wf.workers.get(&id) {
+            if old.command == c.command && old.cwd == c.cwd {
+                c.session_id = old.session_id.clone();
+            }
+        }
+        c.name = name.to_string();
+        wf.workers.insert(id.clone(), c);
+        Ok(())
+    })?;
+    update_profiles(home, |pf| {
+        let a = pf.agents.iter_mut().find(|a| a.agent_id == id).ok_or_else(|| anyhow::anyhow!("profile vanished"))?;
+        if !a.capabilities.iter().any(|c| c == "wake") {
+            a.capabilities.push("wake".into());
+        }
+        Ok(a.clone())
+    })
+}
+
+pub fn disable_wake(home: &Path, name: &str) -> Result<()> {
+    let prof = load_profiles(home)?.agents.into_iter().find(|p| p.name == name).ok_or_else(|| anyhow::anyhow!("no agent profile '{name}' on this PC"))?;
+    let id = prof.agent_id.clone();
+    update_wake(home, |wf| {
+        wf.workers.remove(&id);
+        Ok(())
+    })?;
+    update_profiles(home, |pf| {
+        if let Some(a) = pf.agents.iter_mut().find(|a| a.agent_id == id) {
+            a.capabilities.retain(|c| c != "wake");
+        }
+        Ok(())
     })
 }
 
@@ -346,7 +426,7 @@ pub async fn run(home: &Path) -> Result<()> {
         move || machine_info(share)
     })
     .await?;
-    let st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx)?;
+    let st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx, cmd_tx.clone(), tokio::runtime::Handle::current())?;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx, stop_tx))?;
 

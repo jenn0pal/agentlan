@@ -738,6 +738,21 @@ impl Hub {
             } else if !recips.is_empty() {
                 let i = recips.iter().position(|a| a.readiness == Readiness::Idle).unwrap_or(0);
                 recips = vec![recips.swap_remove(i)];
+            } else {
+                // Nobody live: a wake-enabled worker whose node is connected can take it
+                // (its node starts it). Broadcasts never wake anyone.
+                let wanted = |a: &AgentRecord| match &env.to {
+                    Target::Role { role, project, .. } => &a.profile.role == role && project_ok(a, project),
+                    Target::Project { project, .. } => a.profile.project.as_deref() == Some(project.as_str()),
+                    _ => false,
+                };
+                recips = all
+                    .iter()
+                    .filter(remote)
+                    .filter(|a| wanted(a) && a.profile.capabilities.iter().any(|c| c == "wake") && !exclude.contains(&a.profile.agent_id) && self.conns.contains_key(&a.machine_id))
+                    .take(1)
+                    .cloned()
+                    .collect();
             }
         }
         if env.to.is_direct() && recips.is_empty() && local_recipients.is_empty() {
