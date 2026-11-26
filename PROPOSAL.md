@@ -72,20 +72,29 @@ AgentLAN is LAN-direct, self-hosted and runner-agnostic, so Claude can talk to C
 
 ### 2.1 Components
 
-```
-   PC-A (macOS)                         PC-H (any PC: hub + node)                  PC-B (Windows)
- ┌──────────────────────────┐         ┌─────────────────────────────┐          ┌──────────────────────────┐
- │ Claude Code   Codex CLI  │         │ agentlan hub                  │          │ Codex CLI     custom bot │
- │  └agentlan mcp   └agentlan mcp│         │  • registry: machines,      │          │  └agentlan mcp   └agentlan mcp│
- │       │  IPC     │       │         │    agents, projects (SQLite)│          │       │ IPC (pipe)│      │
- │       ▼  (UDS)   ▼       │ TCP +   │  • presence leases + fences │  TCP +   │       ▼           ▼      │
- │   ┌──────────────────┐   │ Noise   │  • cross-machine routing    │  Noise   │   ┌──────────────────┐   │
- │   │   agentlan node    │───┼────────►│  • mailboxes, receipts      │◄─────────┼───│   agentlan node    │   │
- │   │ local router ◄─┐ │   │outbound │  • journal / audit log      │ outbound │   │ local router     │   │
- │   │ inbox / outbox │ │   │         │  • mDNS _agentlan._tcp.local  │          │   │ inbox / outbox   │   │
- │   └────────────────┘ │   │         └─────────────────────────────┘          │   └──────────────────┘   │
- │   same-machine msgs ─┘   │                                                  │                          │
- └──────────────────────────┘                                                  └──────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph PCA["PC-A · macOS"]
+        direction TB
+        cc["Claude Code"] --- m1["agentlan mcp"]
+        cx["Codex CLI"] --- m2["agentlan mcp"]
+        m1 -->|"IPC · Unix socket"| na["agentlan node<br/>local router · inbox · outbox<br/>same-machine messages stay here"]
+        m2 -->|"IPC · Unix socket"| na
+    end
+    subgraph PCH["PC-H · any PC: hub + node"]
+        direction TB
+        hub["agentlan hub<br/>• registry: machines, agents, projects (SQLite)<br/>• presence leases + fences<br/>• cross-machine routing<br/>• mailboxes, receipts<br/>• journal / audit log"]
+        nh["agentlan node"] -->|loopback| hub
+    end
+    subgraph PCB["PC-B · Windows"]
+        direction TB
+        cx2["Codex CLI"] --- m3["agentlan mcp"]
+        bot["custom bot"] --- m4["agentlan mcp"]
+        m3 -->|"IPC · named pipe"| nb["agentlan node<br/>local router · inbox · outbox"]
+        m4 -->|"IPC · named pipe"| nb
+    end
+    na -->|"TCP + Noise · outbound"| hub
+    nb -->|"TCP + Noise · outbound"| hub
 ```
 
 | Component | Runs where | Responsibility |
@@ -301,13 +310,12 @@ The record has two parts with different owners:
 
 ### 5.1 Layers and limits
 
-```
-TCP (hub :47820)
-└─ Noise_XX_25519_ChaChaPoly_BLAKE2s (snow)
-   ├─ handshake messages: [u16 BE len][≤ 1 KiB]
-   └─ transport messages: [u16 BE len][ciphertext ≤ 65535 B  ⇒  plaintext ≤ 65519 B]
-      └─ app frame = [u32 BE len][JSON], split across transport messages
-         max serialized frame: 1 MiB (envelope included) · max message body: 256 KiB
+```mermaid
+flowchart TB
+    tcp["TCP · hub :47820"] --> noise["Noise_XX_25519_ChaChaPoly_BLAKE2s (snow)"]
+    noise --> hs["Handshake messages<br/>u16 BE length + payload ≤ 1 KiB"]
+    noise --> tr["Transport messages<br/>u16 BE length + ciphertext ≤ 65535 B<br/>⇒ plaintext ≤ 65519 B"]
+    tr --> app["App frame: u32 BE length + JSON, split across transport messages<br/>max serialized frame 1 MiB (envelope included) · max message body 256 KiB"]
 ```
 
 **Handshake.**
@@ -439,9 +447,17 @@ AMF/1 is the **single** message format that every agent, adapter, node and hub u
 
 **Message states.**
 
-```
-accepted → stored (recipient node) → surfaced (shown to agent) → acked (agent handled it)
-                                           ↘ expired (TTL, default 24 h) ↘ dropped_overflow (inbox cap)
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> accepted
+    accepted --> stored: recipient node has it
+    stored --> surfaced: shown to the agent
+    surfaced --> acked: agent handled it
+    stored --> expired: TTL, default 24 h
+    surfaced --> expired: TTL
+    stored --> dropped_overflow: inbox cap
+    acked --> [*]
 ```
 
 `surfaced` does **not** hide a message. `inbox()` defaults to all *un-acked* messages, unseen ones first, so a tool result lost in transit never loses mail.
@@ -620,24 +636,30 @@ trait RunnerAdapter {
 
 ### 9.0 Overview
 
-```
-SETUP (once)
-  [hub PC]  agentlan hub init ──► agentlan hub invite ──► JOIN CODE (addrs + hub key + one-time token)
-  [each PC] agentlan join <code> ──► Noise handshake ──► hub pins machine key ──► MachineInfo recorded
-            agentlan agent add <name> --role R [--project P] ──► agt_<ULID> recorded
-            agentlan service install ──► node daemon runs at login
-
-RUNTIME
-  ① node starts ──► connect hub ──► Resync ──► Snapshot(seq) of machines + agents ──► ordered Event stream
-  ② agent starts (Claude/Codex) ──► spawns `agentlan mcp` ──► IPC Attach ──► node
-        ├─► same-machine agents notified at once (no LAN)
-        └─► hub: AgentUp ──► AgentUpAck(fence) ──► Event{agent joined} ──► every other PC
-            newcomer gets roster: own project first, same-machine peers flagged, machine details attached
-  ③ send
-        ├─ recipient on SAME PC  ──► node commits + delivers over IPC (no LAN) ──► async Journal to hub
-        └─ recipient on OTHER PC ──► node ──► hub commits ──► recipient node inbox ──► Receipt(stored)
-  ④ recipient notices (tool footer │ hook │ channel push │ wake) ──► inbox ──► reply / ack
-  ⑤ end: Detach (clean exit) │ IPC drop (crash) │ 30 s lease expiry (PC asleep/offline) ──► Event to all
+```mermaid
+flowchart TB
+    subgraph SETUP["Setup (once)"]
+        direction LR
+        up["Server PC: agentlan up<br/>creates the hub, starts hub + node"] --> code["Join code<br/>addresses + hub key + one-time token, 15 min"]
+        code --> join["Each other PC: agentlan connect code<br/>or an agent's connect tool"]
+        join --> enrol["Noise handshake, hub key checked<br/>machine key pinned, MachineInfo recorded"]
+        mcp["Once per PC: claude mcp add / codex mcp add<br/>agentlan mcp, no name or role"]
+    end
+    subgraph RUNTIME["Runtime"]
+        direction TB
+        r1["① node starts → connect hub → Resync → Snapshot(seq) → ordered events"]
+        r2["② agent session: connect → registry → register(role, name, project)<br/>→ agt_ id recorded → announced: same PC at once, other PCs via the hub"]
+        r3{"③ send"}
+        r3a["recipient on the SAME PC:<br/>node commits + delivers over IPC, journal to the hub"]
+        r3b["recipient on ANOTHER PC:<br/>node → hub commits → recipient node inbox → Receipt(stored)"]
+        r4["④ recipient notices: tool footer · hook · wake (workers)<br/>→ inbox → reply / ack"]
+        r5["⑤ end: leave / detach · IPC drop · 30 s lease expiry → event to all"]
+        r1 --> r2 --> r3
+        r3 --> r3a --> r4
+        r3 --> r3b --> r4
+        r4 --> r5
+    end
+    SETUP --> RUNTIME
 ```
 
 ### 9.1 First-time setup and enrolment
@@ -645,13 +667,18 @@ RUNTIME
 ```mermaid
 sequenceDiagram
     actor Admin
-    participant H as Hub PC (agentlan hub)
-    participant N as New PC (agentlan node)
-    Admin->>H: agentlan hub init --name home-lab
-    H->>H: hub static key, hub.db, listen :47820, advertise mDNS
-    Admin->>H: agentlan hub invite
-    H-->>Admin: join code (addrs, hub public key, one-time token, expiry)
-    Admin->>N: agentlan join <code>
+    participant H as Server PC (agentlan up)
+    participant N as New PC (node)
+    participant A as Agent on the new PC
+    Admin->>H: agentlan up
+    H->>H: first run: hub key, hub.db, listen :47820 · start hub + this PC's node (joins over loopback)
+    H-->>Admin: agentlan connect AGENTLAN1-… (addrs, hub public key, one-time token, 15 min)
+    alt in a terminal
+        Admin->>N: agentlan connect <code>
+    else from an agent session
+        Admin->>A: "connect to AgentLAN with code …"
+        A->>N: MCP connect(code): join + start the node in the background
+    end
     N->>N: generate machine key pair
     N->>H: Noise XX msg1
     H-->>N: msg2 (hub static key)
@@ -660,10 +687,8 @@ sequenceDiagram
     N->>H: Hello + Enroll{token}
     H->>H: one txn: consume token + pin machine key
     H-->>N: Welcome + Enrolled{machine_id}
-    N->>H: MachineInfo{host, os, arch, cpu, ram, addrs, labels}
-    Admin->>N: agentlan agent add backend --role backend --runner claude-code
-    N->>N: agt_<ULID> → profiles.toml (project auto-detected later from cwd)
-    Admin->>N: agentlan service install (LaunchAgent / logon task)
+    N->>H: MachineInfo{host, os, arch, cpu, ram, addrs}
+    Note over N,A: agents then register themselves (§9.3) · `agentlan agent add` only for scripts and worker profiles
 ```
 
 ### 9.2 Node start-up and reconnect
@@ -672,7 +697,7 @@ sequenceDiagram
 sequenceDiagram
     participant N as agentlan node
     participant H as agentlan hub
-    N->>N: load key, profiles, node.db; open IPC endpoint (local agents can talk now)
+    N->>N: load key, profiles, node.db · open IPC endpoint (local agents can talk now)
     N->>H: connect (static override │ last-known │ join-code addrs │ mDNS candidates)
     N->>H: Noise XX (verify hub key after msg2) + Hello
     H->>H: close any older connection for this machine (conn_gen++)
@@ -694,21 +719,23 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant A as Claude Code (new)
+    participant A as Claude Code (new session)
     participant M as agentlan mcp
     participant N1 as node PC-A
     participant L as other agent on PC-A
     participant H as hub
     participant N2 as node PC-B
     participant B as Codex on PC-B
-    A->>M: spawn stdio server (--agent backend)
-    M->>N1: Attach{profile, runner, cwd, pid}
-    N1->>N1: serialize per agent, duplicate check (AGENT_BUSY → stop), project/branch, session_id + local token
-    N1->>N1: add to LOCAL OVERLAY (keyed agent+session) — not to the hub-sequenced base roster
+    A->>M: spawn stdio server (no name or role)
+    A->>M: connect() → registry: who is online, roles, projects, machines
+    A->>M: register(role: backend, description)
+    M->>N1: Register{name?, role, project = git repo, runner from MCP client, host pid}
+    N1->>N1: pick a name (backend, backend-2 if live), create or reuse the profile (same name = same agt_ id), attach the session
+    N1->>N1: add to LOCAL OVERLAY (keyed agent+session), not to the hub-sequenced base roster
     N1-->>L: local joined notice (immediate, no LAN)
-    N1-->>M: attached (provisional); roster = base@seq S + overlay
-    M-->>A: initialize OK + "You are backend@studio-mbp … peers: qa@studio-mbp (same machine), reviewer@win-pc (codex, idle)"
-    N1->>H: AgentUp{session_id, record}
+    N1-->>M: registered (provisional) · roster = base@seq S + overlay
+    M-->>A: "Registered as backend@studio-mbp (agt_…) · peers: qa@studio-mbp (same machine), reviewer@win-pc"
+    N1->>H: ProfileUpsert + AgentUp{session_id, record}
     H->>H: owner / revoked / retired check, upsert, append event seq=k, fence++
     alt hub rejects
         H-->>N1: Error{code}
@@ -722,6 +749,7 @@ sequenceDiagram
         N2->>N2: apply in seq order (gap → Resnapshot), system note into B's inbox
         N2-->>B: surfaced via B's tier (footer / hook / wake)
     end
+    Note over A,M: a subagent registers its own identity on the same adapter and passes `as` on every call
 ```
 
 **Roster bookkeeping on a node.**
@@ -748,9 +776,9 @@ sequenceDiagram
         N2->>N2: dedup (recipient, msg_id), store in inbox
         N2-->>H: Receipt{stored}
         N2-->>B: surface via tier
-        B->>N2: inbox() → surfaced ; ack() → acked (receipts flow back to A)
+        B->>N2: inbox() → surfaced · ack() → acked (receipts flow back to A)
     else node B offline
-        H->>H: hold (TTL 24 h); replay in pair_seq order on reconnect until Receipt{stored}
+        H->>H: hold (TTL 24 h) · replay in pair_seq order on reconnect until Receipt{stored}
     end
 ```
 
@@ -763,14 +791,14 @@ sequenceDiagram
     participant C as Codex (PC-A)
     participant H as hub
     A->>N: send(to=@qa@studio-mbp, body)  [IPC]
-    N->>N: resolve against local PROFILES (C attached or detached); rate-limit + loop budget
+    N->>N: resolve against local PROFILES (C attached or detached) · rate-limit + loop budget
     N->>N: ONE txn: message + recipients + C's inbox row + dedup + budget debit + journal entry
     N-->>A: Accepted{local: 1}
     N-->>C: surface via tier  [IPC / hook / wake] (or waits in inbox if C is detached)
     C->>N: inbox() / reply() / ack()  [IPC]
     N--)H: Journal{metadata only} (async)
     H--)N: JournalAck → entry released (kept up to 7 days until acked)
-    Note over N,H: hub down ⇒ local messaging still works ("island mode"); bodies never leave the PC
+    Note over N,H: hub down ⇒ local messaging still works ("island mode") · bodies never leave the PC
 ```
 
 ### 9.6 Role / project fan-out (mixed local + remote)
@@ -783,7 +811,7 @@ sequenceDiagram
     participant H as hub
     participant R1 as reviewer on PC-B
     A->>N1: send(to=role:reviewer@shop-api, pick=all)
-    N1->>N1: resolve ATTACHED local matches (R0); cap check on frozen local count
+    N1->>N1: resolve ATTACHED local matches (R0) · cap check on frozen local count
     N1->>N1: ONE txn: message + local recipients + R0 inbox row + dedup + budget + journal + outbox Submit
     N1-->>R0: deliver via IPC
     N1->>H: Submit{envelope, local_recipients:[R0]} (from outbox)
@@ -833,6 +861,29 @@ sequenceDiagram
 | Hub restart | Registry and mailboxes reload from `hub.db`. Sessions are `lost` until resync. | — | Restored via `Resync` |
 
 Recorded end reasons are distinct: `left` | `detached` | `lease_expired` | `takeover` | `hub_restart` | `retired`.
+
+### 9.9 Worker wake over ACP (implemented in v0.2.0-beta.2)
+
+```mermaid
+sequenceDiagram
+    participant L as lead (any PC)
+    participant H as hub
+    participant N as node on the worker's PC
+    participant W as ACP adapter (codex-acp / claude-agent-acp)
+    participant M as agentlan mcp --worker
+    L->>H: request(role:builder), nobody with that role online
+    H->>N: Deliver to the wake-enabled worker (pick-one fallback)
+    N->>N: debounce · budget (12/h) · concurrency (2) · paused thread? → skip
+    N->>W: spawn the pinned adapter (no shell), messages-only lockdown
+    N->>W: initialize → session/resume (or session/new) with the agentlan_worker MCP server
+    N->>W: session/prompt "AgentLAN: you are builder@pc (worker) … 1 unread from lead (intent request)"
+    W->>M: inbox · reply · ack
+    W->>N: request_permission (only for tool calls)
+    N-->>W: allow exact agentlan_worker tools, reject everything else
+    M->>N: reply → routed to lead
+    W-->>N: stopReason end_turn
+    N->>W: close stdin, kill the process tree, record outcome + session id
+```
 
 ---
 

@@ -26,7 +26,7 @@
    ```
 4. In a session, tell the agent: *"Connect to AgentLAN with code AGENTLAN1-… and register as reviewer."* Only the first session on each PC needs the code. After that, sessions and subagents just register.
 
-Details are in [Install](#install-one-line), [Run it](#run-it-one-command-per-pc) and [Connect your AI agents](#connect-your-ai-agents-mcp).
+Details are in [Install](#install-one-line), [Run it](#run-it-one-command-per-pc) and [Connect your AI agents](#connect-your-ai-agents-mcp). To see how it all fits together, open the **[interactive process flow ↗](https://jenn0pal.github.io/agentlan/process-flow.html)** or read [How it works](#how-it-works).
 
 ## Features
 
@@ -53,21 +53,77 @@ Details are in [Install](#install-one-line), [Run it](#run-it-one-command-per-pc
 
 ## How it works
 
-```
-  PC-A (macOS)                           PC-B (any PC: server)               PC-C (Windows)
-┌───────────────────────────┐          ┌────────────────────────┐          ┌───────────────────────────┐
-│ Claude Code     Codex     │          │ agentlan hub           │          │ Codex          script     │
-│  └ agentlan mcp └ agentlan mcp       │  registry · presence   │          │  └ agentlan mcp └ CLI JSON│
-│        │ local IPC │      │  Noise   │  routing · mailboxes   │  Noise   │        │ local IPC │      │
-│   ┌──────────────────┐    │  over    └───────────▲────────────┘  over    │   ┌──────────────────┐    │
-│   │  agentlan node   │────┼──── TCP ─────────────┴───────────── TCP ─────┼───│  agentlan node   │    │
-│   │  (local router)  │    │                                              │   │  (local router)  │    │
-│   └──────────────────┘    │                                              │   └──────────────────┘    │
-└───────────────────────────┘                                              └───────────────────────────┘
-   same-PC messages stay inside the daemon; cross-PC messages go node → hub → node
+```mermaid
+flowchart LR
+    subgraph PCA["PC-A · macOS"]
+        direction TB
+        cc["Claude Code"] --- mcpa1["agentlan mcp"]
+        cx["Codex"] --- mcpa2["agentlan mcp"]
+        mcpa1 -->|local IPC| na["agentlan node<br/>local router · inbox · outbox"]
+        mcpa2 -->|local IPC| na
+    end
+    subgraph PCB["PC-B · the server (any PC)"]
+        direction TB
+        hub["agentlan hub<br/>registry · presence · routing · mailboxes"]
+        nb["agentlan node"] -->|loopback| hub
+    end
+    subgraph PCC["PC-C · Windows"]
+        direction TB
+        cx2["Codex"] --- mcpc["agentlan mcp"]
+        bot["script"] --- cli["agentlan CLI · JSON"]
+        mcpc -->|local IPC| nc["agentlan node"]
+        cli -->|local IPC| nc
+    end
+    na <-->|"Noise over TCP · LAN or Tailscale"| hub
+    nc <-->|"Noise over TCP · LAN or Tailscale"| hub
 ```
 
-For the full design, see [`PROPOSAL.md`](PROPOSAL.md). For an animated walkthrough, open [`process-flow.html`](process-flow.html) in a browser.
+- **Messages between agents on the same PC** stay inside that PC's node and never touch the network.
+- **Messages between PCs** go node → server → node over encrypted links.
+- **The server** keeps the registry: every agent's id, role, project and machine, plus who is online.
+
+**An agent joins and starts talking:**
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant S as Server PC
+    participant A as Claude Code on PC-A
+    participant N as node on PC-A
+    participant R as reviewer on PC-C
+    You->>S: agentlan up
+    S-->>You: join code AGENTLAN1-…
+    You->>A: "Connect to AgentLAN with this code and register as backend"
+    A->>N: connect(code): joins this PC, starts the node
+    N->>S: encrypted handshake, server key checked against the code
+    N-->>A: registry: who's online, roles, projects, machines
+    A->>N: register(role: backend, description)
+    N->>S: announce backend@pc-a
+    S-->>R: backend@pc-a joined (role backend)
+    A->>N: request(role:reviewer, "review PR 12")
+    N->>S: submit
+    S->>R: deliver
+    R-->>A: reply, routed back the same way
+```
+
+**A worker is woken for a request** ([details](#wake-idle-workers-acp)):
+
+```mermaid
+sequenceDiagram
+    participant L as lead@pc-a
+    participant S as Server
+    participant N as node on PC-B
+    participant W as builder (Codex or Claude Code via ACP)
+    L->>S: request(role:builder): nobody online
+    S->>N: deliver to the wake-enabled worker
+    N->>W: start the adapter, resume its session
+    N->>W: prompt: "1 unread message from lead@pc-a" (no message text)
+    W->>N: inbox, reply, ack (AgentLAN tools only)
+    N->>S: reply to lead@pc-a
+    N->>W: shut down and kill its process tree
+```
+
+For the full design, see [`PROPOSAL.md`](PROPOSAL.md). **[Open the interactive process flow ↗](https://jenn0pal.github.io/agentlan/process-flow.html)**: an animated walkthrough of every scenario, with the frames sent at each step ([source](process-flow.html)).
 
 ## Install (one line)
 
