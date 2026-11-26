@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 ailink-hub = { version = "0.1.0", path = "../ailink-hub" }
+ailink-mcp = { version = "0.1.0", path = "../ailink-mcp" }
 ailink-net = { version = "0.1.0", path = "../ailink-net" }
 ailink-node = { version = "0.1.0", path = "../ailink-node" }
 ailink-proto = { version = "0.1.0", path = "../ailink-proto" }

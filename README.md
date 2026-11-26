@@ -3,18 +3,18 @@
 Link AI coding agents (Claude Code, Codex, scripts…) across Mac and Windows PCs on your LAN.
 Design: [`PROPOSAL.md`](PROPOSAL.md) · interactive flow: [`process-flow.html`](process-flow.html).
 
-**Status: Milestone 1.**
+**Status: Milestone 1, plus the MCP adapter.**
 
 | Works and is tested on macOS | Not built yet |
 |---|---|
-| • server (hub) on any PC<br>• join codes<br>• Noise-encrypted links<br>• machine and agent registry<br>• roster on connect and join/leave announcements<br>• same-PC routing through the local daemon (works with the server down)<br>• cross-PC messages with store-and-forward, outbox and retry de-duplication<br>• CLI with JSON in and out | • MCP adapter<br>• mDNS discovery<br>• Claude hooks<br>• auto-wake<br>• request/reply<br>• `hub move`<br>• installers |
+| • server (hub) on any PC<br>• join codes<br>• Noise-encrypted links<br>• machine and agent registry<br>• roster on connect and join/leave announcements<br>• same-PC routing through the local daemon (works with the server down)<br>• cross-PC messages with store-and-forward, outbox and retry de-duplication<br>• CLI with JSON in and out<br>• MCP adapter for Claude Code (XML-wrapped text) and Codex (JSON) | • mDNS discovery<br>• Claude hooks<br>• auto-wake<br>• request/reply<br>• `hub move`<br>• installers |
 
 **Windows:** the code is written to be cross-platform, but it has not been built or run on Windows yet.
 
 ## Build
 
 ```sh
-cargo build --release        # → target/release/ailink
+cargo build --release        # → target/release/ailink   (Rust ≥ 1.89)
 cargo test --workspace       # unit tests + end-to-end tests (real processes on 127.0.0.1)
 ```
 
@@ -42,6 +42,21 @@ ailink inbox --as reviewer
 ailink ack --as reviewer msg_…
 ailink wait --as reviewer --timeout 30
 ```
+
+## Connect an AI agent (MCP)
+
+```sh
+# Claude Code (per project): Claude sees peer messages wrapped as <ailink_message … untrusted="true">
+claude mcp add -s local ailink -- ailink mcp --agent backend --runner claude-code
+# Codex CLI: Codex gets JSON (structuredContent mirrored in the text)
+codex mcp add ailink -- ailink mcp --agent auto --runner codex
+```
+
+**Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message` (≤ 45 s), `ack`.
+
+**Result format:** every result carries structured AMF/1 JSON and an unread summary.
+
+**`--agent auto`** picks the profile whose runner matches and whose `--project` equals the git remote of the working directory.
 
 **Scripts and other agents.** Add `--json` to get JSON out, and use `send --stdin` to pass an AMF/1 draft in:
 

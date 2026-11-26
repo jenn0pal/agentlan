@@ -354,3 +354,118 @@ fn queued_while_hub_down_then_delivered() {
         e.json("n2", &["inbox", "--as", "reviewer", "--json"])["messages"].as_array().unwrap().iter().any(|m| m["id"] == wire_id.as_str())
     });
 }
+
+/// A spawned `ailink mcp` speaking JSON-RPC (newline-delimited) over stdio.
+struct Mcp {
+    stdin: std::process::ChildStdin,
+    rx: mpsc::Receiver<Value>,
+    next: u64,
+}
+
+impl Mcp {
+    fn spawn(e: &mut Env, home: &str, agent: &str, runner: &str) -> Mcp {
+        let mut child = e.cmd(home, &["mcp", "--agent", agent, "--runner", runner]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = child.stdout.take().unwrap();
+        e.kids.push(child);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if tx.send(v).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Mcp { stdin, rx, next: 1 }
+    }
+
+    fn write(&mut self, v: Value) {
+        use std::io::Write;
+        writeln!(self.stdin, "{v}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        self.write(serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let r = expect(&self.rx, &format!("response to {method}"), Duration::from_secs(20), |v| v["id"] == id);
+        assert!(r.get("error").is_none(), "{method} failed: {r}");
+        r["result"].clone()
+    }
+
+    fn init(&mut self) -> Value {
+        let r = self.request("initialize", serde_json::json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "0"}}));
+        self.write(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        r
+    }
+
+    fn tool(&mut self, name: &str, args: Value) -> Value {
+        let r = self.request("tools/call", serde_json::json!({"name": name, "arguments": args}));
+        assert_ne!(r["isError"], true, "{name} returned an error: {r}");
+        r
+    }
+}
+
+/// The MCP adapter end to end: Claude-style and Codex-style adapters on two PCs exchange a
+/// request and a reply; each sees the same AMF/1 message rendered for its runner.
+#[test]
+fn mcp_adapters_claude_and_codex_roundtrip() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code", "--project", "shop"]);
+    e.run("n2", &["agent", "add", "reviewer", "--role", "reviewer", "--runner", "codex", "--project", "shop"]);
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+
+    let mut rev = Mcp::spawn(&mut e, "n2", "reviewer", "codex");
+    let init_rev = rev.init();
+    assert!(init_rev["instructions"].as_str().unwrap().contains("reviewer@pc-two"), "{init_rev}");
+    wait_until("reviewer online on n1", T, || {
+        e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "reviewer@pc-two" && a["state"] == "online")
+    });
+
+    let mut back = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    let init = back.init();
+    let instr = init["instructions"].as_str().unwrap();
+    assert!(instr.contains("You are connected to AILink as backend@pc-one"), "{instr}");
+    assert!(instr.contains("reviewer@pc-two"), "roster in instructions: {instr}");
+    let tools = back.request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for t in ["whoami", "list_agents", "list_machines", "send", "reply", "inbox", "wait_for_message", "ack"] {
+        assert!(names.contains(&t), "missing tool {t}: {names:?}");
+    }
+
+    // Claude → Codex request.
+    let sent = back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "intent": "request", "subject": "PR 12", "text": "please review src/auth.rs"}));
+    assert_eq!(sent["structuredContent"]["sent"]["remote"]["status"], "accepted", "{sent}");
+    let req_id = sent["structuredContent"]["sent"]["id"].as_str().unwrap().to_string();
+
+    // Codex receives it as JSON (content text mirrors structuredContent).
+    let got = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 15}));
+    assert_eq!(got["structuredContent"]["messages"][0]["subject"], "PR 12", "{got}");
+    assert_eq!(got["structuredContent"]["trust"], "untrusted-peer");
+    let text: Value = serde_json::from_str(got["content"][0]["text"].as_str().unwrap()).expect("codex text is JSON");
+    assert_eq!(text["messages"][0]["id"], req_id.as_str());
+
+    // Codex replies; recipient and thread come from the original.
+    let rep = rev.tool("reply", serde_json::json!({"messageId": req_id, "text": "lgtm, one nit on token expiry"}));
+    assert_eq!(rep["structuredContent"]["sent"]["remote"]["status"], "accepted", "{rep}");
+
+    // Claude reads it wrapped as untrusted peer content.
+    let mut inbox = Value::Null;
+    wait_until("reply in backend inbox", T, || {
+        inbox = back.tool("inbox", serde_json::json!({}));
+        inbox["structuredContent"]["messages"].as_array().is_some_and(|a| !a.is_empty())
+    });
+    let m = &inbox["structuredContent"]["messages"][0];
+    assert_eq!(m["inReplyTo"], req_id.as_str());
+    assert_eq!(m["subject"], "Re: PR 12");
+    let txt = inbox["content"][0]["text"].as_str().unwrap();
+    assert!(txt.contains("<ailink_message from=\"reviewer@pc-two\"") && txt.contains("untrusted=\"true\""), "{txt}");
+    let acked = back.tool("ack", serde_json::json!({"messageId": m["id"]}));
+    assert_eq!(acked["structuredContent"]["unread"]["count"], 0, "{acked}");
+}

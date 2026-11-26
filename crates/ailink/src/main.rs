@@ -118,6 +118,15 @@ enum Cmd {
         as_agent: String,
         message_id: String,
     },
+    /// MCP stdio server for an AI agent (Claude Code, Codex, …). Stdout is the MCP channel.
+    Mcp {
+        /// Agent profile name, or `auto` (match runner + git remote of the working dir).
+        #[arg(long)]
+        agent: String,
+        /// claude-code | codex | generic — picks the message translator.
+        #[arg(long, default_value = "generic")]
+        runner: String,
+    },
     /// Wait for the next message.
     Wait {
         #[arg(long = "as")]
@@ -357,6 +366,11 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         Cmd::Ack { as_agent, message_id } => {
             call(home, IpcOp::Ack { agent: Some(as_agent), message_id: message_id.clone() }).await?;
             println!("✓ acked {message_id}");
+        }
+        Cmd::Mcp { agent, runner } => {
+            let r = ailink_mcp::Runner::parse(&runner);
+            let agent = if agent == "auto" { ailink_mcp::resolve_auto(home, r.key(), &std::env::current_dir()?)? } else { agent };
+            ailink_mcp::serve(home.to_path_buf(), agent, r).await?;
         }
         Cmd::Wait { as_agent, timeout, json } => {
             let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000 }).await?;
