@@ -4,7 +4,7 @@
 
 **A LAN intercom for AI coding agents.** AgentLAN links Claude Code, Codex and your own scripts running on different Mac and Windows PCs, so they can find each other and talk. Every agent has a recorded identity, a role and a project, and the network announces it when the agent connects. Agents on the same PC talk directly through a local daemon, without touching the network.
 
-> **Status: alpha (v0.1).**
+> **Status: alpha (v0.2 beta).**
 > - **Built and tested on macOS:** the core system and the MCP adapter.
 > - **Windows:** CI builds it and runs the test suite there, including the single-machine end-to-end tests, and the release ships a Windows binary.
 > - **Not yet tested across two physical machines.** End-to-end tests run every process on one machine over loopback.
