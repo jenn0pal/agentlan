@@ -476,3 +476,91 @@ fn mcp_adapters_claude_and_codex_roundtrip() {
     let acked = back.tool("ack", serde_json::json!({"messageId": m["id"]}));
     assert_eq!(acked["structuredContent"]["unread"]["count"], 0, "{acked}");
 }
+
+fn inbox_subjects(e: &Env, home: &str, agent: &str) -> Vec<String> {
+    e.json(home, &["inbox", "--as", agent, "--json"])["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["subject"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+fn send_draft(e: &Env, home: &str, as_agent: &str, draft: Value) -> Value {
+    let mut child = e.cmd(home, &["send", "--as", as_agent, "--stdin", "--json"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(draft.to_string().as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "send failed: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Role, project, machine and pick-one fan-out across two PCs: local legs are delivered by
+/// the node, remote legs by the hub, other projects and the sender are excluded.
+#[test]
+fn fanout_role_project_machine_and_pick_one() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    for (home, name, role, project) in [
+        ("n1", "backend", "backend", "shop"),
+        ("n1", "qa", "qa", "shop"),
+        ("n1", "devops", "devops", "infra"),
+        ("n2", "reviewer", "reviewer", "shop"),
+        ("n2", "qa2", "qa", "shop"),
+    ] {
+        e.run(home, &["agent", "add", name, "--role", role, "--project", project]);
+    }
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+    // Broadcasts go to *attached* agents only.
+    let _s: Vec<_> = [("n1", "backend"), ("n1", "qa"), ("n1", "devops"), ("n2", "reviewer"), ("n2", "qa2")]
+        .iter()
+        .map(|(h, a)| {
+            let rx = e.stream(h, &["attach", a, "--json"]);
+            expect(&rx, "attached", T, |v| v["event"] == "attached");
+            rx
+        })
+        .collect();
+    wait_until("remote agents online on n1", T, || {
+        let agents = e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().clone();
+        ["reviewer@pc-two", "qa2@pc-two"].iter().all(|h| agents.iter().any(|a| a["handle"] == *h && a["state"] == "online"))
+    });
+
+    // Project broadcast: local qa + remote reviewer, qa2; not devops (infra), not the sender.
+    let r = send_draft(&e, "n1", "backend", serde_json::json!({"to": {"kind": "project", "project": "shop"}, "subject": "proj"}));
+    assert_eq!(r["local"], 1, "{r}");
+    assert_eq!(r["remote"], serde_json::json!({"status": "accepted", "count": 2}), "{r}");
+
+    // Role broadcast: qa on both machines.
+    let r = send_draft(&e, "n1", "backend", serde_json::json!({"to": {"kind": "role", "role": "qa"}, "subject": "role-qa"}));
+    assert_eq!((r["local"].as_u64(), r["remote"]["count"].as_u64()), (Some(1), Some(1)), "{r}");
+
+    // pick:one prefers a local match and skips the remote leg entirely.
+    let r = send_draft(&e, "n1", "backend", serde_json::json!({"to": {"kind": "role", "role": "qa", "pick": "one"}, "subject": "pick-local"}));
+    assert_eq!(r["local"], 1, "{r}");
+    assert_eq!(r["remote"]["status"], "none", "{r}");
+
+    // pick:one with no local match: exactly one remote recipient.
+    let r = send_draft(&e, "n2", "qa2", serde_json::json!({"to": {"kind": "role", "role": "backend", "pick": "one"}, "subject": "pick-remote"}));
+    assert_eq!((r["local"].as_u64(), r["remote"]["count"].as_u64()), (Some(0), Some(1)), "{r}");
+
+    // Machine target: every attached agent on pc-two, nothing local.
+    let r = send_draft(&e, "n1", "backend", serde_json::json!({"to": {"kind": "machine", "machine": "pc-two"}, "subject": "machine"}));
+    assert_eq!((r["local"].as_u64(), r["remote"]["count"].as_u64()), (Some(0), Some(2)), "{r}");
+
+    wait_until("remote deliveries settled", T, || inbox_subjects(&e, "n2", "reviewer").len() == 2 && inbox_subjects(&e, "n2", "qa2").len() == 3);
+    let mut rv = inbox_subjects(&e, "n2", "reviewer");
+    rv.sort();
+    assert_eq!(rv, vec!["machine", "proj"]);
+    let mut q2 = inbox_subjects(&e, "n2", "qa2");
+    q2.sort();
+    assert_eq!(q2, vec!["machine", "proj", "role-qa"]);
+    let mut q = inbox_subjects(&e, "n1", "qa");
+    q.sort();
+    assert_eq!(q, vec!["pick-local", "proj", "role-qa"]);
+    assert_eq!(inbox_subjects(&e, "n1", "backend"), vec!["pick-remote"], "sender excluded from its own broadcasts");
+    assert!(inbox_subjects(&e, "n1", "devops").is_empty(), "other project excluded");
+}
