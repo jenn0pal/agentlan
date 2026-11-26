@@ -103,7 +103,11 @@ jobs:
   smoke:
     name: installer smoke test (${{ matrix.os }})
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    # On a tag: test the release just published. On a manual dry run: test the
+    # installers on this branch against the newest published release.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    env:
+      PIN: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.1.0' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -114,7 +118,7 @@ jobs:
       - name: install.sh
         if: runner.os != 'Windows'
         env:
-          AGENTLAN_VERSION: ${{ github.ref_name }}
+          AGENTLAN_VERSION: ${{ env.PIN }}
           AGENTLAN_INSTALL_DIR: ${{ runner.temp }}/agl-bin
         run: |
           sh install.sh
@@ -126,7 +130,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir sums && cd sums
-          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}"
+          gh release download "$PIN" --repo "${{ github.repository }}"
           sha256sum -c SHA256SUMS
       - name: install.sh (unpinned "latest", as in the README one-liner)
         if: runner.os != 'Windows'
@@ -139,7 +143,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          AGENTLAN_VERSION: ${{ github.ref_name }}
+          AGENTLAN_VERSION: ${{ env.PIN }}
           AGENTLAN_INSTALL_DIR: ${{ runner.temp }}\agl-bin
         run: |
           ./install.ps1
