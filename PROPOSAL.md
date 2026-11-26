@@ -1085,4 +1085,10 @@ Where the code differs from this spec, and why:
   - **`setup` writes only `CLAUDE.md` or `AGENTS.md`,** in the git root, inside markers. It neutralises marker text in model input and never writes join codes.
 - **Join code:** unchanged. About 260 characters, one PC, 15 minutes. A real `codex exec` session passed it through intact. A short id can't carry the server's public key, so a shorter code would need discovery, such as mDNS (Phase 3), plus a fingerprint check.
 - **Subagents share their host's adapter process.** MCP calls don't say which agent made them, so identities are chosen explicitly with `as`. With more than one registered, calls without `as` are refused rather than guessed.
+- **Live Claude Code check (headless `claude -p` 2.1.332, Sonnet; the subagent ran on Haiku via the Agent tool).**
+  - The session connected with the code and registered itself as `lead-dev`.
+  - The subagent registered `qa-sub`, sent with `as` and then called `leave`.
+  - The PostToolUse hook found the session's identity through the process tree and pointed at a new message.
+  - `setup` wrote `CLAUDE.md` in the project directory.
+  - **Quirk:** hooks fire for subagent tool calls too, so the subagent saw the session's unread pointer.
 

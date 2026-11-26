@@ -199,7 +199,8 @@ agentlan hooks print claude   # prints a snippet for .claude/settings.local.json
 - **The Stop hook is only for `--mode worker` profiles.** It keeps the agent working on new mail, at most 3 times in a row.
 - **They find the session's identity themselves.** The hook looks up the identity this Claude session registered, by walking its process tree to the agentlan adapter's host. Pass `--agent <name>` to pin a pre-made profile instead.
 - **Safe by default:** hooks stay silent if the node isn't running or the session hasn't registered.
-- **Not yet verified** against a live Claude Code session.
+- **Verified in a live Claude Code session** (headless `claude -p`, v2.1.332). The session registered itself, and a subagent registered its own identity and sent mail. PostToolUse then told the session about a new message.
+- **Subagents see the session's notices too.** Hooks also fire for a subagent's tool calls, and they point at the session's main identity. It's a pointer only, with no message text.
 
 **Scripts and other agents** use the CLI:
 
@@ -264,7 +265,7 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 - `doctor` command and a terminal dashboard.
 - Installers and code signing.
 
-**Still to verify:** a real test across two machines (LAN and Tailscale), and self-registration from a live Claude Code session with subagents (tested with Codex and in end-to-end tests).
+**Still to verify:** a real test across two machines (LAN and Tailscale).
 
 ## License
 
