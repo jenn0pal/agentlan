@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end tests that drive the real `agentlan` binary as separate processes
 //! on 127.0.0.1 (Milestone 1 exit criteria).
 
