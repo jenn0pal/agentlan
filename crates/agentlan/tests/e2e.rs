@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![allow(dead_code)]
 //! End-to-end tests that drive the real `agentlan` binary as separate processes
 //! on 127.0.0.1 (Milestone 1 exit criteria).
 
@@ -23,8 +23,10 @@ struct Env {
 
 impl Env {
     fn new() -> Env {
-        // Short path: Unix socket paths are limited to ~104 bytes on macOS.
-        let root = PathBuf::from(format!("/tmp/agl-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        // Unix: short /tmp path (socket paths are limited to ~104 bytes on macOS).
+        // Windows: the system temp dir (IPC uses named pipes, no path limit).
+        let name = format!("agl-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
+        let root = if cfg!(unix) { PathBuf::from("/tmp").join(name) } else { std::env::temp_dir().join(name) };
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -276,6 +278,7 @@ fn same_machine_delivery_without_hub() {
 
 /// Criterion 5: a plain shell script using only the CLI with JSON can attach, be
 /// announced, send and receive.
+#[cfg(unix)] // uses `sh`
 #[test]
 fn shell_script_using_only_cli_json() {
     let mut e = Env::new();
@@ -726,6 +729,12 @@ fn claude_hooks_pointer_only_and_worker_only_stop() {
         assert!(!st["reason"].as_str().unwrap().contains("fix it"));
     }
     assert!(hook(&e, "n1", "stop", "bot", "s4").is_none(), "continuation budget exhausted");
+    // Tool calls made while the worker keeps going must not reset the budget…
+    hook(&e, "n1", "post-tool-use", "bot", "s4");
+    assert!(hook(&e, "n1", "stop", "bot", "s4").is_none(), "post-tool-use must not reset the Stop budget");
+    // …but a human prompt does.
+    hook(&e, "n1", "user-prompt-submit", "bot", "s4");
+    assert!(hook(&e, "n1", "stop", "bot", "s4").is_some(), "a human turn resets the budget");
 
     // Peeking never consumed the mail.
     let w = e.json("n1", &["wait", "--as", "backend", "--timeout", "3", "--json"]);
@@ -741,6 +750,7 @@ fn claude_hooks_pointer_only_and_worker_only_stop() {
 
 /// Loop guard: a thread pauses after its automated-message budget, the pause survives a
 /// node restart, resuming needs a human at a terminal, and per-pair rate limits apply.
+#[cfg(unix)] // drives a pseudo-terminal via python3
 #[test]
 fn loop_guard_pauses_threads_and_limits_pairs() {
     let mut e = Env::new();
@@ -782,12 +792,19 @@ fn loop_guard_pauses_threads_and_limits_pairs() {
         pty.stdin.take().unwrap().write_all(b"y\n").unwrap();
     }
     let out = pty.wait_with_output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).contains("resumed thr_loop"), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("resumed thread:thr_loop"), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(send(&e, "thr_loop").status.success(), "thread usable again after resume");
 
-    // Per-pair hourly limit: 4 sends so far to b; two more fit, the next is rate-limited.
-    assert!(send(&e, "thr_x").status.success());
-    assert!(send(&e, "thr_y").status.success());
-    let limited = send(&e, "thr_z");
-    assert!(String::from_utf8_lossy(&limited.stderr).contains("RATE_LIMITED"), "{}", String::from_utf8_lossy(&limited.stderr));
+    // Ping-pong without threads (each plain send starts a new thread): the pair budget
+    // stops it, however the peer is addressed (handle or agent id), and pauses the pair.
+    let b_id = e.json("n1", &["agent", "ls", "--json"]).as_array().unwrap().iter().find(|p| p["name"] == "b").unwrap()["agentId"].as_str().unwrap().to_string();
+    let plain = |e: &Env, to: &str| e.cmd("n1", &["send", "--as", "a", to, "ping"]).output().unwrap();
+    assert!(plain(&e, &b_id).status.success(), "5th a→b (by id)");
+    assert!(plain(&e, "@b@pc-one").status.success(), "6th a→b (by handle)");
+    let stopped = plain(&e, &b_id);
+    let err = String::from_utf8_lossy(&stopped.stderr).to_string();
+    assert!(err.contains("PAUSED") && err.contains(&format!("pair:")) && err.contains(&b_id), "{err}");
+    assert!(e.status("n1")["pausedThreads"].as_array().unwrap().iter().any(|p| p["key"].as_str().unwrap().starts_with("pair:")));
+    // The reverse direction is its own pair and still allowed.
+    assert!(e.cmd("n1", &["send", "--as", "b", "@a@pc-one", "pong"]).output().unwrap().status.success());
 }

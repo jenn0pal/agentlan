@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS inbox(
 CREATE TABLE IF NOT EXISTS sent(msg_id TEXT PRIMARY KEY, sender TEXT NOT NULL, result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, msg_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS budget(key TEXT NOT NULL, window INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(key, window));
-CREATE TABLE IF NOT EXISTS paused_threads(thread_id TEXT PRIMARY KEY, paused_at TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS paused(key TEXT PRIMARY KEY, paused_at TEXT NOT NULL, reason TEXT NOT NULL);
 "#;
 
 /// Loop-guard limits (cost/safety brake; agents run as the same OS user, so this is
@@ -836,9 +836,14 @@ impl NodeState {
             IpcOp::Status => {
                 let outbox: i64 = self.db.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
                 let sessions: Vec<Value> = self.sessions.iter().map(|(a, s)| json!({"agentId": a, "sessionId": s.session_id, "fenced": s.fence.is_some()})).collect();
-                let mut st = self.db.prepare("SELECT thread_id, paused_at, reason FROM paused_threads ORDER BY paused_at")?;
-                let paused: Vec<Value> =
-                    st.query_map([], |r| Ok(json!({"threadId": r.get::<_, String>(0)?, "pausedAt": r.get::<_, String>(1)?, "reason": r.get::<_, String>(2)?})))?.filter_map(|x| x.ok()).collect();
+                let mut st = self.db.prepare("SELECT key, paused_at, reason FROM paused ORDER BY paused_at")?;
+                let paused: Vec<Value> = st
+                    .query_map([], |r| {
+                        let key: String = r.get(0)?;
+                        Ok(json!({"key": key, "threadId": key.strip_prefix("thread:"), "pausedAt": r.get::<_, String>(1)?, "reason": r.get::<_, String>(2)?}))
+                    })?
+                    .filter_map(|x| x.ok())
+                    .collect();
                 drop(st);
                 Ok(Some(json!({
                     "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "net": self.cfg.net,
@@ -950,10 +955,12 @@ impl NodeState {
                 })))
             }
             IpcOp::ResumeThread { thread_id } => {
-                let n = self.db.execute("DELETE FROM paused_threads WHERE thread_id=?1", params![thread_id])?;
-                self.db.execute("DELETE FROM budget WHERE key=?1", params![format!("thread:{thread_id}")])?;
-                info!("node: thread {thread_id} resumed by a human");
-                Ok(Some(json!({"resumed": n > 0, "threadId": thread_id})))
+                // Accepts a thread id (thr_…) or any paused key (thread:… / pair:…).
+                let key = if thread_id.contains(':') { thread_id.clone() } else { format!("thread:{thread_id}") };
+                let n = self.db.execute("DELETE FROM paused WHERE key=?1", params![key])?;
+                self.db.execute("DELETE FROM budget WHERE key=?1", params![key])?;
+                info!("node: {key} resumed by a human");
+                Ok(Some(json!({"resumed": n > 0, "key": key})))
             }
             IpcOp::CancelWait => {
                 let (gone, keep): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.conn == conn);
@@ -1042,21 +1049,34 @@ impl NodeState {
         let local_ids: Vec<String> = local.iter().map(|p| p.agent_id.clone()).collect();
 
         // Loop guard: refuse before anything is committed; debits persist with the send.
-        let paused: Option<String> =
-            self.db.query_row("SELECT reason FROM paused_threads WHERE thread_id=?1", params![env.thread_id], |r| r.get(0)).optional()?;
-        if let Some(reason) = paused {
-            return Err(IpcErr("PAUSED", format!("thread {} is paused ({reason}); a human must run `agentlan thread resume {}`", env.thread_id, env.thread_id)));
+        // One canonical pair key per recipient, however it was addressed (handle, id,
+        // reply, local pick-one), so a ping-pong can't spread over several budgets.
+        let direct_peer: Option<String> = match &env.to {
+            Target::Agent { agent } => Some(agent.clone()),
+            Target::Handle { handle } => {
+                let h = handle.trim_start_matches('@');
+                local
+                    .first()
+                    .map(|p| p.agent_id.clone())
+                    .or_else(|| self.base_agents.values().find(|a| a.handle == h).map(|a| a.profile.agent_id.clone()))
+                    .or_else(|| Some(h.to_string()))
+            }
+            Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. } if !needs_remote => local.first().map(|p| p.agent_id.clone()),
+            _ => None,
+        };
+        let pair_key = direct_peer.as_ref().map(|peer| format!("pair:{}>{peer}", sender.agent_id));
+        let thread_key = format!("thread:{}", env.thread_id);
+        for key in std::iter::once(&thread_key).chain(pair_key.iter()) {
+            let paused: Option<String> = self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![key], |r| r.get(0)).optional()?;
+            if let Some(reason) = paused {
+                return Err(IpcErr("PAUSED", format!("{key} is paused ({reason}); a human must run `agentlan thread resume {key}`")));
+            }
         }
         let limits = Limits::from_env();
         let hour = now().timestamp() / 3600;
-        let direct_peer = match &env.to {
-            Target::Agent { agent } => Some(agent.clone()),
-            Target::Handle { handle } => Some(handle.trim_start_matches('@').to_string()),
-            _ => None,
-        };
-        let mut debits: Vec<(String, i64)> = vec![(format!("agent:{}", sender.agent_id), hour), (format!("thread:{}", env.thread_id), 0)];
-        if let Some(peer) = &direct_peer {
-            debits.push((format!("pair:{}>{peer}", sender.agent_id), hour));
+        let mut debits: Vec<(String, i64)> = vec![(format!("agent:{}", sender.agent_id), hour), (thread_key.clone(), 0)];
+        if let Some(k) = &pair_key {
+            debits.push((k.clone(), hour));
         }
         for (key, window) in &debits {
             let used: i64 = self.db.query_row("SELECT COALESCE(SUM(count),0) FROM budget WHERE key=?1 AND window=?2", params![key, window], |r| r.get(0))?;
@@ -1068,13 +1088,15 @@ impl NodeState {
                 (limits.per_thread, "automated messages in this thread")
             };
             if used >= limit {
-                if key.starts_with("thread:") {
+                // Threads and pairs pause until a human resumes them (this is what stops a
+                // ping-pong); the per-agent hourly cap is a plain rate limit.
+                if key.starts_with("thread:") || key.starts_with("pair:") {
                     self.db.execute(
-                        "INSERT OR IGNORE INTO paused_threads(thread_id, paused_at, reason) VALUES(?1,?2,?3)",
-                        params![env.thread_id, now().to_rfc3339(), format!("reached {limit} {what}")],
+                        "INSERT OR IGNORE INTO paused(key, paused_at, reason) VALUES(?1,?2,?3)",
+                        params![key, now().to_rfc3339(), format!("reached {limit} {what}")],
                     )?;
-                    warn!("node: loop guard paused thread {}", env.thread_id);
-                    return Err(IpcErr("PAUSED", format!("thread {} reached {limit} {what}; it is now paused — a human must run `agentlan thread resume {}`", env.thread_id, env.thread_id)));
+                    warn!("node: loop guard paused {key}");
+                    return Err(IpcErr("PAUSED", format!("{key} reached {limit} {what}; it is now paused — a human must run `agentlan thread resume {key}`")));
                 }
                 return Err(IpcErr("RATE_LIMITED", format!("loop guard: {limit} {what} reached; try again later")));
             }

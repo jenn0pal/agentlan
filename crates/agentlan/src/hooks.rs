@@ -143,18 +143,24 @@ pub async fn run(home: &Path, event: &str, agent: &str) -> Result<()> {
         }
         "stop" => {
             let worker = peek["agent"]["mode"] == "worker";
-            if worker && unread > 0 && st.stop_blocks < STOP_BUDGET {
-                st.stop_blocks += 1;
-                Some(json!({"decision": "block", "reason": pointer(&peek)}))
+            if worker && unread > 0 {
+                if st.stop_blocks < STOP_BUDGET {
+                    st.stop_blocks += 1;
+                    Some(json!({"decision": "block", "reason": pointer(&peek)}))
+                } else {
+                    None // budget exhausted: stay exhausted until a human prompt
+                }
             } else {
-                st.stop_blocks = 0;
+                st.stop_blocks = 0; // nothing pending: a genuine stop
                 None
             }
         }
         _ => None,
     };
-    if event != "stop" {
-        st.stop_blocks = 0; // any other activity resets the continuation budget
+    // Only a human turn resets the continuation budget; tool calls made while the
+    // agent keeps working must not (otherwise the budget never runs out).
+    if event == "user-prompt-submit" || event == "session-start" {
+        st.stop_blocks = 0;
     }
     st.notified.dedup();
     let len = st.notified.len();

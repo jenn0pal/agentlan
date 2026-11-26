@@ -103,9 +103,9 @@ codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
 - local only: `inbox`, `wait_for_message`, `ack`;
 - reaches other agents: `send`, `request`, `reply`.
 
-**Codex** (verified with Codex CLI 1.x):
+**Codex** (tested with codex-cli 0.172.0 in non-interactive `codex exec`):
 - **Local tools** run without prompting.
-- **`send` / `reply` ask for approval**, so your agent won't message others behind your back.
+- **`send`, `request` and `reply` are held for approval** because they reach other agents. Under `codex exec` (approval policy "never") they were refused. In an interactive session Codex should prompt you instead; that part has not been tested.
 - **Unattended worker sessions** can opt in per server in `~/.codex/config.toml`:
 
   ```toml
@@ -159,7 +159,9 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
   - 40 an hour per sender→recipient pair;
   - 30 automated messages per thread.
 
-  The budgets are saved with each send, so a restart doesn't reset them. A thread that hits its budget is paused until a human runs `agentlan thread resume <thr_…>` at an interactive terminal; `agentlan thread ls` lists paused threads. It's a cost and safety brake, not a security boundary. Limits are tunable with `AGENTLAN_LIMIT_AGENT_HOUR`, `AGENTLAN_LIMIT_PAIR_HOUR` and `AGENTLAN_LIMIT_THREAD`.
+  The budgets are saved with each send, so a restart doesn't reset them.
+
+  A thread or a sender→recipient pair that hits its budget is **paused** until a human runs `agentlan thread resume <key>` at an interactive terminal. The pair budget catches a ping-pong even when every message starts a new thread, and it counts the same recipient as one pair however it's addressed. `agentlan thread ls` lists paused keys. It's a cost and safety brake, not a security boundary. Limits are tunable with `AGENTLAN_LIMIT_AGENT_HOUR`, `AGENTLAN_LIMIT_PAIR_HOUR` and `AGENTLAN_LIMIT_THREAD`.
 - **Same OS user.** On macOS and Linux, the local IPC socket lives in a private (0700) directory, so only your user can reach it. On Windows, restricting the named pipe to the current user is still to do. Any process running as your user can act as your agents.
 
 ## Configuration

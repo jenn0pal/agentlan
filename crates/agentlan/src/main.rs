@@ -208,7 +208,7 @@ enum HubCmd {
 enum ThreadCmd {
     /// List threads paused by the loop guard.
     Ls,
-    /// Resume a paused thread. Must be run by a human at an interactive terminal.
+    /// Resume a paused thread (thr_…) or pair (pair:…). Must be run by a human at an interactive terminal.
     Resume { thread_id: String },
 }
 
@@ -491,7 +491,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 println!("(no paused threads)");
             }
             for t in p {
-                println!("{}  paused {}  — {}", t["threadId"].as_str().unwrap_or("?"), t["pausedAt"].as_str().unwrap_or("?"), t["reason"].as_str().unwrap_or(""));
+                println!("{}  paused {}  — {}", t["key"].as_str().unwrap_or("?"), t["pausedAt"].as_str().unwrap_or("?"), t["reason"].as_str().unwrap_or(""));
             }
         }
         Cmd::Thread { cmd: ThreadCmd::Resume { thread_id } } => {
@@ -508,7 +508,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 bail!("not resumed");
             }
             let v = call(home, IpcOp::ResumeThread { thread_id: thread_id.clone() }).await?;
-            println!("{}", if v["resumed"] == true { format!("✓ resumed {thread_id}") } else { format!("{thread_id} was not paused") });
+            println!("{}", if v["resumed"] == true { format!("✓ resumed {}", v["key"].as_str().unwrap_or(&thread_id)) } else { format!("{thread_id} was not paused") });
         }
         Cmd::Wait { as_agent, timeout, json } => {
             let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
