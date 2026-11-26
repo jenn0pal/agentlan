@@ -100,6 +100,12 @@ fn env_ms(name: &str, default: u64) -> u64 {
 
 /// Run the hub until the process is stopped.
 pub async fn run(home: &Path, listen_override: Option<String>) -> Result<()> {
+    run_with_ready(home, listen_override, None).await
+}
+
+/// Like [`run`], but reports the address actually bound (so callers such as
+/// `agentlan up` don't have to guess by probing a port).
+pub async fn run_with_ready(home: &Path, listen_override: Option<String>, ready: Option<oneshot::Sender<std::net::SocketAddr>>) -> Result<()> {
     let hf = load(home)?;
     let dir = hub_dir(home);
     let key = StaticKey::load(&dir.join("hub.key"))?;
@@ -110,6 +116,9 @@ pub async fn run(home: &Path, listen_override: Option<String>) -> Result<()> {
     // Bind before touching persisted presence, so a failed second start changes nothing.
     let addr = listen_override.unwrap_or(hf.listen.clone());
     let listener = TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
+    if let Some(r) = ready {
+        let _ = r.send(listener.local_addr()?);
+    }
     let db = agentlan_store::open(&dir.join("hub.db"))?;
     let hub = Hub::new(db, Duration::from_millis(lease))?;
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();

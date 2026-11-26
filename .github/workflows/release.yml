@@ -2,9 +2,11 @@ name: Release
 
 # Push a tag like v0.1.0 to build binaries for every platform, publish them as a
 # GitHub Release (with SHA-256 checksums), then smoke-test the one-line installers.
+# Run it manually (workflow_dispatch) for a dry run: builds + checksums, no publishing.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -34,6 +36,11 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
+        # musl targets: use the musl-gcc wrapper (native on each runner) for C code
+        # such as the bundled SQLite, instead of relying on cc's compiler lookup.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target ${{ matrix.target }} -p agentlan
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -53,7 +60,8 @@ jobs:
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $d
           Compress-Archive -Path "$d/agentlan.exe", "$d/README.md", "$d/LICENSE-MIT", "$d/LICENSE-APACHE" -DestinationPath "agentlan-$t.zip"
           $h = (Get-FileHash "agentlan-$t.zip" -Algorithm SHA256).Hash.ToLower()
-          "$h  agentlan-$t.zip" | Out-File -Encoding ascii -NoNewline "agentlan-$t.zip.sha256"
+          # LF-terminated, like sha256sum output (SHA256SUMS is built by concatenation).
+          [IO.File]::WriteAllText("$PWD/agentlan-$t.zip.sha256", "$h  agentlan-$t.zip`n")
       - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
@@ -68,41 +76,62 @@ jobs:
           pattern: dist-*
           path: dist
           merge-multiple: true
+      - name: Assemble and verify SHA256SUMS
+        run: |
+          cd dist
+          # One line per artifact, whatever line endings each .sha256 has.
+          for f in *.sha256; do tr -d '\r' < "$f"; echo; done | sed '/^$/d' > SHA256SUMS
+          sha256sum -c SHA256SUMS
       - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           cd dist
-          cat *.sha256 > SHA256SUMS
+          # vX.Y.Z → normal release (becomes "latest"); vX.Y.Z-suffix → pre-release.
+          case "$TAG" in *-*) pre="--prerelease" ;; *) pre="" ;; esac
           notes="Install (macOS/Linux): curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
           Install (Windows PowerShell): irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
           Then: \`agentlan up\` on the server PC, \`agentlan connect <code>\` on the others. See the README."
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release upload "$TAG" ./* --clobber --repo "${{ github.repository }}"
           else
-            gh release create "$TAG" ./* --repo "${{ github.repository }}" --title "AgentLAN $TAG" --notes "$notes" --prerelease
+            gh release create "$TAG" ./* --repo "${{ github.repository }}" --title "AgentLAN $TAG" --notes "$notes" $pre
           fi
 
   smoke:
     name: installer smoke test (${{ matrix.os }})
     needs: release
+    # On a tag: test the release just published. On a manual dry run: test the
+    # installers on this branch against the newest published release.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    env:
+      PIN: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.1.0' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - name: install.sh
         if: runner.os != 'Windows'
         env:
-          AGENTLAN_VERSION: ${{ github.ref_name }}
+          AGENTLAN_VERSION: ${{ env.PIN }}
           AGENTLAN_INSTALL_DIR: ${{ runner.temp }}/agl-bin
         run: |
           sh install.sh
           "$AGENTLAN_INSTALL_DIR/agentlan" --version
           "$AGENTLAN_INSTALL_DIR/agentlan" --help >/dev/null
+      - name: SHA256SUMS verifies every artifact
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir sums && cd sums
+          gh release download "$PIN" --repo "${{ github.repository }}"
+          sha256sum -c SHA256SUMS
       - name: install.sh (unpinned "latest", as in the README one-liner)
         if: runner.os != 'Windows'
         env:
@@ -114,7 +143,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          AGENTLAN_VERSION: ${{ github.ref_name }}
+          AGENTLAN_VERSION: ${{ env.PIN }}
           AGENTLAN_INSTALL_DIR: ${{ runner.temp }}\agl-bin
         run: |
           ./install.ps1

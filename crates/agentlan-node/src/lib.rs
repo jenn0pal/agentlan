@@ -107,7 +107,11 @@ pub fn add_agent(home: &Path, name: &str, role: &str, project: Option<String>, r
         description: None,
     };
     pf.agents.push(prof.clone());
-    std::fs::write(profiles_path(home), serde_json::to_string_pretty(&pf)?)?;
+    // Atomic replace: a running node polling this file never reads a partial write.
+    let path = profiles_path(home);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&pf)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(prof)
 }
 

@@ -53,15 +53,26 @@ detect_target() {
   esac
 }
 
+install_bin() { # <built binary> — same destination as a download
+  mkdir -p "$INSTALL_DIR" || err "cannot create $INSTALL_DIR"
+  cp "$1" "$INSTALL_DIR/agentlan.new" || err "cannot write to $INSTALL_DIR"
+  chmod 755 "$INSTALL_DIR/agentlan.new" || err "cannot make the binary executable"
+  mv -f "$INSTALL_DIR/agentlan.new" "$INSTALL_DIR/agentlan" || err "cannot install into $INSTALL_DIR"
+  BIN="$INSTALL_DIR/agentlan"
+}
+
 from_source() {
   have cargo || err "no prebuilt binary for this system, and Rust is not installed. Install Rust from https://rustup.rs, then run: AGENTLAN_FROM_SOURCE=1 sh install.sh"
   say "Building agentlan from source with cargo (this takes a few minutes)…"
+  root=$(mktemp -d)
   if [ "$VERSION" = latest ]; then
-    cargo install --locked --git "https://github.com/$REPO" agentlan
+    cargo install --locked --root "$root" --git "https://github.com/$REPO" agentlan || err "cargo install failed"
   else
-    cargo install --locked --git "https://github.com/$REPO" --tag "$VERSION" agentlan
+    cargo install --locked --root "$root" --git "https://github.com/$REPO" --tag "$VERSION" agentlan || err "cargo install failed"
   fi
-  BIN="$(command -v agentlan 2>/dev/null || echo "${CARGO_HOME:-$HOME/.cargo}/bin/agentlan")"
+  # Install the binary we just built (not whatever `agentlan` happens to be on PATH).
+  install_bin "$root/bin/agentlan"
+  rm -rf "$root"
 }
 
 # GitHub's /releases/latest skips pre-releases; the releases API lists them too (newest first).
@@ -77,10 +88,18 @@ resolve_version() {
   [ -n "$tag" ] && echo "$tag"
 }
 
+# Returns 1 only when no prebuilt binary is available (caller falls back to a source
+# build). Any other failure is fatal: under `from_release || from_source`, `set -e` is
+# off inside this function, so every step checks for errors explicitly.
 from_release() { # <target>
   target="$1"
-  tag=$(resolve_version) || { say "Could not look up the latest release."; return 1; }
-  base="https://github.com/$REPO/releases/download/$tag"
+  if tag=$(resolve_version); then
+    base="https://github.com/$REPO/releases/download/$tag"
+  else
+    say "Could not query the releases API; trying the latest stable release."
+    tag="latest"
+    base="https://github.com/$REPO/releases/latest/download"
+  fi
   asset="agentlan-$target.tar.gz"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
@@ -95,12 +114,9 @@ from_release() { # <target>
   [ -n "$got" ] || err "need sha256sum or shasum to verify the download"
   [ "$want" = "$got" ] || err "checksum mismatch for $asset (expected $want, got $got)"
   say "Checksum verified."
-  tar -xzf "$tmp/$asset" -C "$tmp"
-  mkdir -p "$INSTALL_DIR"
-  cp "$tmp/agentlan" "$INSTALL_DIR/agentlan.new"
-  chmod 755 "$INSTALL_DIR/agentlan.new"
-  mv -f "$INSTALL_DIR/agentlan.new" "$INSTALL_DIR/agentlan"
-  BIN="$INSTALL_DIR/agentlan"
+  tar -xzf "$tmp/$asset" -C "$tmp" || err "could not extract $asset"
+  [ -f "$tmp/agentlan" ] || err "$asset does not contain the agentlan binary"
+  install_bin "$tmp/agentlan"
 }
 
 main() {
