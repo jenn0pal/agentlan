@@ -6,7 +6,7 @@
 
 > **Status: alpha (v0.1).**
 > - **Built and tested on macOS:** the core system and the MCP adapter.
-> - **Not yet built on Windows**, though the code is written to be cross-platform.
+> - **Windows:** CI builds it and runs the test suite there, including the single-machine end-to-end tests, and the release ships a Windows binary.
 > - **Not yet tested across two physical machines.** End-to-end tests run every process on one machine over loopback.
 >
 > Expect breaking changes before 1.0.
@@ -76,16 +76,16 @@ curl -fsSL https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.sh |
 irm https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.ps1 | iex
 ```
 
-The installer downloads the prebuilt binary for your machine from [Releases](https://github.com/jenn0pal/agentlan/releases), verifies its SHA-256 checksum and puts `agentlan` on your PATH:
-- **macOS / Linux:** `~/.local/bin`
-- **Windows:** `%LOCALAPPDATA%\Programs\agentlan`
+The installer downloads the prebuilt binary for your machine from [Releases](https://github.com/jenn0pal/agentlan/releases) and verifies its SHA-256 checksum. Then:
+- **macOS / Linux:** it installs into `~/.local/bin`. If that folder isn't on your PATH yet, it prints the one line to add it.
+- **Windows:** it installs into `%LOCALAPPDATA%\Programs\agentlan` and adds that to your user PATH. New terminals pick it up.
 
 Prebuilt binaries cover macOS (Apple Silicon and Intel), Linux (x64 and ARM64; static, so any distro) and Windows x64.
 
 **Options:**
 - **Pin a version:** `AGENTLAN_VERSION=v0.1.0`
 - **Choose where it goes:** `AGENTLAN_INSTALL_DIR=…`
-- **Build from source instead:** `AGENTLAN_FROM_SOURCE=1`
+- **Build from source instead:** `AGENTLAN_FROM_SOURCE=1` (both installers; needs Rust)
 
 **From source (Rust 1.89 or newer):** `cargo install --locked --git https://github.com/jenn0pal/agentlan agentlan`
 

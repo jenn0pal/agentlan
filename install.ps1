@@ -9,6 +9,7 @@
 #   $env:AGENTLAN_VERSION = 'v0.1.0'           install a specific release (default: latest)
 #   $env:AGENTLAN_INSTALL_DIR = 'C:\tools\agl'  where to put the binary
 #                                               (default: %LOCALAPPDATA%\Programs\agentlan)
+#   $env:AGENTLAN_FROM_SOURCE = '1'            build from source with cargo instead of downloading
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -18,31 +19,54 @@ $Version = if ($env:AGENTLAN_VERSION) { $env:AGENTLAN_VERSION } else { 'latest' 
 $InstallDir = if ($env:AGENTLAN_INSTALL_DIR) { $env:AGENTLAN_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\agentlan' }
 $Target = 'x86_64-pc-windows-msvc'   # also runs on Windows on Arm (x64 emulation)
 $Asset = "agentlan-$Target.zip"
-if ($Version -eq 'latest') {
-    # /releases/latest skips pre-releases; the releases API lists them too (newest first).
-    $Releases = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases?per_page=1" -Headers @{ 'User-Agent' = 'agentlan-installer' }
-    $Version = @($Releases)[0].tag_name
-    if (-not $Version) { throw 'no AgentLAN release found' }
-}
-$Base = "https://github.com/$Repo/releases/download/$Version"
-
-$Tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentlan-" + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $Tmp | Out-Null
-try {
-    Write-Host "Downloading $Asset ($Version)..."
-    Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset" -OutFile (Join-Path $Tmp $Asset)
-    Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset.sha256" -OutFile (Join-Path $Tmp "$Asset.sha256")
-    $want = ((Get-Content (Join-Path $Tmp "$Asset.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
-    $got = (Get-FileHash (Join-Path $Tmp $Asset) -Algorithm SHA256).Hash.ToLower()
-    if ($want -ne $got) { throw "checksum mismatch for $Asset (expected $want, got $got)" }
-    Write-Host 'Checksum verified.'
-    Expand-Archive -Path (Join-Path $Tmp $Asset) -DestinationPath $Tmp -Force
+function Install-Bin([string]$Built) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item (Join-Path $Tmp 'agentlan.exe') (Join-Path $InstallDir 'agentlan.exe') -Force
+    Copy-Item $Built (Join-Path $InstallDir 'agentlan.exe') -Force
 }
-finally {
-    Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
+
+function Install-FromSource {
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        throw 'Rust is not installed. Install it from https://rustup.rs, then set AGENTLAN_FROM_SOURCE=1 and run this again.'
+    }
+    Write-Host 'Building agentlan from source with cargo (this takes a few minutes)...'
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("agentlan-src-" + [Guid]::NewGuid().ToString('N'))
+    $CargoArgs = @('install', '--locked', '--root', $Root, '--git', "https://github.com/$Repo")
+    if ($Version -ne 'latest') { $CargoArgs += @('--tag', $Version) }
+    $CargoArgs += 'agentlan'
+    & cargo @CargoArgs
+    if ($LASTEXITCODE -ne 0) { throw 'cargo install failed' }
+    Install-Bin (Join-Path $Root 'bin\agentlan.exe')
+    Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue
 }
+
+function Install-FromRelease {
+    $Tag = $Version
+    if ($Tag -eq 'latest') {
+        # /releases/latest skips pre-releases; the releases API lists them too (newest first).
+        $Releases = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases?per_page=1" -Headers @{ 'User-Agent' = 'agentlan-installer' }
+        $Tag = @($Releases)[0].tag_name
+        if (-not $Tag) { throw 'no AgentLAN release found' }
+    }
+    $Base = "https://github.com/$Repo/releases/download/$Tag"
+    $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentlan-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $Tmp | Out-Null
+    try {
+        Write-Host "Downloading $Asset ($Tag)..."
+        Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset" -OutFile (Join-Path $Tmp $Asset)
+        Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset.sha256" -OutFile (Join-Path $Tmp "$Asset.sha256")
+        $want = ((Get-Content (Join-Path $Tmp "$Asset.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
+        $got = (Get-FileHash (Join-Path $Tmp $Asset) -Algorithm SHA256).Hash.ToLower()
+        if ($want -ne $got) { throw "checksum mismatch for $Asset (expected $want, got $got)" }
+        Write-Host 'Checksum verified.'
+        Expand-Archive -Path (Join-Path $Tmp $Asset) -DestinationPath $Tmp -Force
+        Install-Bin (Join-Path $Tmp 'agentlan.exe')
+    }
+    finally {
+        Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
+    }
+}
+
+if ($env:AGENTLAN_FROM_SOURCE -eq '1') { Install-FromSource } else { Install-FromRelease }
 
 $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (-not (($UserPath -split ';') -contains $InstallDir)) {

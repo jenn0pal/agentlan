@@ -254,9 +254,10 @@ impl NodeState {
                 self.ticks += 1;
                 if self.ticks % 10 == 0 {
                     let m = std::fs::metadata(self.home.join("node").join("profiles.json")).and_then(|m| m.modified()).ok();
-                    if m != self.profiles_mtime {
+                    // Only remember the timestamp once the file parsed, so a read that
+                    // caught a partial write is retried on the next poll.
+                    if m != self.profiles_mtime && self.reload_profiles() {
                         self.profiles_mtime = m;
-                        self.reload_profiles();
                     }
                 }
                 self.tick();
@@ -286,13 +287,25 @@ impl NodeState {
         }
     }
 
-    fn reload_profiles(&mut self) {
-        match crate::load_profiles(&self.home) {
-            Ok(pf) => self.profiles = pf.agents,
-            Err(e) => warn!("node: cannot read profiles: {e:#}"),
-        }
-        // Agents added or edited while the node runs: register them with the hub before
-        // anything they send (same link, so the upsert is processed first).
+    /// Re-read profiles.json; returns false if it could not be parsed (e.g. mid-write).
+    fn reload_profiles(&mut self) -> bool {
+        let ok = match crate::load_profiles(&self.home) {
+            Ok(pf) => {
+                self.profiles = pf.agents;
+                true
+            }
+            Err(e) => {
+                warn!("node: cannot read profiles: {e:#}");
+                false
+            }
+        };
+        self.register_changed_profiles();
+        ok
+    }
+
+    /// Agents added or edited while the node runs: register them with the hub before
+    /// anything they send (same link, so the upsert is processed first).
+    fn register_changed_profiles(&mut self) {
         if self.hub == HubStatus::Ready {
             let changed: Vec<AgentProfile> = self
                 .profiles
@@ -530,6 +543,8 @@ impl NodeState {
                     .map(|(a, s)| (a.clone(), s.session_id.clone()))
                     .collect();
                 self.hub = HubStatus::Ready;
+                // Profiles added or edited while resyncing weren't in the Resync payload.
+                self.register_changed_profiles();
                 for (agent, sid) in late {
                     if let Some(p) = self.profiles.iter().find(|p| p.agent_id == agent).cloned() {
                         self.send_live(NodeToHub::AgentUp { session_id: sid, profile: p });

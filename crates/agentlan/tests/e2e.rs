@@ -527,7 +527,10 @@ fn up_and_connect_one_liners() {
     });
 
     // Running `connect` again on a joined PC needs no code (it just runs the node);
-    // here it refuses because the node is already running.
+    // here it refuses up front — no false "running" message — because a node is running.
     let again = e.cmd("pc2", &["connect"]).output().unwrap();
-    assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("already using this directory"));
+    let err = String::from_utf8_lossy(&again.stderr);
+    assert!(!again.status.success() && err.contains("already running") && !err.contains("Starting the node"), "{err}");
+    let again_up = e.cmd("srv", &["up"]).output().unwrap();
+    assert!(!again_up.status.success() && String::from_utf8_lossy(&again_up.stderr).contains("already running"));
 }
