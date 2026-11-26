@@ -93,7 +93,14 @@ pub struct Adapter {
     /// Unbound connection for lookups that need no identity (roster, status).
     anon: Arc<NodeClient>,
     instructions: String,
+    /// `--worker`: a woken worker's server. Only the messaging tools, for its one identity
+    /// (no connect/register/leave/setup: a peer can't get it to join elsewhere, take other
+    /// identities or write project files).
+    worker: bool,
 }
+
+/// The tools a woken worker gets.
+pub const WORKER_TOOLS: [&str; 9] = ["whoami", "list_agents", "list_machines", "send", "request", "reply", "inbox", "wait_for_message", "ack"];
 
 /// Resolve `--agent auto`: the profile whose runner matches (any, if not given) and whose
 /// project equals the git remote of the working directory.
@@ -139,7 +146,10 @@ fn setup_instructions(note: Option<String>) -> String {
 /// Run the MCP server on stdio until the client disconnects. With `agent`, this session
 /// starts as that existing profile (the pre-registration way); without it, the agent
 /// connects and registers itself through the tools.
-pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>) -> Result<()> {
+pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>, worker: bool) -> Result<()> {
+    if worker && agent.as_deref().is_none_or(|a| a == "auto") {
+        bail!("--worker needs --agent <worker profile>");
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let host_pid = agentlan_node::parent_pid();
     let rkey = runner.unwrap_or(Runner::Generic).key().to_string();
@@ -178,7 +188,7 @@ pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>)
         let _ = cell.set(r);
     }
     let anon = Arc::new(NodeClient::new(home.clone(), Bind::None, rkey, host_pid));
-    let adapter = Adapter { home, cwd, host_pid, runner: cell, idents: tokio::sync::Mutex::new(idents), anon, instructions };
+    let adapter = Adapter { home, cwd, host_pid, runner: cell, idents: tokio::sync::Mutex::new(idents), anon, instructions, worker };
     let service = adapter.serve(rmcp::transport::stdio()).await.map_err(|e| anyhow::anyhow!("mcp init failed: {e}"))?;
     service.waiting().await?;
     Ok(())
@@ -931,11 +941,11 @@ impl ServerHandler for Adapter {
     }
 
     async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(ListToolsResult::with_all_items(tools().into_iter().filter(|t| !self.worker || WORKER_TOOLS.contains(&t.name.as_ref())).collect()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|t| t.name == name)
+        tools().into_iter().find(|t| t.name == name && (!self.worker || WORKER_TOOLS.contains(&name)))
     }
 
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
@@ -951,6 +961,9 @@ impl ServerHandler for Adapter {
             }
         });
         let args = request.arguments.unwrap_or_default();
+        if self.worker && !WORKER_TOOLS.contains(&request.name.as_ref()) {
+            return Ok(self.error("NOT_AVAILABLE", &format!("'{}' isn't available to a woken worker", request.name)).into());
+        }
         Ok(self.dispatch(&request.name, args, &context.ct).await.into())
     }
 }

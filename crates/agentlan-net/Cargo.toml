@@ -1,10 +1,10 @@
 [package]
 name = "agentlan-net"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 edition = "2024"
 
 [dependencies]
-agentlan-proto = { version = "0.2.0-beta.1", path = "../agentlan-proto" }
+agentlan-proto = { version = "0.2.0-beta.2", path = "../agentlan-proto" }
 anyhow = "1.0.105"
 bytes = "1.12.2"
 data-encoding = "2.11.1"

@@ -1,6 +1,7 @@
 //! `agentlan` — one binary: hub, node daemon and CLI client.
 
 mod hooks;
+mod wakecli;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -171,6 +172,9 @@ enum Cmd {
         /// claude-code | codex | generic — message format (default: detected from the MCP client).
         #[arg(long)]
         runner: Option<String>,
+        /// Messaging tools only, for the --agent identity (used for woken workers).
+        #[arg(long)]
+        worker: bool,
     },
     /// Run a runner hook (reads the hook JSON on stdin). Example: `hook claude post-tool-use --agent backend`.
     Hook {
@@ -185,6 +189,17 @@ enum Cmd {
     Thread {
         #[command(subcommand)]
         cmd: ThreadCmd,
+    },
+    /// Worker wake: start an idle worker agent (through ACP) when mail arrives for it.
+    Wake {
+        #[command(subcommand)]
+        cmd: WakeCmd,
+    },
+    /// Development helpers (used by tests).
+    #[command(hide = true)]
+    Dev {
+        #[command(subcommand)]
+        cmd: DevCmd,
     },
     /// Hook configuration helpers.
     Hooks {
@@ -227,6 +242,48 @@ enum HubCmd {
     Run {
         #[arg(long)]
         listen: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WakeCmd {
+    /// Enable wake for a worker profile (`agentlan agent add <name> --mode worker`).
+    Enable {
+        name: String,
+        /// codex (codex-acp) | claude (claude-agent-acp) | custom (any ACP agent, with --command)
+        #[arg(long)]
+        agent: String,
+        /// The ACP agent command (default: the adapter found on PATH, pinned as an absolute path).
+        #[arg(long)]
+        command: Option<String>,
+        /// Working directory (project) for the agent (default: the current directory).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// messages (default): AgentLAN tools only. work: reads/edits inside --cwd (Codex: commands in
+        /// its sandbox). full: approve everything, unattended.
+        #[arg(long, default_value = "messages")]
+        access: String,
+        /// Max seconds per wake.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Disable wake for a worker.
+    Disable { name: String },
+    /// Show workers with wake enabled and their last wake.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wake a worker now (it must have unread mail).
+    Now { name: String },
+}
+
+#[derive(Subcommand)]
+enum DevCmd {
+    /// A minimal fake ACP agent for tests.
+    FakeAcp {
+        #[arg(long)]
+        log: PathBuf,
     },
 }
 
@@ -597,9 +654,14 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             // One node operation: send + wait for the actual recipient's reply.
             let out = call(home, IpcOp::Request { as_agent: Some(as_agent), draft, timeout_ms: wait * 1000 }).await?;
             let id = out["sent"]["id"].as_str().unwrap_or_default().to_string();
-            print_value(&out, json, |o| match o["reply"].as_object() {
-                Some(m) => format!("↩ reply from {}: {}", m["from"]["handle"].as_str().unwrap_or("?"), m["parts"][0]["text"].as_str().or(m["subject"].as_str()).unwrap_or("")),
-                None => format!("sent {id}; no reply within {wait}s (it will land in the inbox)"),
+            print_value(&out, json, |o| {
+                // Index the Value (missing keys are Null), not the Map (missing keys panic).
+                let m = &o["reply"];
+                if m.is_object() {
+                    format!("↩ reply from {}: {}", m["from"]["handle"].as_str().unwrap_or("?"), m["parts"][0]["text"].as_str().or(m["subject"].as_str()).unwrap_or(""))
+                } else {
+                    format!("sent {id}; no reply within {wait}s (it will land in the inbox)")
+                }
             });
         }
         Cmd::Inbox { as_agent, limit, json } => {
@@ -624,8 +686,8 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             call(home, IpcOp::Ack { agent: Some(as_agent), message_id: message_id.clone() }).await?;
             println!("✓ acked {message_id}");
         }
-        Cmd::Mcp { agent, runner } => {
-            agentlan_mcp::serve(home.to_path_buf(), agent, runner.as_deref().map(agentlan_mcp::Runner::parse)).await?;
+        Cmd::Mcp { agent, runner, worker } => {
+            agentlan_mcp::serve(home.to_path_buf(), agent, runner.as_deref().map(agentlan_mcp::Runner::parse), worker).await?;
         }
         Cmd::Hook { runner, event, agent } => {
             if runner != "claude" && runner != "claude-code" {
@@ -634,6 +696,13 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             hooks::run(home, &event, &agent).await?;
         }
         Cmd::Hooks { .. } => unreachable!("handled before dispatch"),
+        Cmd::Wake { cmd } => match cmd {
+            WakeCmd::Enable { name, agent, command, cwd, access, timeout } => wakecli::enable(home, &name, &agent, command, cwd, &access, timeout)?,
+            WakeCmd::Disable { name } => wakecli::disable(home, &name)?,
+            WakeCmd::Ls { json } => wakecli::ls(home, json).await?,
+            WakeCmd::Now { name } => wakecli::now(home, &name).await?,
+        },
+        Cmd::Dev { cmd: DevCmd::FakeAcp { log } } => wakecli::fake_acp(&log)?,
         Cmd::Thread { cmd: ThreadCmd::Ls } => {
             let v = call(home, IpcOp::Status).await?;
             let p = v["pausedThreads"].as_array().cloned().unwrap_or_default();
@@ -662,9 +731,14 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         }
         Cmd::Wait { as_agent, timeout, json } => {
             let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
-            print_value(&v, json, |v| match v["message"].as_object() {
-                Some(m) => format!("{} from {}: {}", m["id"].as_str().unwrap_or("?"), m["from"]["handle"].as_str().unwrap_or("?"), m["subject"].as_str().unwrap_or("")),
-                None => "(timed out)".into(),
+            print_value(&v, json, |v| {
+                let m = &v["message"]; // Value indexing: a missing subject is Null, not a panic
+                if m.is_object() {
+                    let what = m["subject"].as_str().or(m["parts"][0]["text"].as_str()).unwrap_or("");
+                    format!("{} from {}: {what}", m["id"].as_str().unwrap_or("?"), m["from"]["handle"].as_str().unwrap_or("?"))
+                } else {
+                    "(timed out)".into()
+                }
             });
         }
     }
