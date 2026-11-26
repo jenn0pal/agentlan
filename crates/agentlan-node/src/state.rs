@@ -1618,16 +1618,23 @@ impl NodeState {
                 Some(_) => (vec![], true),
                 None => return Err(IpcErr("INVALID", format!("bad handle '{handle}'"))),
             },
-            Target::Role { role, project, .. } => (
-                self.profiles
+            Target::Role { role, project, .. } => {
+                let c: Vec<AgentProfile> = self
+                    .profiles
                     .iter()
                     .filter(|p| attached_match(p, &|p| &p.role == role && project.as_ref().is_none_or(|pr| agentlan_proto::ids::project_matches(p.project.as_deref(), pr))))
                     .cloned()
-                    .collect(),
-                true,
-            ),
+                    .collect();
+                let c = match project {
+                    Some(pr) => agentlan_proto::ids::prefer_exact_project(c, pr, |p| p.project.as_deref()),
+                    None => c,
+                };
+                (c, true)
+            }
             Target::Project { project, .. } => {
-                (self.profiles.iter().filter(|p| attached_match(p, &|p| agentlan_proto::ids::project_matches(p.project.as_deref(), project))).cloned().collect(), true)
+                let c: Vec<AgentProfile> =
+                    self.profiles.iter().filter(|p| attached_match(p, &|p| agentlan_proto::ids::project_matches(p.project.as_deref(), project))).cloned().collect();
+                (agentlan_proto::ids::prefer_exact_project(c, project, |p| p.project.as_deref()), true)
             }
             Target::Machine { machine } => {
                 if machine == &self.cfg.machine_id || machine == &self.cfg.alias {
@@ -1677,6 +1684,13 @@ impl NodeState {
                 let mut cands: Vec<AgentProfile> =
                     self.profiles.iter().filter(|p| p.agent_id != sender.agent_id && matches(p) && self.wake_enabled(&p.agent_id).is_some()).cloned().collect();
                 cands.retain(|p| self.pair_paused(&sender.agent_id, &p.agent_id).ok().flatten().is_none());
+                let want = match &env.to {
+                    Target::Role { project: Some(pr), .. } | Target::Project { project: pr, .. } => Some(pr.clone()),
+                    _ => None,
+                };
+                if let Some(w) = want {
+                    cands = agentlan_proto::ids::prefer_exact_project(cands, &w, |p| p.project.as_deref());
+                }
                 if let Some(p) = cands.into_iter().next() {
                     local = vec![p];
                 }

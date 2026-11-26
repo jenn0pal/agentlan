@@ -732,6 +732,13 @@ impl Hub {
             }
             Target::All => all.iter().filter(remote).filter(online).cloned().collect(),
         };
+        // A qualified project target prefers exact project matches over folder-name fallbacks.
+        match &env.to {
+            Target::Role { project: Some(pr), .. } | Target::Project { project: pr, .. } => {
+                recips = agentlan_proto::ids::prefer_exact_project(recips, pr, |a| a.profile.project.as_deref());
+            }
+            _ => {}
+        }
         // Loop guard: the sender's node has paused these pairs.
         recips.retain(|a| !exclude.contains(&a.profile.agent_id));
         if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) {
@@ -751,13 +758,17 @@ impl Hub {
                     Target::Project { project, .. } => agentlan_proto::ids::project_matches(a.profile.project.as_deref(), project),
                     _ => false,
                 };
-                recips = all
+                let mut cands: Vec<AgentRecord> = all
                     .iter()
                     .filter(remote)
                     .filter(|a| wanted(a) && a.profile.capabilities.iter().any(|c| c == "wake") && !exclude.contains(&a.profile.agent_id) && self.conns.contains_key(&a.machine_id))
-                    .take(1)
                     .cloned()
                     .collect();
+                if let Target::Role { project: Some(pr), .. } | Target::Project { project: pr, .. } = &env.to {
+                    cands = agentlan_proto::ids::prefer_exact_project(cands, pr, |a| a.profile.project.as_deref());
+                }
+                cands.truncate(1);
+                recips = cands;
             }
         }
         if env.to.is_direct() && recips.is_empty() && local_recipients.is_empty() {

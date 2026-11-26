@@ -886,8 +886,11 @@ impl Adapter {
                     Some(Value::String(s)) => !s.eq_ignore_ascii_case("false"),
                     _ => true,
                 };
-                let rejected = sent["remote"]["status"] == "rejected" && sent["local"].as_u64().unwrap_or(0) == 0;
-                let acked = want_ack && !rejected && client.call(IpcOp::Ack { agent: None, message_id: mid.to_string() }).await.is_ok();
+                // Only once the reply is known to have gone out: delivered on this PC, or accepted
+                // by the hub. A queued reply (hub unreachable) could still be rejected later, so the
+                // original stays open until then.
+                let delivered = sent["local"].as_u64().unwrap_or(0) > 0 || sent["remote"]["status"] == "accepted";
+                let acked = want_ack && delivered && client.call(IpcOp::Ack { agent: None, message_id: mid.to_string() }).await.is_ok();
                 let unread = self.footer(&client).await;
                 let text = if acked { format!("{}\nMarked {mid} handled.", render::sent(&sent)) } else { render::sent(&sent) };
                 self.result(text, json!({"sent": sent, "acked": acked, "unread": unread}), &unread)

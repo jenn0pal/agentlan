@@ -138,3 +138,42 @@ mod project_tests {
         assert!(!project_matches(None, "agentlan"));
     }
 }
+
+/// Is the wanted project fully qualified (`host/owner/repo`), as opposed to a bare name?
+pub fn project_is_qualified(want: &str) -> bool {
+    let w = want.trim();
+    w.contains('/') || w.contains(':') || w.contains('\\')
+}
+
+/// For a qualified target, keep only candidates whose project matches it exactly when
+/// there are any (so an unrelated remote-less checkout sharing the repository name loses
+/// to the real project); otherwise keep the folder-name fallbacks.
+pub fn prefer_exact_project<T>(items: Vec<T>, want: &str, project: impl Fn(&T) -> Option<&str>) -> Vec<T> {
+    if !project_is_qualified(want) {
+        return items;
+    }
+    let norm = |s: &str| s.trim().replace('\\', "/").trim_end_matches('/').trim_end_matches(".git").trim_end_matches('/').to_ascii_lowercase();
+    let w = norm(want);
+    if items.iter().any(|i| project(i).is_some_and(|p| norm(p) == w)) {
+        items.into_iter().filter(|i| project(i).is_some_and(|p| norm(p) == w)).collect()
+    } else {
+        items
+    }
+}
+
+#[cfg(test)]
+mod prefer_tests {
+    use super::*;
+
+    #[test]
+    fn qualified_targets_prefer_exact_projects() {
+        fn p<'a>(i: &'a (&'static str, Option<&'static str>)) -> Option<&'a str> {
+            i.1
+        }
+        let items = vec![("a", Some("github.com/acme/shop")), ("b", Some("shop"))];
+        assert_eq!(prefer_exact_project(items.clone(), "github.com/acme/shop", p).len(), 1);
+        assert_eq!(prefer_exact_project(items.clone(), "shop", p).len(), 2, "bare target keeps both");
+        let only_fallback = vec![("b", Some("shop"))];
+        assert_eq!(prefer_exact_project(only_fallback, "github.com/acme/shop", p).len(), 1, "no exact: fallback kept");
+    }
+}
