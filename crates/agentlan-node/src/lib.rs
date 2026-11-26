@@ -177,7 +177,7 @@ pub fn enable_wake(home: &Path, name: &str, cfg: wake::WakeConfig) -> Result<Age
         if let Some(old) = wf.workers.get(&id) {
             c.rev = old.rev + 1;
             // A session started with other permissions (e.g. `work`) is never resumed.
-            if old.argv == c.argv && old.cwd == c.cwd && old.preset == c.preset && old.access == c.access {
+            if old.argv == c.argv && old.cwd == c.cwd && old.preset == c.preset && old.access == c.access && old.env == c.env {
                 c.session_id = old.session_id.clone();
             }
         }

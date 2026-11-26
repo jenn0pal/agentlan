@@ -29,8 +29,22 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|d| exts.iter().map(|e| d.join(format!("{name}{e}"))).find(|p| p.is_file()))
 }
 
+/// Environment variables the node sets itself for the lockdown; a worker's `--env` can't
+/// override them.
+const RESERVED_ENV: [&str; 3] = ["CODEX_CONFIG", "INITIAL_AGENT_MODE", "NO_BROWSER"];
+
 #[allow(clippy::too_many_arguments)]
-pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd: Option<PathBuf>, access: &str, timeout_s: u64) -> Result<()> {
+pub fn enable(
+    home: &Path,
+    name: &str,
+    agent: &str,
+    command: Option<String>,
+    cwd: Option<PathBuf>,
+    access: &str,
+    timeout_s: u64,
+    env: Vec<String>,
+    claude_cli: Option<PathBuf>,
+) -> Result<()> {
     let (preset, default_bin, install) = match agent {
         "codex" => (Preset::Codex, "codex-acp", "npm install -g @agentclientprotocol/codex-acp@2.12.1"),
         "claude" | "claude-code" => (Preset::Claude, "claude-agent-acp", "npm install -g @agentclientprotocol/claude-agent-acp@0.112.0"),
@@ -62,7 +76,27 @@ pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd
         Some(c) => canonical(&c).map_err(|e| anyhow!("--cwd {}: {e}", c.display()))?,
         None => std::env::current_dir()?,
     };
-    let cfg = WakeConfig { name: name.to_string(), preset, argv, cwd: cwd.clone(), access, timeout_s, rev: 1, session_id: None, last: None };
+    let mut vars = std::collections::BTreeMap::new();
+    for kv in env {
+        let (k, v) = kv.split_once('=').ok_or_else(|| anyhow!("--env needs KEY=VALUE (got '{kv}')"))?;
+        let k = k.trim();
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || k.starts_with(|c: char| c.is_ascii_digit()) {
+            bail!("--env: '{k}' isn't a valid variable name");
+        }
+        if RESERVED_ENV.contains(&k) {
+            bail!("--env: {k} is set by AgentLAN for the worker's lockdown and can't be overridden");
+        }
+        vars.insert(k.to_string(), v.to_string());
+    }
+    if let Some(cli) = claude_cli {
+        if preset != Preset::Claude {
+            bail!("--claude-cli is for --agent claude");
+        }
+        let p = canonical(&cli).map_err(|e| anyhow!("--claude-cli {}: {e}", cli.display()))?;
+        vars.insert("CLAUDE_CODE_EXECUTABLE".into(), p.to_string_lossy().to_string());
+    }
+    let shown: Vec<String> = vars.keys().cloned().collect();
+    let cfg = WakeConfig { name: name.to_string(), preset, argv, cwd: cwd.clone(), access, timeout_s, env: vars, rev: 1, session_id: None, last: None };
     agentlan_node::enable_wake(home, name, cfg)?;
     println!("✓ wake enabled for '{name}': {command}");
     println!("  working directory {}", cwd.display());
@@ -70,6 +104,9 @@ pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd
         Access::Messages => println!("  access: messages only (AgentLAN tools; no shell, file edits or other MCP servers)"),
         Access::Work => println!("  access: work — reads and edits inside that directory (path-checked); Codex runs commands in its sandbox, Claude's are refused"),
         Access::Full => println!("  access: FULL — every action it asks for is approved, unattended (only the adapter's own limits apply)"),
+    }
+    if !shown.is_empty() {
+        println!("  environment: {} (stored in this PC's private AgentLAN data dir)", shown.join(", "));
     }
     println!("  When mail arrives and '{name}' isn't running, this PC's node starts it (≤ {timeout_s}s per wake).");
     Ok(())
@@ -111,6 +148,10 @@ pub async fn ls(home: &Path, json_out: bool) -> Result<()> {
         );
         let argv: Vec<&str> = c["argv"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
         println!("    {}  (in {})", argv.join(" "), c["cwd"].as_str().unwrap_or(""));
+        if let Some(env) = c["env"].as_object().filter(|e| !e.is_empty()) {
+            // Names only: values may be credentials.
+            println!("    env: {}", env.keys().cloned().collect::<Vec<_>>().join(", "));
+        }
         if let Some(l) = c.get("last").filter(|l| !l.is_null()) {
             println!("    last wake {}: {} ({}s)", l["at"].as_str().unwrap_or("?"), l["outcome"].as_str().unwrap_or("?"), l["seconds"]);
         }
@@ -166,6 +207,9 @@ pub fn fake_acp(log: &Path) -> Result<()> {
             "session/set_mode" => send(json!({"jsonrpc": "2.0", "id": id, "result": {}}))?,
             "session/prompt" => {
                 say(format!("prompt {}", p["prompt"][0]["text"].as_str().unwrap_or("")));
+                if let Ok(mark) = std::env::var("AGENTLAN_FAKE_MARK") {
+                    say(format!("env AGENTLAN_FAKE_MARK={mark}"));
+                }
                 // 1. Try something outside AgentLAN.
                 send(json!({"jsonrpc": "2.0", "id": 9001, "method": "session/request_permission", "params": {
                     "sessionId": p["sessionId"], "toolCall": {"toolCallId": "t1", "title": "Edit files", "kind": "edit"},

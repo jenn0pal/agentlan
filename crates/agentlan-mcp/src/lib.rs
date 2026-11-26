@@ -106,19 +106,11 @@ pub const WORKER_TOOLS: [&str; 9] = ["whoami", "list_agents", "list_machines", "
 /// project equals the git remote of the working directory.
 pub fn resolve_auto(home: &Path, runner: Option<&str>, cwd: &Path) -> Result<String> {
     let profiles = agentlan_node::load_profiles(home)?.agents;
-    let remote = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| agentlan_proto::ids::project_from_remote(String::from_utf8_lossy(&o.stdout).trim()));
-    let Some(project) = remote else {
+    let Some(project) = setup::git_project(cwd) else {
         bail!("--agent auto needs a git repository with an 'origin' remote in {}; pass --agent <name> instead", cwd.display());
     };
     let rn = runner.unwrap_or("any");
-    let hits: Vec<_> = profiles.iter().filter(|p| runner.is_none_or(|r| p.runner == r) && p.project.as_deref() == Some(project.as_str())).collect();
+    let hits: Vec<_> = profiles.iter().filter(|p| runner.is_none_or(|r| p.runner == r) && agentlan_proto::ids::project_matches(p.project.as_deref(), &project)).collect();
     match hits.as_slice() {
         [one] => Ok(one.name.clone()),
         [] => bail!("no {rn} profile for project {project}; run `agentlan agent add <name> --role <role> --runner <runner> --project {project}`"),
@@ -334,8 +326,11 @@ fn base_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "reply",
-            "Reply to a message you received. The recipient and thread come from the original message.",
-            schema(json!({"type":"object","properties":{"messageId":{"type":"string"},"text":{"type":"string"},"intent":{"type":"string","default":"result"}},"required":["messageId","text"]})),
+            "Reply to a message you received. The recipient and thread come from the original message, and the original is marked handled (acked) unless you pass ack: false (e.g. for an interim status update).",
+            schema(json!({"type":"object","properties":{
+                "messageId":{"type":"string"},"text":{"type":"string"},"intent":{"type":"string","default":"result"},
+                "ack":{"type":"boolean","default":true,"description":"Mark the original message handled after replying (default true)."}
+            },"required":["messageId","text"]})),
         ),
         Tool::new(
             "inbox",
@@ -884,8 +879,12 @@ impl Adapter {
                     ..Default::default()
                 };
                 let sent = call!(IpcOp::Send { as_agent: None, draft });
+                // Answering a message handles it (unless this is only an interim update).
+                let acked = args.get("ack").and_then(|v| v.as_bool()).unwrap_or(true)
+                    && client.call(IpcOp::Ack { agent: None, message_id: mid.to_string() }).await.is_ok();
                 let unread = self.footer(&client).await;
-                self.result(render::sent(&sent), json!({"sent": sent, "unread": unread}), &unread)
+                let text = if acked { format!("{}\nMarked {mid} handled.", render::sent(&sent)) } else { render::sent(&sent) };
+                self.result(text, json!({"sent": sent, "acked": acked, "unread": unread}), &unread)
             }
             "inbox" => {
                 let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n.clamp(1, 100) as u32);

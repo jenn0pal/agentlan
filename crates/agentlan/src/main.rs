@@ -266,6 +266,14 @@ enum WakeCmd {
         /// Max seconds per wake.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Extra environment for the agent, e.g. --env CLAUDE_CONFIG_DIR=C:\Users\me\.claude-work
+        /// (repeatable). Stored with the worker in this PC's private data dir.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Claude Code only: run your own Claude CLI (sets CLAUDE_CODE_EXECUTABLE). It must take
+        /// Claude's normal arguments (an .exe/.cmd or script that passes them through).
+        #[arg(long, value_name = "PATH")]
+        claude_cli: Option<PathBuf>,
     },
     /// Disable wake for a worker.
     Disable { name: String },
@@ -697,7 +705,9 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         }
         Cmd::Hooks { .. } => unreachable!("handled before dispatch"),
         Cmd::Wake { cmd } => match cmd {
-            WakeCmd::Enable { name, agent, command, cwd, access, timeout } => wakecli::enable(home, &name, &agent, command, cwd, &access, timeout)?,
+            WakeCmd::Enable { name, agent, command, cwd, access, timeout, env, claude_cli } => {
+                wakecli::enable(home, &name, &agent, command, cwd, &access, timeout, env, claude_cli)?
+            }
             WakeCmd::Disable { name } => wakecli::disable(home, &name)?,
             WakeCmd::Ls { json } => wakecli::ls(home, json).await?,
             WakeCmd::Now { name } => wakecli::now(home, &name).await?,

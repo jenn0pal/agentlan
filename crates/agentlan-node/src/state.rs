@@ -484,7 +484,9 @@ impl NodeState {
         remote.sort_by(|a, b| a.handle.cmp(&b.handle));
         out.extend(remote.into_iter().map(|a| RosterEntry { agent: a.clone(), same_machine: false, stale }));
         out.retain(|e| {
-            project.is_none_or(|p| e.agent.profile.project.as_deref() == Some(p)) && role.is_none_or(|r| e.agent.profile.role == r) && e.agent.state != PresenceState::Retired
+            project.is_none_or(|p| agentlan_proto::ids::project_matches(e.agent.profile.project.as_deref(), p))
+                && role.is_none_or(|r| e.agent.profile.role == r)
+                && e.agent.state != PresenceState::Retired
         });
         out
     }
@@ -559,6 +561,20 @@ impl NodeState {
     }
 
     /// Terminal outcome for a submit: update the cached result and drop the row together.
+    /// A request's send result as it stands now (the hub's verdict may have arrived since
+    /// the request was committed).
+    fn current_sent(&self, r: &SendResult) -> SendResult {
+        let cur: Option<String> = self.db.query_row("SELECT result FROM sent WHERE msg_id=?1", params![r.id], |row| row.get(0)).optional().ok().flatten();
+        match cur.and_then(|c| serde_json::from_str::<SendResult>(&c).ok()) {
+            Some(mut now) => {
+                now.client_id = r.client_id.clone();
+                now.duplicate = r.duplicate;
+                now
+            }
+            None => r.clone(),
+        }
+    }
+
     fn settle_submit(&mut self, msg_id: &str, remote: RemoteResult) -> Result<()> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let r = (|| -> Result<()> {
@@ -782,7 +798,7 @@ impl NodeState {
         self.waiters = keep;
         for w in expired {
             let v = match &w.request {
-                Some(r) => json!({"status": "pending", "sent": r, "reply": null}),
+                Some(r) => json!({"status": "pending", "sent": self.current_sent(r), "reply": null}),
                 None => json!({"message": null, "timedOut": true}),
             };
             self.reply(w.conn, ok(w.req, v));
@@ -928,7 +944,7 @@ impl NodeState {
         self.mark(agent, &env.id, DeliveryState::Surfaced)?;
         let v = match &w.request {
             Some(r) => {
-                json!({"status": "replied", "sent": r, "reply": env, "unread": self.unread_count(agent)?})
+                json!({"status": "replied", "sent": self.current_sent(r), "reply": env, "unread": self.unread_count(agent)?})
             }
             None => json!({"message": env, "unread": self.unread_count(agent)?}),
         };
@@ -1603,11 +1619,15 @@ impl NodeState {
                 None => return Err(IpcErr("INVALID", format!("bad handle '{handle}'"))),
             },
             Target::Role { role, project, .. } => (
-                self.profiles.iter().filter(|p| attached_match(p, &|p| &p.role == role && project.as_ref().is_none_or(|pr| p.project.as_deref() == Some(pr.as_str())))).cloned().collect(),
+                self.profiles
+                    .iter()
+                    .filter(|p| attached_match(p, &|p| &p.role == role && project.as_ref().is_none_or(|pr| agentlan_proto::ids::project_matches(p.project.as_deref(), pr))))
+                    .cloned()
+                    .collect(),
                 true,
             ),
             Target::Project { project, .. } => {
-                (self.profiles.iter().filter(|p| attached_match(p, &|p| p.project.as_deref() == Some(project.as_str()))).cloned().collect(), true)
+                (self.profiles.iter().filter(|p| attached_match(p, &|p| agentlan_proto::ids::project_matches(p.project.as_deref(), project))).cloned().collect(), true)
             }
             Target::Machine { machine } => {
                 if machine == &self.cfg.machine_id || machine == &self.cfg.alias {
@@ -1643,8 +1663,8 @@ impl NodeState {
         // another PC (the hub applies the same fallback for remote workers).
         if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) && local.is_empty() {
             let matches = |p: &AgentProfile| match &env.to {
-                Target::Role { role, project, .. } => &p.role == role && project.as_ref().is_none_or(|pr| p.project.as_deref() == Some(pr.as_str())),
-                Target::Project { project, .. } => p.project.as_deref() == Some(project.as_str()),
+                Target::Role { role, project, .. } => &p.role == role && project.as_ref().is_none_or(|pr| agentlan_proto::ids::project_matches(p.project.as_deref(), pr)),
+                Target::Project { project, .. } => agentlan_proto::ids::project_matches(p.project.as_deref(), project),
                 _ => false,
             };
             let live_remote = self.base_agents.values().any(|a| {
