@@ -511,10 +511,10 @@ impl Hub {
                 )?;
                 self.emit_agent(EventKind::Left, &agent_id)?;
             }
-            NodeToHub::Submit { agent_id, envelope, local_recipients, .. } => {
+            NodeToHub::Submit { agent_id, envelope, local_recipients, exclude, .. } => {
                 let msg_id = envelope.id.clone();
-                match self.submit(mid, &agent_id, envelope, &local_recipients) {
-                    Ok(count) => self.send(mid, HubToNode::Accepted { msg_id, remote: count }),
+                match self.submit(mid, &agent_id, envelope, &local_recipients, &exclude) {
+                    Ok((count, recipients)) => self.send(mid, HubToNode::Accepted { msg_id, remote: count, recipients }),
                     Err(SubmitErr::Reject(code, msg)) => self.send(mid, HubToNode::Rejected { msg_id, code: code.into(), msg }),
                     // Storage failure: roll back and stay silent; the node keeps the row and retries.
                     Err(SubmitErr::Db(e)) => return Err(e),
@@ -690,7 +690,7 @@ impl Hub {
     /// Commit a submission (inside the current transaction) and schedule deliveries.
     /// Submits are durable traffic: they use the node-authenticated path; fences guard
     /// live session mutations (AgentDown) instead.
-    fn submit(&mut self, mid: &str, agent_id: &str, mut env: Amf, local_recipients: &[String]) -> Result<u32, SubmitErr> {
+    fn submit(&mut self, mid: &str, agent_id: &str, mut env: Amf, local_recipients: &[String], exclude: &[String]) -> Result<(u32, Vec<String>), SubmitErr> {
         let sender = self.agent(agent_id)?.ok_or_else(|| SubmitErr::Reject("UNKNOWN_SENDER", agent_id.into()))?;
         if sender.machine_id != mid {
             return Err(SubmitErr::Reject("NOT_OWNER", format!("{agent_id} does not belong to this machine")));
@@ -704,7 +704,9 @@ impl Hub {
             self.db.query_row("SELECT from_agent, remote_count FROM messages WHERE msg_id=?1", params![env.id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         if let Some((from, count)) = prev {
             if from == agent_id {
-                return Ok(count as u32);
+                let mut st = self.db.prepare("SELECT recipient FROM deliveries WHERE msg_id=?1 ORDER BY rowid")?;
+                let r: Vec<String> = st.query_map(params![env.id], |row| row.get(0))?.collect::<Result<_, _>>()?;
+                return Ok((count as u32, r));
             }
             return Err(SubmitErr::Reject("ID_CONFLICT", format!("message id {} was already used by another sender", env.id)));
         }
@@ -728,6 +730,8 @@ impl Hub {
             }
             Target::All => all.iter().filter(remote).filter(online).cloned().collect(),
         };
+        // Loop guard: the sender's node has paused these pairs.
+        recips.retain(|a| !exclude.contains(&a.profile.agent_id));
         if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) {
             if !local_recipients.is_empty() {
                 recips.clear();
@@ -760,6 +764,6 @@ impl Hub {
             )?;
             self.pump_after.insert(r.machine_id.clone());
         }
-        Ok(recips.len() as u32)
+        Ok((recips.len() as u32, recips.iter().map(|r| r.profile.agent_id.clone()).collect()))
     }
 }

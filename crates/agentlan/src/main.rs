@@ -437,14 +437,9 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 reply_by: Some(agentlan_proto::now() + chrono::Duration::seconds(600)),
                 ..Default::default()
             };
-            let sent = call(home, IpcOp::Send { as_agent: Some(as_agent.clone()), draft }).await?;
-            let delivered = sent["local"].as_u64().unwrap_or(0) > 0 || matches!(sent["remote"]["status"].as_str(), Some("queued")) || sent["remote"]["count"].as_u64().unwrap_or(0) > 0;
-            if !delivered {
-                bail!("NOT_DELIVERED: no recipient matched {target} (role/project targets need an online agent)");
-            }
-            let id = sent["id"].as_str().unwrap_or_default().to_string();
-            let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: wait * 1000, in_reply_to: Some(id.clone()) }).await?;
-            let out = json!({"status": if v["message"].is_object() { "replied" } else { "pending" }, "sent": sent, "reply": v["message"]});
+            // One node operation: send + wait for the actual recipient's reply.
+            let out = call(home, IpcOp::Request { as_agent: Some(as_agent), draft, timeout_ms: wait * 1000 }).await?;
+            let id = out["sent"]["id"].as_str().unwrap_or_default().to_string();
             print_value(&out, json, |o| match o["reply"].as_object() {
                 Some(m) => format!("↩ reply from {}: {}", m["from"]["handle"].as_str().unwrap_or("?"), m["parts"][0]["text"].as_str().or(m["subject"].as_str()).unwrap_or("")),
                 None => format!("sent {id}; no reply within {wait}s (it will land in the inbox)"),

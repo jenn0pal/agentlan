@@ -656,6 +656,17 @@ fn mcp_request_tool_and_cancelled_wait() {
     assert_eq!(res["structuredContent"]["status"], "replied", "{res}");
     assert_eq!(res["structuredContent"]["reply"]["parts"][0]["text"], "approved");
 
+    // Cancelling one wait leaves a concurrent request on the same adapter untouched.
+    let rid2 = back.start("tools/call", serde_json::json!({"name": "request", "arguments": {"to": "@reviewer@pc-two", "text": "second?", "waitS": 20}}));
+    let wid0 = back.start("tools/call", serde_json::json!({"name": "wait_for_message", "arguments": {"timeoutS": 30}}));
+    std::thread::sleep(Duration::from_millis(300));
+    back.write(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": wid0, "reason": "test"}}));
+    let got2 = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 15}));
+    let q2 = got2["structuredContent"]["messages"][0]["id"].as_str().unwrap().to_string();
+    rev.tool("reply", serde_json::json!({"messageId": q2, "text": "second answer"}));
+    let res2 = back.finish(rid2);
+    assert_eq!(res2["structuredContent"]["status"], "replied", "request survived the other wait's cancel: {res2}");
+
     // Cancel a pending wait, then deliver: the next wait must still get the message.
     let wid = rev.start("tools/call", serde_json::json!({"name": "wait_for_message", "arguments": {"timeoutS": 30}}));
     std::thread::sleep(Duration::from_millis(300));
@@ -807,4 +818,65 @@ fn loop_guard_pauses_threads_and_limits_pairs() {
     assert!(e.status("n1")["pausedThreads"].as_array().unwrap().iter().any(|p| p["key"].as_str().unwrap().starts_with("pair:")));
     // The reverse direction is its own pair and still allowed.
     assert!(e.cmd("n1", &["send", "--as", "b", "@a@pc-one", "pong"]).output().unwrap().status.success());
+}
+
+/// Only the request's actual recipient can satisfy it: a third agent quoting the request
+/// id in inReplyTo is treated as ordinary mail.
+#[test]
+fn request_reply_only_from_the_real_recipient() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend"]);
+    e.run("n2", &["agent", "add", "reviewer", "--role", "reviewer"]);
+    e.run("n2", &["agent", "add", "intruder", "--role", "other"]);
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+
+    let req = e.cmd("n1", &["request", "--as", "backend", "@reviewer@pc-two", "approve?", "--wait", "20", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let q = e.json("n2", &["wait", "--as", "reviewer", "--timeout", "10", "--json"]);
+    let qid = q["message"]["id"].as_str().unwrap().to_string();
+    e.run("n2", &["send", "--as", "intruder", "@backend@pc-one", "forged yes", "--reply-to", &qid]);
+    std::thread::sleep(Duration::from_millis(500));
+    e.run("n2", &["send", "--as", "reviewer", "@backend@pc-one", "real answer", "--reply-to", &qid]);
+    let out = req.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["reply"]["parts"][0]["text"], "real answer", "{r}");
+    assert_eq!(r["reply"]["from"]["handle"], "reviewer@pc-two");
+    // The forged message is just mail.
+    let w = e.json("n1", &["wait", "--as", "backend", "--timeout", "3", "--json"]);
+    assert_eq!(w["message"]["parts"][0]["text"], "forged yes");
+}
+
+/// Group sends (project broadcast) skip recipients whose pair is paused — locally at the
+/// node and remotely at the hub.
+#[test]
+fn group_sends_respect_paused_pairs() {
+    let mut e = Env::new();
+    e.extra_env = vec![("AGENTLAN_LIMIT_PAIR_HOUR", "2".into())];
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "a", "--role", "dev", "--project", "p"]);
+    e.run("n1", &["agent", "add", "b", "--role", "dev", "--project", "p"]);
+    e.run("n2", &["agent", "add", "c", "--role", "dev", "--project", "p"]);
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+    let _b = e.stream("n1", &["attach", "b", "--json"]);
+    let _c = e.stream("n2", &["attach", "c", "--json"]);
+    wait_until("c online on n1", T, || e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|x| x["handle"] == "c@pc-two" && x["state"] == "online"));
+
+    let broadcast = |e: &Env| send_draft(e, "n1", "a", serde_json::json!({"to": {"kind": "project", "project": "p"}, "subject": "all hands"}));
+    let r = broadcast(&e);
+    assert_eq!((r["local"].as_u64(), r["remote"]["count"].as_u64()), (Some(1), Some(1)), "{r}");
+
+    // Exhaust and pause a→b (local) and a→c (remote) with direct sends.
+    for to in ["@b@pc-one", "@c@pc-two"] {
+        e.run("n1", &["send", "--as", "a", to, "x"]);
+        let third = e.cmd("n1", &["send", "--as", "a", to, "x"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&third.stderr).contains("PAUSED"), "{to}: {}", String::from_utf8_lossy(&third.stderr));
+    }
+    let r = broadcast(&e);
+    assert_eq!(r["local"], 0, "paused local pair skipped: {r}");
+    assert_eq!(r["remote"]["count"], 0, "paused remote pair excluded by the hub: {r}");
 }

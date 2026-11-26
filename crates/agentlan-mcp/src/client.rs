@@ -118,7 +118,16 @@ impl NodeClient {
     }
 
     async fn raw(&self, live: &Live, op: IpcOp) -> std::result::Result<Value, IpcError> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = self.reserve_id();
+        self.raw_id(live, id, op).await
+    }
+
+    /// Reserve an IPC request id (so a later CancelWait can name exactly this call).
+    pub fn reserve_id(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn raw_id(&self, live: &Live, id: u64, op: IpcOp) -> std::result::Result<Value, IpcError> {
         let (tx, rx) = oneshot::channel();
         live.pending.lock().await.insert(id, tx);
         let mut line = serde_json::to_vec(&IpcRequest { id, op }).map_err(|e| IpcError { code: "INTERNAL".into(), msg: e.to_string() })?;
@@ -139,6 +148,11 @@ impl NodeClient {
 
     /// Call an op on the attached session, reconnecting (and re-attaching) if the node restarted.
     pub async fn call(&self, op: IpcOp) -> std::result::Result<Value, CallError> {
+        let id = self.reserve_id();
+        self.call_with_id(id, op).await
+    }
+
+    pub async fn call_with_id(&self, id: u64, op: IpcOp) -> std::result::Result<Value, CallError> {
         if let Some(why) = self.ended.lock().await.clone() {
             return Err(CallError { code: "SESSION_ENDED".into(), msg: why });
         }
@@ -157,6 +171,6 @@ impl NodeClient {
             }
             guard.as_ref().unwrap().clone()
         };
-        self.raw(&live, op).await.map_err(|e| CallError { code: e.code, msg: e.msg })
+        self.raw_id(&live, id, op).await.map_err(|e| CallError { code: e.code, msg: e.msg })
     }
 }

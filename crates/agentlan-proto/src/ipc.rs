@@ -71,8 +71,20 @@ pub enum IpcOp {
     /// Lift a loop-guard pause on a thread (the CLI only sends this after a human
     /// confirmed on an interactive terminal).
     ResumeThread { thread_id: String },
-    /// Drop this connection's pending waits (the caller gave up).
-    CancelWait,
+    /// Drop a pending wait on this connection (the caller gave up): the one with IPC
+    /// request id `reqId`, or all of them if omitted.
+    CancelWait {
+        #[serde(default)]
+        req_id: Option<u64>,
+    },
+    /// Send and wait for a reply in one step (no gap in which the reply could be
+    /// taken by another waiter). Only the actual recipient's reply satisfies it.
+    Request {
+        #[serde(default, rename = "as")]
+        as_agent: Option<String>,
+        draft: SendDraft,
+        timeout_ms: u64,
+    },
     /// Put a message back to "unseen" (a wait result that never reached its caller).
     Unsurface {
         #[serde(default)]

@@ -34,11 +34,26 @@ fn load(p: &Path) -> HookState {
     std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
+/// Atomic replace: a concurrent reader never sees a truncated file.
 fn save(p: &Path, st: &HookState) {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(p, serde_json::to_string(st).unwrap_or_default());
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_string(st).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, p);
+    }
+}
+
+/// Serialise each session's read-modify-write across concurrent hook processes.
+fn lock_session(p: &Path) -> Option<std::fs::File> {
+    let lp = p.with_extension("lock");
+    if let Some(d) = lp.parent() {
+        std::fs::create_dir_all(d).ok()?;
+    }
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lp).ok()?;
+    f.lock().ok()?;
+    Some(f)
 }
 
 fn ctx(event: &str, text: String) -> Value {
@@ -123,6 +138,9 @@ pub async fn run(home: &Path, event: &str, agent: &str) -> Result<()> {
     };
     let session = inp["session_id"].as_str().unwrap_or("default");
     let sp = state_path(home, session);
+    let Some(_lock) = lock_session(&sp) else {
+        return Ok(()); // can't lock: stay silent rather than risk a wrong budget
+    };
     let mut st = load(&sp);
     let unread = peek["unread"].as_i64().unwrap_or(0);
     let ids: Vec<String> = peek["unreadLatest"].as_array().cloned().unwrap_or_default().iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS sent(msg_id TEXT PRIMARY KEY, sender TEXT NOT NULL, r
 CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, msg_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS budget(key TEXT NOT NULL, window INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(key, window));
 CREATE TABLE IF NOT EXISTS paused(key TEXT PRIMARY KEY, paused_at TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS request_recipients(msg_id TEXT NOT NULL, agent_id TEXT NOT NULL, PRIMARY KEY(msg_id, agent_id));
 "#;
 
 /// Loop-guard limits (cost/safety brake; agents run as the same OS user, so this is
@@ -110,6 +111,16 @@ struct Waiter {
     deadline: Instant,
     /// Only a reply to this message satisfies the waiter (request/reply).
     in_reply_to: Option<String>,
+    /// Set for an atomic Request: the send result to report alongside the reply.
+    request: Option<SendResult>,
+}
+
+/// A send committed to the node (or an earlier identical send, for retries).
+struct Committed {
+    env: Amf,
+    result: SendResult,
+    needs_remote: bool,
+    local_ids: Vec<String>,
 }
 
 struct PendingSend {
@@ -405,6 +416,7 @@ impl NodeState {
                         fence: None,
                         envelope,
                         local_recipients: serde_json::from_value(v["localRecipients"].clone()).unwrap_or_default(),
+                        exclude: serde_json::from_value(v["exclude"].clone()).unwrap_or_default(),
                     }
                 }
                 "journal" => NodeToHub::Journal { entry: serde_json::from_str(&body)? },
@@ -573,7 +585,19 @@ impl NodeState {
                     self.send_live(NodeToHub::AgentDown { agent_id: agent, session_id, fence, reason });
                 }
             }
-            HubToNode::Accepted { msg_id, remote } => self.settle_submit(&msg_id, RemoteResult::Accepted { count: remote })?,
+            HubToNode::Accepted { msg_id, remote, recipients } => {
+                self.record_remote_recipients(&msg_id, &recipients)?;
+                if remote == 0 {
+                    // A request nobody can receive should not wait for its timeout.
+                    let (gone, keep): (Vec<Waiter>, Vec<Waiter>) =
+                        std::mem::take(&mut self.waiters).into_iter().partition(|w| w.request.is_some() && w.in_reply_to.as_deref() == Some(msg_id.as_str()));
+                    self.waiters = keep;
+                    for w in gone {
+                        self.reply(w.conn, fail(w.req, "NOT_DELIVERED", "no agent matched the request (role/project targets need an online agent)"));
+                    }
+                }
+                self.settle_submit(&msg_id, RemoteResult::Accepted { count: remote })?
+            }
             HubToNode::Rejected { msg_id, code, msg } => self.settle_submit(&msg_id, RemoteResult::Rejected { code, msg })?,
             HubToNode::Deliver { recipient, pair_seq, envelope } => {
                 if !self.profiles.iter().any(|p| p.agent_id == recipient) {
@@ -645,7 +669,11 @@ impl NodeState {
         let (expired, keep): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.deadline <= now_i);
         self.waiters = keep;
         for w in expired {
-            self.reply(w.conn, ok(w.req, json!({"message": null, "timedOut": true})));
+            let v = match &w.request {
+                Some(r) => json!({"status": "pending", "sent": r, "reply": null}),
+                None => json!({"message": null, "timedOut": true}),
+            };
+            self.reply(w.conn, ok(w.req, v));
         }
         let late: Vec<String> = self.pending.iter().filter(|(_, p)| p.deadline <= now_i).map(|(k, _)| k.clone()).collect();
         for m in late {
@@ -750,18 +778,45 @@ impl NodeState {
     }
 
     /// New mail for a local agent: satisfy one waiter, then push to watchers.
-    fn notify(&mut self, agent: &str, env: &Amf) -> Result<()> {
-        let reply_to = env.in_reply_to.as_deref();
-        let pick = self
-            .waiters
-            .iter()
-            .position(|w| w.agent == agent && w.in_reply_to.is_some() && w.in_reply_to.as_deref() == reply_to)
-            .or_else(|| self.waiters.iter().position(|w| w.agent == agent && w.in_reply_to.is_none()));
-        if let Some(i) = pick {
-            let w = self.waiters.remove(i);
-            self.mark(agent, &env.id, DeliveryState::Surfaced)?;
-            self.reply(w.conn, ok(w.req, json!({"message": env, "unread": self.unread_count(agent)?})));
+    /// Is `sender` one of the recipients actually routed for request `request_id`?
+    fn allowed_replier(&self, request_id: &str, sender: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT 1 FROM request_recipients WHERE msg_id=?1 AND agent_id=?2", params![request_id, sender], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Give a message to one matching waiter: a request waiter for a reply from its real
+    /// recipient first, otherwise a plain waiter. Returns true if consumed.
+    fn offer_to_waiters(&mut self, agent: &str, env: &Amf) -> Result<bool> {
+        let mut pick = None;
+        if let Some(rt) = env.in_reply_to.as_deref() {
+            if self.allowed_replier(rt, &env.from.agent)? {
+                pick = self.waiters.iter().position(|w| w.agent == agent && w.in_reply_to.as_deref() == Some(rt));
+            }
         }
+        let pending: Vec<String> = self.waiters.iter().filter_map(|w| w.in_reply_to.clone()).collect();
+        let reserved = env.in_reply_to.as_ref().is_some_and(|rt| pending.contains(rt)) && pick.is_none() && {
+            // A reply someone is waiting for is never handed to a plain waiter.
+            env.in_reply_to.as_deref().map(|rt| self.allowed_replier(rt, &env.from.agent)).transpose()?.unwrap_or(false)
+        };
+        if pick.is_none() && !reserved {
+            pick = self.waiters.iter().position(|w| w.agent == agent && w.in_reply_to.is_none());
+        }
+        let Some(i) = pick else { return Ok(false) };
+        let w = self.waiters.remove(i);
+        self.mark(agent, &env.id, DeliveryState::Surfaced)?;
+        let v = match &w.request {
+            Some(r) => json!({"status": "replied", "sent": r, "reply": env, "unread": self.unread_count(agent)?}),
+            None => json!({"message": env, "unread": self.unread_count(agent)?}),
+        };
+        self.reply(w.conn, ok(w.req, v));
+        Ok(true)
+    }
+
+    fn notify(&mut self, agent: &str, env: &Amf) -> Result<()> {
+        self.offer_to_waiters(agent, env)?;
         let handle = self.profiles.iter().find(|p| p.agent_id == agent).map(|p| self.handle_of(p)).unwrap_or_default();
         for (id, c) in &self.conns {
             let wants = c.attached.as_deref() == Some(agent) || matches!(&c.watch, Some(None)) || matches!(&c.watch, Some(Some(a)) if a == agent);
@@ -907,7 +962,9 @@ impl NodeState {
                         .db
                         .query_row(
                             "SELECT i.msg_id, m.envelope FROM inbox i JOIN messages m USING(msg_id)
-                             WHERE i.agent_id=?1 AND i.state!='acked' AND json_extract(m.envelope,'$.inReplyTo')=?2 ORDER BY i.rowid LIMIT 1",
+                             WHERE i.agent_id=?1 AND i.state!='acked' AND json_extract(m.envelope,'$.inReplyTo')=?2
+                               AND json_extract(m.envelope,'$.from.agent') IN (SELECT agent_id FROM request_recipients WHERE msg_id=?2)
+                             ORDER BY i.rowid LIMIT 1",
                             params![p.agent_id, rt],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
@@ -930,9 +987,10 @@ impl NodeState {
                     return Ok(Some(json!({"message": serde_json::from_str::<Value>(&env)?, "unread": self.unread_count(&p.agent_id)?})));
                 }
                 let t = timeout_ms.min(300_000);
-                self.waiters.push(Waiter { conn, req: req.id, agent: p.agent_id, deadline: Instant::now() + Duration::from_millis(t), in_reply_to });
+                self.waiters.push(Waiter { conn, req: req.id, agent: p.agent_id, deadline: Instant::now() + Duration::from_millis(t), in_reply_to, request: None });
                 Ok(None)
             }
+            IpcOp::Request { as_agent, draft, timeout_ms } => self.request(conn, req.id, as_agent.as_deref(), draft, timeout_ms),
             IpcOp::Peek { agent } => {
                 let p = self.agent_for(conn, Some(&agent))?;
                 let mut st = self.db.prepare(
@@ -955,15 +1013,24 @@ impl NodeState {
                 })))
             }
             IpcOp::ResumeThread { thread_id } => {
-                // Accepts a thread id (thr_…) or any paused key (thread:… / pair:…).
+                // Accepts a thread id (thr_…) or a paused key (thread:… / pair:…) only.
                 let key = if thread_id.contains(':') { thread_id.clone() } else { format!("thread:{thread_id}") };
-                let n = self.db.execute("DELETE FROM paused WHERE key=?1", params![key])?;
-                self.db.execute("DELETE FROM budget WHERE key=?1", params![key])?;
+                if !(key.starts_with("thread:") || key.starts_with("pair:")) {
+                    return Err(IpcErr("INVALID", format!("'{key}' is not a thread or pair key")));
+                }
+                let tx = self.db.unchecked_transaction()?;
+                let n = tx.execute("DELETE FROM paused WHERE key=?1", params![key])?;
+                if n == 0 {
+                    return Err(IpcErr("NOT_PAUSED", format!("{key} is not paused")));
+                }
+                tx.execute("DELETE FROM budget WHERE key=?1", params![key])?;
+                tx.commit()?;
                 info!("node: {key} resumed by a human");
-                Ok(Some(json!({"resumed": n > 0, "key": key})))
+                Ok(Some(json!({"resumed": true, "key": key})))
             }
-            IpcOp::CancelWait => {
-                let (gone, keep): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.conn == conn);
+            IpcOp::CancelWait { req_id } => {
+                let (gone, keep): (Vec<Waiter>, Vec<Waiter>) =
+                    std::mem::take(&mut self.waiters).into_iter().partition(|w| w.conn == conn && req_id.is_none_or(|r| w.req == r));
                 self.waiters = keep;
                 for w in &gone {
                     self.reply(w.conn, fail(w.req, "CANCELLED", "wait cancelled"));
@@ -976,6 +1043,14 @@ impl NodeState {
                     "UPDATE inbox SET state='stored' WHERE agent_id=?1 AND msg_id=?2 AND state='surfaced'",
                     params![p.agent_id, message_id],
                 )?;
+                if n > 0 {
+                    // A waiter registered meanwhile should get it now, not time out.
+                    let env: Option<String> = self.db.query_row("SELECT envelope FROM messages WHERE msg_id=?1", params![message_id], |r| r.get(0)).optional()?;
+                    if let Some(env) = env {
+                        let env: Amf = serde_json::from_str(&env)?;
+                        self.offer_to_waiters(&p.agent_id, &env)?;
+                    }
+                }
                 Ok(Some(json!({"unsurfaced": n})))
             }
             IpcOp::Watch { agent } => {
@@ -991,7 +1066,54 @@ impl NodeState {
         }
     }
 
-    fn send(&mut self, conn: u64, req_id: u64, as_agent: Option<&str>, mut draft: SendDraft) -> R<Option<Value>> {
+    fn pair_paused(&self, sender: &str, peer: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![format!("pair:{sender}>{peer}")], |r| r.get(0)).optional()?)
+    }
+
+    fn budget_used(&self, key: &str, window: i64) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COALESCE(SUM(count),0) FROM budget WHERE key=?1 AND window=?2", params![key, window], |r| r.get(0))?)
+    }
+
+    fn pause(&self, key: &str, reason: &str) -> Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO paused(key, paused_at, reason) VALUES(?1,?2,?3)", params![key, now().to_rfc3339(), reason])?;
+        warn!("node: loop guard paused {key}");
+        Ok(())
+    }
+
+    /// Remote recipients the hub committed: allowed repliers for requests, and pair
+    /// accounting for group sends (direct sends were debited at commit).
+    fn record_remote_recipients(&mut self, msg_id: &str, recipients: &[String]) -> Result<()> {
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        let row: Option<(String, String)> = self
+            .db
+            .query_row("SELECT s.sender, m.envelope FROM sent s JOIN messages m USING(msg_id) WHERE s.msg_id=?1", params![msg_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((sender, env)) = row else { return Ok(()) };
+        let env: Amf = serde_json::from_str(&env)?;
+        let limits = Limits::from_env();
+        let hour = now().timestamp() / 3600;
+        let tx = self.db.unchecked_transaction()?;
+        for r in recipients {
+            tx.execute("INSERT OR IGNORE INTO request_recipients(msg_id, agent_id) VALUES(?1,?2)", params![msg_id, r])?;
+        }
+        tx.commit()?;
+        if !env.to.is_direct() {
+            for r in recipients {
+                let key = format!("pair:{sender}>{r}");
+                self.db.execute("INSERT INTO budget(key, window, count) VALUES(?1,?2,1) ON CONFLICT(key, window) DO UPDATE SET count=count+1", params![key, hour])?;
+                if self.budget_used(&key, hour)? >= limits.per_pair_hour {
+                    self.pause(&key, &format!("reached {} messages per hour to this recipient", limits.per_pair_hour))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate, apply the loop guard and commit a send in one transaction.
+    /// `Err(dup)` = an identical earlier send (retry key), returned as-is.
+    fn commit_send(&mut self, conn: u64, as_agent: Option<&str>, mut draft: SendDraft) -> R<std::result::Result<Committed, (String, Value)>> {
         let sender = self.agent_for(conn, as_agent)?;
         // Caller retry keys are scoped to the sender.
         let client_id = draft.id.take();
@@ -1001,7 +1123,7 @@ impl NodeState {
             if let Some(p) = prev {
                 let mut res: SendResult = serde_json::from_str(&p)?;
                 res.duplicate = true;
-                return Ok(Some(serde_json::to_value(res)?));
+                return Ok(Err((canon, serde_json::to_value(res)?)));
             }
             draft.id = Some(canon);
         }
@@ -1042,15 +1164,33 @@ impl NodeState {
             }
             Target::All => (self.profiles.iter().filter(|p| attached_match(p, &|_| true)).cloned().collect(), true),
         };
+
+        let limits = Limits::from_env();
+        let hour = now().timestamp() / 3600;
+        let direct = env.to.is_direct();
+        // Group sends: skip local recipients whose pair is paused or would exceed its budget.
+        if !direct {
+            let mut keep = Vec::new();
+            for p in local {
+                let key = format!("pair:{}>{}", sender.agent_id, p.agent_id);
+                if self.pair_paused(&sender.agent_id, &p.agent_id)?.is_some() {
+                    continue;
+                }
+                if self.budget_used(&key, hour)? >= limits.per_pair_hour {
+                    self.pause(&key, &format!("reached {} messages per hour to this recipient", limits.per_pair_hour))?;
+                    continue;
+                }
+                keep.push(p);
+            }
+            local = keep;
+        }
         if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) && !local.is_empty() {
             local.truncate(1);
             needs_remote = false; // a committed local pick skips the remote leg
         }
         let local_ids: Vec<String> = local.iter().map(|p| p.agent_id.clone()).collect();
 
-        // Loop guard: refuse before anything is committed; debits persist with the send.
-        // One canonical pair key per recipient, however it was addressed (handle, id,
-        // reply, local pick-one), so a ping-pong can't spread over several budgets.
+        // Direct sends: one canonical pair key, however the peer was addressed.
         let direct_peer: Option<String> = match &env.to {
             Target::Agent { agent } => Some(agent.clone()),
             Target::Handle { handle } => {
@@ -1061,7 +1201,6 @@ impl NodeState {
                     .or_else(|| self.base_agents.values().find(|a| a.handle == h).map(|a| a.profile.agent_id.clone()))
                     .or_else(|| Some(h.to_string()))
             }
-            Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. } if !needs_remote => local.first().map(|p| p.agent_id.clone()),
             _ => None,
         };
         let pair_key = direct_peer.as_ref().map(|peer| format!("pair:{}>{peer}", sender.agent_id));
@@ -1072,14 +1211,17 @@ impl NodeState {
                 return Err(IpcErr("PAUSED", format!("{key} is paused ({reason}); a human must run `agentlan thread resume {key}`")));
             }
         }
-        let limits = Limits::from_env();
-        let hour = now().timestamp() / 3600;
         let mut debits: Vec<(String, i64)> = vec![(format!("agent:{}", sender.agent_id), hour), (thread_key.clone(), 0)];
         if let Some(k) = &pair_key {
             debits.push((k.clone(), hour));
         }
+        if !direct {
+            for id in &local_ids {
+                debits.push((format!("pair:{}>{id}", sender.agent_id), hour));
+            }
+        }
         for (key, window) in &debits {
-            let used: i64 = self.db.query_row("SELECT COALESCE(SUM(count),0) FROM budget WHERE key=?1 AND window=?2", params![key, window], |r| r.get(0))?;
+            let used = self.budget_used(key, *window)?;
             let (limit, what) = if key.starts_with("agent:") {
                 (limits.per_agent_hour, "messages per hour from this agent")
             } else if key.starts_with("pair:") {
@@ -1091,16 +1233,19 @@ impl NodeState {
                 // Threads and pairs pause until a human resumes them (this is what stops a
                 // ping-pong); the per-agent hourly cap is a plain rate limit.
                 if key.starts_with("thread:") || key.starts_with("pair:") {
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO paused(key, paused_at, reason) VALUES(?1,?2,?3)",
-                        params![key, now().to_rfc3339(), format!("reached {limit} {what}")],
-                    )?;
-                    warn!("node: loop guard paused {key}");
+                    self.pause(key, &format!("reached {limit} {what}"))?;
                     return Err(IpcErr("PAUSED", format!("{key} reached {limit} {what}; it is now paused — a human must run `agentlan thread resume {key}`")));
                 }
                 return Err(IpcErr("RATE_LIMITED", format!("loop guard: {limit} {what} reached; try again later")));
             }
         }
+        // Remote leg: tell the hub which of this sender's pairs are paused.
+        let exclude: Vec<String> = {
+            let mut st = self.db.prepare("SELECT key FROM paused WHERE key LIKE ?1")?;
+            let prefix = format!("pair:{}>", sender.agent_id);
+            let keys: Vec<String> = st.query_map(params![format!("{prefix}%")], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            keys.into_iter().filter_map(|k| k.strip_prefix(&prefix).map(String::from)).collect()
+        };
 
         let result = SendResult {
             id: env.id.clone(),
@@ -1111,7 +1256,7 @@ impl NodeState {
             client_id,
         };
 
-        // One transaction: message + local inbox rows + dedup record + deferred work.
+        // One transaction: message + local inbox rows + dedup record + budgets + deferred work.
         {
             let tx = self.db.unchecked_transaction()?;
             tx.execute(
@@ -1129,6 +1274,10 @@ impl NodeState {
                     "INSERT OR IGNORE INTO inbox(agent_id, msg_id, state, remote, received_at) VALUES(?1,?2,'stored',0,?3)",
                     params![id, env.id, now().to_rfc3339()],
                 )?;
+                tx.execute("INSERT OR IGNORE INTO request_recipients(msg_id, agent_id) VALUES(?1,?2)", params![env.id, id])?;
+            }
+            if let Some(peer) = direct_peer.as_ref().filter(|p| p.starts_with("agt_")) {
+                tx.execute("INSERT OR IGNORE INTO request_recipients(msg_id, agent_id) VALUES(?1,?2)", params![env.id, peer])?;
             }
             tx.execute("INSERT INTO sent(msg_id, sender, result) VALUES(?1,?2,?3)", params![env.id, sender.agent_id, serde_json::to_string(&result)?])?;
             for (key, window) in &debits {
@@ -1140,7 +1289,7 @@ impl NodeState {
             if needs_remote {
                 tx.execute(
                     "INSERT INTO outbox(kind, msg_id, body) VALUES('submit', ?1, ?2)",
-                    params![env.id, json!({"agentId": sender.agent_id, "envelope": env, "localRecipients": local_ids}).to_string()],
+                    params![env.id, json!({"agentId": sender.agent_id, "envelope": env, "localRecipients": local_ids, "exclude": exclude}).to_string()],
                 )?;
             }
             if !local_ids.is_empty() {
@@ -1157,18 +1306,82 @@ impl NodeState {
             }
             tx.commit()?;
         }
+        Ok(Ok(Committed { env, result, needs_remote, local_ids }))
+    }
 
-        // Local leg: deliver now, over IPC only.
-        for id in &local_ids {
-            self.notify(id, &env)?;
+    fn deliver_local(&mut self, c: &Committed) -> Result<()> {
+        for id in &c.local_ids {
+            self.notify(id, &c.env)?;
         }
-        self.pump()?;
-        if needs_remote && self.hub == HubStatus::Ready {
+        self.pump()
+    }
+
+    fn send(&mut self, conn: u64, req_id: u64, as_agent: Option<&str>, draft: SendDraft) -> R<Option<Value>> {
+        let c = match self.commit_send(conn, as_agent, draft)? {
+            Ok(c) => c,
+            Err((_, dup)) => return Ok(Some(dup)),
+        };
+        self.deliver_local(&c)?;
+        if c.needs_remote && self.hub == HubStatus::Ready {
             // Answer when the hub decides (or after SEND_WAIT as "queued").
-            self.pending.insert(env.id.clone(), PendingSend { conn, req: req_id, result, deadline: Instant::now() + SEND_WAIT });
+            self.pending.insert(c.env.id.clone(), PendingSend { conn, req: req_id, result: c.result, deadline: Instant::now() + SEND_WAIT });
             return Ok(None);
         }
-        Ok(Some(serde_json::to_value(result)?))
+        Ok(Some(serde_json::to_value(c.result)?))
+    }
+
+    /// Send + wait for the reply as one step: the reply-waiter exists before any reply
+    /// can be processed, and only the actual recipient's reply satisfies it.
+    fn request(&mut self, conn: u64, req_id: u64, as_agent: Option<&str>, mut draft: SendDraft, timeout_ms: u64) -> R<Option<Value>> {
+        draft.to = match draft.to.take() {
+            Some(Target::Role { role, project, .. }) => Some(Target::Role { role, project, pick: Pick::One }),
+            Some(Target::Project { project, .. }) => Some(Target::Project { project, pick: Pick::One }),
+            Some(t @ (Target::Agent { .. } | Target::Handle { .. })) => Some(t),
+            Some(_) => return Err(IpcErr("INVALID", "a request needs a single recipient: @name@machine, agt_…, role:R or project:P".into())),
+            None => return Err(IpcErr("INVALID", "missing 'to'".into())),
+        };
+        if draft.intent.is_none() {
+            draft.intent = Some("request".into());
+        }
+        let sender = self.agent_for(conn, as_agent)?.agent_id;
+        let (id, result, committed) = match self.commit_send(conn, as_agent, draft)? {
+            Ok(c) => {
+                if c.local_ids.is_empty() && !c.needs_remote {
+                    return Err(IpcErr("NOT_DELIVERED", "no agent matched the request (role/project targets need an online agent)".into()));
+                }
+                (c.env.id.clone(), c.result.clone(), Some(c))
+            }
+            Err((id, dup)) => (id, serde_json::from_value(dup)?, None),
+        };
+        // Register the reply-waiter before anything else can run.
+        self.waiters.push(Waiter {
+            conn,
+            req: req_id,
+            agent: sender.clone(),
+            deadline: Instant::now() + Duration::from_millis(timeout_ms.min(300_000)),
+            in_reply_to: Some(id.clone()),
+            request: Some(result),
+        });
+        if let Some(c) = committed {
+            self.deliver_local(&c)?;
+        } else {
+            // Retry of an earlier request: its reply may already be here.
+            let have: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT m.envelope FROM inbox i JOIN messages m USING(msg_id) WHERE i.agent_id=?1 AND i.state!='acked'
+                       AND json_extract(m.envelope,'$.inReplyTo')=?2
+                       AND json_extract(m.envelope,'$.from.agent') IN (SELECT agent_id FROM request_recipients WHERE msg_id=?2) ORDER BY i.rowid LIMIT 1",
+                    params![sender, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(env) = have {
+                let env: Amf = serde_json::from_str(&env)?;
+                self.offer_to_waiters(&sender, &env)?;
+            }
+        }
+        Ok(None)
     }
 }
 

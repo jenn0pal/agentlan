@@ -27,6 +27,35 @@ pub use render::Runner;
 /// Upper bound for blocking waits, kept below common host tool timeouts (Codex: ~60 s).
 const MAX_WAIT_S: u64 = 45;
 
+/// Holds a message that was handed to this tool call; if the call is dropped before its
+/// result is returned (e.g. the host cancelled it), the message goes back to "unseen".
+struct SeenGuard {
+    client: Arc<NodeClient>,
+    id: Option<String>,
+}
+
+impl SeenGuard {
+    fn new(client: &Arc<NodeClient>, id: Option<&str>) -> SeenGuard {
+        SeenGuard { client: client.clone(), id: id.map(String::from) }
+    }
+    fn disarm(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for SeenGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let c = self.client.clone();
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn(async move {
+                    let _ = c.call(IpcOp::Unsurface { agent: None, message_id: id }).await;
+                });
+            }
+        }
+    }
+}
+
 pub struct Adapter {
     client: Arc<NodeClient>,
     runner: Runner,
@@ -191,12 +220,14 @@ impl Adapter {
         r
     }
 
-    /// Run an IPC call that may block; if the MCP request is cancelled, cancel the node-side wait.
+    /// Run an IPC call that may block; if the MCP request is cancelled, cancel exactly that
+    /// node-side wait (other waits on the connection are unaffected).
     async fn cancellable(&self, op: IpcOp, ct: &CancellationToken) -> std::result::Result<Value, client::CallError> {
+        let id = self.client.reserve_id();
         tokio::select! {
-            r = self.client.call(op) => r,
+            r = self.client.call_with_id(id, op) => r,
             _ = ct.cancelled() => {
-                let _ = self.client.call(IpcOp::CancelWait).await;
+                let _ = self.client.call(IpcOp::CancelWait { req_id: Some(id) }).await;
                 Err(client::CallError { code: "CANCELLED".into(), msg: "the caller cancelled this wait".into() })
             }
         }
@@ -289,33 +320,33 @@ impl Adapter {
                     reply_by: Some(agentlan_proto::now() + chrono::Duration::seconds(within)),
                     ..Default::default()
                 };
-                let sent = call!(IpcOp::Send { as_agent: None, draft });
-                let delivered = sent["local"].as_u64().unwrap_or(0) > 0 || matches!(sent["remote"]["status"].as_str(), Some("accepted" | "queued"));
-                if !delivered {
-                    return self.error("NOT_DELIVERED", &render::sent(&sent));
-                }
-                let id = sent["id"].as_str().unwrap_or_default().to_string();
                 let t = args.get("waitS").and_then(|v| v.as_u64()).unwrap_or(30).clamp(1, MAX_WAIT_S);
-                let v = match self.cancellable(IpcOp::Wait { agent: None, timeout_ms: t * 1000, in_reply_to: Some(id.clone()) }, ct).await {
+                // One node operation: send + register the reply-waiter, no gap in between.
+                let v = match self.cancellable(IpcOp::Request { as_agent: None, draft, timeout_ms: t * 1000 }, ct).await {
                     Ok(v) => v,
                     Err(e) => return self.error(&e.code, &e.msg),
                 };
+                let guard = SeenGuard::new(&self.client, v["reply"]["id"].as_str());
+                let sent = v["sent"].clone();
+                let id = sent["id"].as_str().unwrap_or_default().to_string();
                 let me = self.client.call(IpcOp::Whoami).await.ok();
                 let unread = me.as_ref().map(|w| json!({"count": w["unread"], "latest": w["unreadLatest"]})).unwrap_or(json!({"count": null}));
                 let my_machine = me.as_ref().and_then(|w| w["machineId"].as_str().map(String::from)).unwrap_or_default();
-                match v["message"].as_object() {
+                let out = match v["reply"].as_object() {
                     Some(_) => {
-                        let msgs = vec![v["message"].clone()];
+                        let msgs = vec![v["reply"].clone()];
                         let text = format!("Reply to {id}:\n\n{}", render::messages(&msgs, self.runner, &my_machine));
                         let views = render::views(&msgs, &my_machine);
-                        self.result(text, json!({"status": "replied", "sent": sent, "reply": v["message"], "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                        self.result(text, json!({"status": "replied", "sent": sent, "reply": v["reply"], "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
                     }
                     None => self.result(
                         format!("Sent {id}; no reply within {t}s. The reply will land in your inbox (call wait_for_message or inbox later)."),
                         json!({"status": "pending", "sent": sent, "reply": null, "unread": unread}),
                         &unread,
                     ),
-                }
+                };
+                guard.disarm();
+                out
             }
             "reply" => {
                 let Some(mid) = arg(&args, "messageId") else { return self.error("INVALID", "messageId is required") };
@@ -355,10 +386,11 @@ impl Adapter {
                     Ok(v) => v,
                     Err(e) => return self.error(&e.code, &e.msg),
                 };
+                let guard = SeenGuard::new(&self.client, v["message"]["id"].as_str());
                 let me = self.client.call(IpcOp::Whoami).await.ok();
                 let unread = me.as_ref().map(|w| json!({"count": w["unread"], "latest": w["unreadLatest"]})).unwrap_or(json!({"count": null}));
                 let my_machine = me.as_ref().and_then(|w| w["machineId"].as_str().map(String::from)).unwrap_or_default();
-                match v["message"].as_object() {
+                let out = match v["message"].as_object() {
                     Some(_) => {
                         let msgs = vec![v["message"].clone()];
                         let text = render::messages(&msgs, self.runner, &my_machine);
@@ -366,7 +398,9 @@ impl Adapter {
                         self.result(text, json!({"messages": msgs, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
                     }
                     None => self.result(format!("No message within {t}s."), json!({"messages": [], "timedOut": true, "unread": unread}), &unread),
-                }
+                };
+                guard.disarm();
+                out
             }
             "ack" => {
                 let Some(mid) = arg(&args, "messageId") else { return self.error("INVALID", "messageId is required") };
