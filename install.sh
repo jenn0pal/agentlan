@@ -64,17 +64,27 @@ from_source() {
   BIN="$(command -v agentlan 2>/dev/null || echo "${CARGO_HOME:-$HOME/.cargo}/bin/agentlan")"
 }
 
+# GitHub's /releases/latest skips pre-releases; the releases API lists them too (newest first).
+resolve_version() {
+  if [ "$VERSION" != latest ]; then
+    echo "$VERSION"
+    return 0
+  fi
+  j=$(mktemp)
+  download "https://api.github.com/repos/$REPO/releases?per_page=1" "$j" || { rm -f "$j"; return 1; }
+  tag=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$j" | head -n 1)
+  rm -f "$j"
+  [ -n "$tag" ] && echo "$tag"
+}
+
 from_release() { # <target>
   target="$1"
-  if [ "$VERSION" = latest ]; then
-    base="https://github.com/$REPO/releases/latest/download"
-  else
-    base="https://github.com/$REPO/releases/download/$VERSION"
-  fi
+  tag=$(resolve_version) || { say "Could not look up the latest release."; return 1; }
+  base="https://github.com/$REPO/releases/download/$tag"
   asset="agentlan-$target.tar.gz"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
-  say "Downloading $asset ($VERSION)…"
+  say "Downloading $asset ($tag)…"
   if ! download "$base/$asset" "$tmp/$asset"; then
     say "No prebuilt binary found for $target."
     return 1
