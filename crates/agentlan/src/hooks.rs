@@ -124,17 +124,29 @@ pub async fn run(home: &Path, event: &str, agent: &str) -> Result<()> {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let inp: Value = serde_json::from_str(&input).unwrap_or(json!({}));
-    let agent = if agent == "auto" {
-        let cwd = inp["cwd"].as_str().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
-        match agentlan_mcp::resolve_auto(home, "claude-code", &cwd) {
-            Ok(a) => a,
-            Err(_) => return Ok(()), // not an AgentLAN project: stay silent
+    let peek = if agent == "auto" {
+        // The identity this Claude session registered through the agentlan MCP tools: the
+        // adapter recorded its parent (the Claude process), which is also our ancestor.
+        let by_host = crate::call(home, IpcOp::Peek { agent: None, host_pids: agentlan_node::ancestor_pids(8) }).await;
+        match by_host {
+            Ok(p) => p,
+            Err(_) => {
+                // Else a pre-made profile matching this repository.
+                let cwd = inp["cwd"].as_str().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+                let Ok(a) = agentlan_mcp::resolve_auto(home, Some("claude-code"), &cwd) else {
+                    return Ok(()); // not registered / not an AgentLAN project: stay silent
+                };
+                match crate::call(home, IpcOp::Peek { agent: Some(a), host_pids: vec![] }).await {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()),
+                }
+            }
         }
     } else {
-        agent.to_string()
-    };
-    let Ok(peek) = crate::call(home, IpcOp::Peek { agent }).await else {
-        return Ok(()); // node not running: never disturb the session
+        match crate::call(home, IpcOp::Peek { agent: Some(agent.to_string()), host_pids: vec![] }).await {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // node not running: never disturb the session
+        }
     };
     let session = inp["session_id"].as_str().unwrap_or("default");
     let sp = state_path(home, session);

@@ -129,6 +129,12 @@ impl Drop for Env {
             let _ = k.kill();
             let _ = k.wait();
         }
+        // Nodes started in the background by an adapter's `connect` aren't our children.
+        if let Ok(rd) = std::fs::read_dir(&self.root) {
+            for d in rd.flatten().filter(|d| d.path().join("node").is_dir()) {
+                let _ = Command::new(BIN).arg("--home").arg(d.path()).args(["node", "stop"]).output();
+            }
+        }
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.root);
         } else {
@@ -379,7 +385,19 @@ struct Mcp {
 
 impl Mcp {
     fn spawn(e: &mut Env, home: &str, agent: &str, runner: &str) -> Mcp {
-        let mut child = e.cmd(home, &["mcp", "--agent", agent, "--runner", runner]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let cmd = e.cmd(home, &["mcp", "--agent", agent, "--runner", runner]);
+        Mcp::spawn_cmd(e, cmd)
+    }
+
+    /// `agentlan mcp` with no flags, as installed by `claude mcp add agentlan -- agentlan mcp`.
+    fn spawn_plain(e: &mut Env, home: &str, alias: &str, cwd: &Path) -> Mcp {
+        let mut cmd = e.cmd(home, &["mcp"]);
+        cmd.env("AGENTLAN_ALIAS", alias).current_dir(cwd);
+        Mcp::spawn_cmd(e, cmd)
+    }
+
+    fn spawn_cmd(e: &mut Env, mut cmd: Command) -> Mcp {
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let out = child.stdout.take().unwrap();
         e.kids.push(child);
@@ -412,7 +430,12 @@ impl Mcp {
     }
 
     fn init(&mut self) -> Value {
-        let r = self.request("initialize", serde_json::json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "0"}}));
+        self.init_as("e2e")
+    }
+
+    fn init_as(&mut self, client: &str) -> Value {
+        let r = self
+            .request("initialize", serde_json::json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": client, "version": "0"}}));
         self.write(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         r
     }
@@ -435,6 +458,144 @@ impl Mcp {
         assert_ne!(r["isError"], true, "{name} returned an error: {r}");
         r
     }
+
+    /// A tool call that must fail with this error code.
+    fn tool_err(&mut self, name: &str, args: Value, code: &str) -> Value {
+        let r = self.request("tools/call", serde_json::json!({"name": name, "arguments": args}));
+        assert_eq!(r["isError"], true, "{name} should fail: {r}");
+        assert_eq!(r["structuredContent"]["error"]["code"], code, "{name}: {r}");
+        r
+    }
+}
+
+/// Agents connect and assign themselves roles from inside their session: `agentlan mcp`
+/// is installed with no agent or role; the first session on a PC joins with the server's
+/// code; sessions and subagents each register their own identity; roles change live.
+#[test]
+fn agents_connect_and_register_themselves() {
+    let mut e = Env::new();
+    e.run("hub", &["hub", "init", "--name", "e2e", "--listen", &e.addr()]);
+    let invite = |e: &Env| String::from_utf8(e.run("hub", &["hub", "invite", "--addr", &e.addr()]).stdout).unwrap().trim().to_string();
+    let (code1, code2) = (invite(&e), invite(&e));
+    e.spawn("hub", &["hub", "run"]);
+    wait_port(e.port);
+    let proj = e.root.join("shop");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("CLAUDE.md"), "# Shop\n\nOur rules.\n").unwrap();
+
+    // Session 1 on pc-one (Claude Code): nothing configured yet.
+    let mut a = Mcp::spawn_plain(&mut e, "n1", "pc-one", &proj);
+    let init = a.init_as("claude-code");
+    assert!(init["instructions"].as_str().unwrap().contains("call `connect`"), "{init}");
+    let tools = a.request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for t in ["connect", "register", "leave", "setup", "send", "inbox"] {
+        assert!(names.contains(&t), "missing tool {t}: {names:?}");
+    }
+    let w = a.tool("whoami", serde_json::json!({}));
+    assert_eq!(w["structuredContent"]["joined"], false, "{w}");
+    a.tool_err("send", serde_json::json!({"to": "all", "text": "hi"}), "NOT_REGISTERED");
+    a.tool_err("register", serde_json::json!({"role": "backend"}), "NOT_JOINED");
+    a.tool_err("connect", serde_json::json!({}), "NOT_JOINED");
+    a.tool_err("connect", serde_json::json!({"code": &code1[..code1.len() - 9]}), "BAD_CODE");
+
+    // Join with the code (this starts the node in the background), then self-register.
+    let c = a.tool("connect", serde_json::json!({"code": code1}));
+    assert_eq!(c["structuredContent"]["joinedNow"], true, "{c}");
+    assert_eq!(c["structuredContent"]["network"], "e2e");
+    assert_eq!(c["structuredContent"]["hub"], "ready", "{c}");
+    let r = a.tool("register", serde_json::json!({"role": "backend", "description": "orders API"}));
+    let me = &r["structuredContent"]["registered"];
+    assert_eq!(me["handle"], "backend@pc-one", "{r}");
+    assert_eq!(me["project"], "shop", "project defaults to the folder: {r}");
+    assert_eq!(me["runner"], "claude-code", "runner detected from the MCP client: {r}");
+    assert!(me["agentId"].as_str().unwrap().starts_with("agt_"));
+    let backend_id = me["agentId"].as_str().unwrap().to_string();
+    // Later sessions on this PC need no code; a used code can't join another PC.
+    a.tool("connect", serde_json::json!({}));
+    let mut thief = Mcp::spawn_plain(&mut e, "n3", "pc-three", &proj);
+    thief.init();
+    let j = thief.tool_err("connect", serde_json::json!({"code": code1}), "JOIN_FAILED");
+    assert!(j["structuredContent"]["error"]["msg"].as_str().unwrap().contains("one PC"), "{j}");
+
+    // A subagent in the same session registers its own identity; calls then need `as`.
+    let sub = a.tool("register", serde_json::json!({"role": "tester", "name": "backend-tests"}));
+    assert_eq!(sub["structuredContent"]["registered"]["handle"], "backend-tests@pc-one", "{sub}");
+    assert_eq!(sub["structuredContent"]["identities"], serde_json::json!(["backend", "backend-tests"]));
+    a.tool_err("inbox", serde_json::json!({}), "AMBIGUOUS_IDENTITY");
+    a.tool("inbox", serde_json::json!({"as": "backend-tests"}));
+
+    // Another Claude session on the same PC taking the same role gets its own name.
+    let mut b = Mcp::spawn_plain(&mut e, "n1", "pc-one", &proj);
+    b.init_as("claude-code");
+    let rb = b.tool("connect", serde_json::json!({"role": "backend"}));
+    assert_eq!(rb["structuredContent"]["registered"]["handle"], "backend-2@pc-one", "{rb}");
+    b.tool_err("register", serde_json::json!({"role": "x", "name": "backend"}), "AGENT_BUSY");
+    // User-made worker profiles can't be claimed by an agent.
+    e.run("n1", &["agent", "add", "builder", "--role", "build", "--runner", "codex", "--mode", "worker"]);
+    b.tool_err("register", serde_json::json!({"role": "build", "name": "builder"}), "RESERVED");
+
+    // A Codex session on a second PC joins and registers in one call.
+    let mut r2 = Mcp::spawn_plain(&mut e, "n2", "pc-two", &proj);
+    r2.init_as("codex-mcp-client");
+    let rr = r2.tool("connect", serde_json::json!({"code": code2, "role": "reviewer", "description": "reviews PRs"}));
+    assert_eq!(rr["structuredContent"]["registered"]["handle"], "reviewer@pc-two", "{rr}");
+    assert_eq!(rr["structuredContent"]["registered"]["runner"], "codex");
+    let mut roster = Value::Null;
+    wait_until("pc-two sees backend with its role and description", T, || {
+        roster = r2.tool("list_agents", serde_json::json!({}));
+        roster["structuredContent"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["handle"] == "backend@pc-one" && x["role"] == "backend" && x["description"] == "orders API" && x["state"] == "online")
+    });
+
+    // Messages flow between self-registered identities (by role).
+    let sent = a.tool("send", serde_json::json!({"as": "backend", "to": "role:reviewer", "subject": "PR 7", "text": "please review"}));
+    assert_eq!(sent["structuredContent"]["sent"]["remote"]["status"], "accepted", "{sent}");
+    let got = r2.tool("wait_for_message", serde_json::json!({"timeoutS": 15}));
+    assert_eq!(got["structuredContent"]["messages"][0]["from"]["handle"], "backend@pc-one", "{got}");
+
+    // An agent changes its own role; the id stays and other PCs see the change.
+    let up = a.tool("register", serde_json::json!({"as": "backend", "role": "api"}));
+    assert_eq!(up["structuredContent"]["registered"]["agentId"], backend_id.as_str(), "{up}");
+    wait_until("pc-two sees the new role", T, || {
+        let v = r2.tool("list_agents", serde_json::json!({}));
+        v["structuredContent"]["agents"].as_array().unwrap().iter().any(|x| x["handle"] == "backend@pc-one" && x["role"] == "api")
+    });
+
+    // The subagent leaves; the session is back to a single identity (no `as` needed).
+    a.tool("leave", serde_json::json!({"as": "backend-tests"}));
+    let w = a.tool("whoami", serde_json::json!({}));
+    assert_eq!(w["structuredContent"]["agent"]["handle"], "backend@pc-one", "{w}");
+
+    // Hooks find this session's identity through the process tree (no --agent).
+    let h = hook(&e, "n1", "session-start", "auto", "s1").expect("session-start context");
+    assert!(h["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("backend@pc-one"), "{h}");
+
+    // setup writes the project instructions into CLAUDE.md, keeping the user's content.
+    let st =
+        a.tool("setup", serde_json::json!({"roles": [{"name": "backend", "description": "API and DB"}, "reviewer"], "notes": "Run tests before handoff."}));
+    assert_eq!(st["structuredContent"]["files"][0]["result"], "appended", "{st}");
+    let md = std::fs::read_to_string(proj.join("CLAUDE.md")).unwrap();
+    assert!(md.starts_with("# Shop\n\nOur rules.\n") && md.contains("`backend`: API and DB") && md.contains("call `register`"), "{md}");
+    assert!(!md.contains("AGENTLAN1-"), "join codes are never written");
+    let again = a.tool("setup", serde_json::json!({"roles": ["backend", "reviewer"]}));
+    assert_eq!(again["structuredContent"]["files"][0]["result"], "updated");
+    assert_eq!(std::fs::read_to_string(proj.join("CLAUDE.md")).unwrap().matches("agentlan:begin").count(), 1);
+
+    // Profiles persist: a later session reusing the name keeps the recorded id.
+    drop(a);
+    let mut a2 = Mcp::spawn_plain(&mut e, "n1", "pc-one", &proj);
+    a2.init_as("claude-code");
+    let mut back = Value::Null;
+    wait_until("old session released backend", T, || {
+        let r = a2.request("tools/call", serde_json::json!({"name": "register", "arguments": {"role": "api", "name": "backend"}}));
+        back = r.clone();
+        r["isError"] != true
+    });
+    assert_eq!(back["structuredContent"]["registered"]["agentId"], backend_id.as_str(), "{back}");
 }
 
 /// The MCP adapter end to end: Claude-style and Codex-style adapters on two PCs exchange a
@@ -933,8 +1094,10 @@ fn up_and_connect_one_liners() {
     // Running `connect` again on a joined PC needs no code (it just runs the node);
     // here it refuses up front — no false "running" message — because a node is running.
     let again = e.cmd("pc2", &["connect"]).output().unwrap();
-    let err = String::from_utf8_lossy(&again.stderr);
-    assert!(!again.status.success() && err.contains("already running") && !err.contains("Starting the node"), "{err}");
+    let out = String::from_utf8_lossy(&again.stdout);
+    assert!(again.status.success() && out.contains("already running"), "{out}");
+    // A second `up` leaves the running node alone and fails only because the server's
+    // port is taken.
     let again_up = e.cmd("srv", &["up"]).output().unwrap();
-    assert!(!again_up.status.success() && String::from_utf8_lossy(&again_up.stderr).contains("already running"));
+    assert!(!again_up.status.success(), "second up must not start a second server");
 }

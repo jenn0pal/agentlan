@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use agentlan_proto::amf::{Amf, From, Origin, Pick, SendDraft, Target};
 use agentlan_proto::ipc::{IpcError, IpcOp, IpcOut, IpcPush, IpcRequest, IpcResponse, RemoteResult, SendResult};
-use agentlan_proto::records::{AgentProfile, AgentRecord, EndReason, MachineRecord, MachineReported, PresenceState, Readiness, RosterEntry};
+use agentlan_proto::records::{AgentMode, AgentProfile, AgentRecord, EndReason, MachineRecord, MachineReported, PresenceState, Readiness, RosterEntry};
 use agentlan_proto::wire::{AttachedSession, DeliveryState, EventKind, HubToNode, JournalEntry, NodeToHub};
 use agentlan_proto::{DEFAULT_TTL_HOURS, MAX_FRAME, Ts, now};
 use agentlan_store::rusqlite::{Connection, OptionalExtension, params};
@@ -95,6 +95,8 @@ struct Session {
     conn: u64,
     since: Ts,
     fence: Option<u64>,
+    /// Process hosting the adapter (e.g. a Claude Code session); hooks look identities up by it.
+    host_pid: Option<u32>,
 }
 
 struct Conn {
@@ -158,6 +160,8 @@ pub struct NodeState {
     pending: HashMap<String, PendingSend>,
     /// Outbox row ids sent on the current link, with send time.
     inflight: HashMap<i64, Instant>,
+    /// Set by a Shutdown request: the state loop exits after replying.
+    stopping: bool,
 }
 
 fn ok(id: u64, v: Value) -> IpcOut {
@@ -233,6 +237,7 @@ impl NodeState {
             waiters: Vec::new(),
             pending: HashMap::new(),
             inflight: HashMap::new(),
+            stopping: false,
         })
     }
 
@@ -240,6 +245,13 @@ impl NodeState {
         while let Some(c) = rx.blocking_recv() {
             if let Err(e) = self.handle(c) {
                 warn!("node: command failed: {e:#}");
+            }
+            if self.stopping {
+                info!("node: stopping (requested over IPC)");
+                // Every write is its own transaction, so nothing is half-done here; give the
+                // IPC writer a moment to deliver the reply, then exit the process.
+                std::thread::sleep(Duration::from_millis(200));
+                std::process::exit(0);
             }
         }
     }
@@ -741,7 +753,9 @@ impl NodeState {
     }
 
     fn end_session(&mut self, agent_id: &str, reason: EndReason) {
-        let Some(s) = self.sessions.remove(agent_id) else { return };
+        let Some(s) = self.sessions.remove(agent_id) else {
+            return;
+        };
         if let Some(c) = self.conns.get_mut(&s.conn) {
             c.attached = None;
         }
@@ -809,7 +823,9 @@ impl NodeState {
             .db
             .query_row("SELECT state, remote FROM inbox WHERE agent_id=?1 AND msg_id=?2", params![agent, msg_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some((cur, remote)) = row else { return Ok(()) };
+        let Some((cur, remote)) = row else {
+            return Ok(());
+        };
         if rank(ds(state)) <= rank(&cur) {
             return Ok(());
         }
@@ -856,7 +872,9 @@ impl NodeState {
         let w = self.waiters.remove(i);
         self.mark(agent, &env.id, DeliveryState::Surfaced)?;
         let v = match &w.request {
-            Some(r) => json!({"status": "replied", "sent": r, "reply": env, "unread": self.unread_count(agent)?}),
+            Some(r) => {
+                json!({"status": "replied", "sent": r, "reply": env, "unread": self.unread_count(agent)?})
+            }
             None => json!({"message": env, "unread": self.unread_count(agent)?}),
         };
         self.reply(w.conn, ok(w.req, v));
@@ -879,37 +897,19 @@ impl NodeState {
 
     fn ipc(&mut self, conn: u64, req: IpcRequest) -> R<Option<Value>> {
         match req.op {
-            IpcOp::Attach { agent, runner, pid, takeover } => {
+            IpcOp::Attach { agent, runner, pid, takeover, host_pid } => {
                 if self.conns.get(&conn).is_some_and(|c| c.attached.is_some()) {
                     return Err(IpcErr("ALREADY_ATTACHED", "this connection is already attached".into()));
                 }
                 let p = self.agent_for(conn, Some(&agent))?;
-                if let Some(s) = self.sessions.get(&p.agent_id) {
-                    if !takeover {
-                        let age = (now() - s.since).num_seconds();
-                        return Err(IpcErr("AGENT_BUSY", format!("{} already has a live session ({}s old); use takeover to replace it", self.handle_of(&p), age)));
-                    }
-                    let old = s.conn;
-                    self.end_session(&p.agent_id, EndReason::Takeover);
-                    self.push(old, "session", json!({"status": "ended", "reason": "takeover"}));
-                }
-                let sid = agentlan_proto::ids::session_id();
-                self.sessions.insert(p.agent_id.clone(), Session { session_id: sid.clone(), conn, since: now(), fence: None });
-                if let Some(c) = self.conns.get_mut(&conn) {
-                    c.attached = Some(p.agent_id.clone());
-                }
-                let rec = self.local_record(&p);
-                self.push_local_roster("joined", &rec, Some(conn));
-                if self.hub == HubStatus::Ready {
-                    self.send_live(NodeToHub::AgentUp { session_id: sid.clone(), profile: p.clone() });
-                }
-                info!("node: {} attached (runner {:?}, pid {:?})", self.handle_of(&p), runner, pid);
-                Ok(Some(json!({
-                    "agent": rec, "sessionId": sid, "provisional": true,
-                    "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
-                    "roster": self.roster(None, None),
-                    "unread": self.unread_count(&p.agent_id)?,
-                })))
+                self.attach_session(conn, p, runner, pid, host_pid, takeover).map(Some)
+            }
+            IpcOp::Register { name, role, project, description, runner, pid, host_pid } => {
+                self.register(conn, name, role, project, description, runner, pid, host_pid).map(Some)
+            }
+            IpcOp::Shutdown => {
+                self.stopping = true;
+                Ok(Some(json!({"stopping": true})))
             }
             IpcOp::Detach => {
                 let a = self.conns.get(&conn).and_then(|c| c.attached.clone()).ok_or(IpcErr("NOT_ATTACHED", "not attached".into()))?;
@@ -1039,8 +1039,19 @@ impl NodeState {
                 Ok(None)
             }
             IpcOp::Request { as_agent, draft, timeout_ms } => self.request(conn, req.id, as_agent.as_deref(), draft, timeout_ms),
-            IpcOp::Peek { agent } => {
-                let p = self.agent_for(conn, Some(&agent))?;
+            IpcOp::Peek { agent, host_pids } => {
+                let p = match agent {
+                    Some(a) => self.agent_for(conn, Some(&a))?,
+                    None => {
+                        // The identity registered from the nearest host process (earliest
+                        // registration wins when a session also registered subagents).
+                        let hit = host_pids
+                            .iter()
+                            .find_map(|hp| self.sessions.iter().filter(|(_, s)| s.host_pid == Some(*hp)).min_by_key(|(_, s)| s.since).map(|(a, _)| a.clone()));
+                        let a = hit.ok_or(IpcErr("NOT_REGISTERED", "no AgentLAN identity is registered from this session".into()))?;
+                        self.agent_for(conn, Some(&a))?
+                    }
+                };
                 let mut st = self.db.prepare(
                     "SELECT m.envelope FROM inbox i JOIN messages m USING(msg_id) WHERE i.agent_id=?1 AND i.state='stored' ORDER BY i.rowid LIMIT 5",
                 )?;
@@ -1114,6 +1125,174 @@ impl NodeState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn attach_session(&mut self, conn: u64, p: AgentProfile, runner: Option<String>, pid: Option<u32>, host_pid: Option<u32>, takeover: bool) -> R<Value> {
+        if let Some(s) = self.sessions.get(&p.agent_id) {
+            if !takeover {
+                let age = (now() - s.since).num_seconds();
+                return Err(IpcErr("AGENT_BUSY", format!("{} already has a live session ({}s old); use takeover to replace it", self.handle_of(&p), age)));
+            }
+            let old = s.conn;
+            self.end_session(&p.agent_id, EndReason::Takeover);
+            self.push(old, "session", json!({"status": "ended", "reason": "takeover"}));
+        }
+        let sid = agentlan_proto::ids::session_id();
+        self.sessions.insert(p.agent_id.clone(), Session { session_id: sid.clone(), conn, since: now(), fence: None, host_pid });
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.attached = Some(p.agent_id.clone());
+        }
+        let rec = self.local_record(&p);
+        self.push_local_roster("joined", &rec, Some(conn));
+        if self.hub == HubStatus::Ready {
+            self.send_live(NodeToHub::AgentUp { session_id: sid.clone(), profile: p.clone() });
+        }
+        info!("node: {} attached (runner {:?}, pid {:?})", self.handle_of(&p), runner, pid);
+        Ok(json!({
+            "agent": rec, "sessionId": sid, "provisional": true,
+            "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
+            "roster": self.roster(None, None),
+            "unread": self.unread_count(&p.agent_id)?,
+        }))
+    }
+
+    /// Write one profile change through the locked file, then pick it up.
+    fn save_profile(&mut self, f: impl FnOnce(&mut crate::ProfilesFile) -> Result<AgentProfile>) -> R<AgentProfile> {
+        let p = crate::update_profiles(&self.home, f).map_err(|e| IpcErr("PROFILE_WRITE", format!("{e:#}")))?;
+        self.reload_profiles();
+        Ok(p)
+    }
+
+    /// An agent (or subagent) assigns itself a name and role. See `IpcOp::Register`.
+    #[allow(clippy::too_many_arguments)]
+    fn register(
+        &mut self,
+        conn: u64,
+        name: Option<String>,
+        role: String,
+        project: Option<String>,
+        description: Option<String>,
+        runner: Option<String>,
+        pid: Option<u32>,
+        host_pid: Option<u32>,
+    ) -> R<Value> {
+        use agentlan_proto::ids::normalize_name;
+        let role = normalize_name(&role);
+        if role.is_empty() || role.len() > 40 {
+            return Err(IpcErr("INVALID", "role must be 1-40 letters, digits or dashes (e.g. \"backend\", \"reviewer\")".into()));
+        }
+        let explicit = match name.as_deref().map(normalize_name) {
+            Some(n) if n.is_empty() || n.len() > 40 => {
+                return Err(IpcErr("INVALID", "name must be 1-40 letters, digits or dashes".into()));
+            }
+            other => other,
+        };
+        let clip = |v: Option<String>, n: usize| v.map(|v| v.trim().chars().take(n).collect::<String>()).filter(|v| !v.is_empty());
+        let project = clip(project, 120);
+        let description = clip(description, 300);
+        let runner = runner.unwrap_or_else(|| "generic".into());
+        self.reload_profiles();
+
+        // Already registered on this connection: change role/project/description in place.
+        if let Some(cur) = self.conns.get(&conn).and_then(|c| c.attached.clone()) {
+            let me = self.find_local(&cur).ok_or(IpcErr("UNKNOWN_AGENT", "attached profile vanished".into()))?;
+            if explicit.as_ref().is_some_and(|n| *n != me.name) {
+                return Err(IpcErr(
+                    "ALREADY_ATTACHED",
+                    format!("this connection is registered as {}; open another connection for another identity", self.handle_of(&me)),
+                ));
+            }
+            let id = me.agent_id.clone();
+            let p = self.save_profile(|pf| {
+                let a = pf.agents.iter_mut().find(|a| a.agent_id == id).ok_or_else(|| anyhow::anyhow!("profile {id} not found"))?;
+                a.role = role;
+                if project.is_some() {
+                    a.project = project;
+                }
+                if description.is_some() {
+                    a.description = description;
+                }
+                Ok(a.clone())
+            })?;
+            let rec = self.local_record(&p);
+            self.push_local_roster("updated", &rec, Some(conn));
+            self.register_changed_profiles();
+            return Ok(json!({
+                "agent": rec, "updated": true, "created": false,
+                "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
+                "roster": self.roster(None, None), "unread": self.unread_count(&p.agent_id)?,
+            }));
+        }
+
+        // Pick a name: the requested one, else the role, then role-2, role-3, …
+        let base = explicit.clone().unwrap_or_else(|| role.clone());
+        let mut chosen = None;
+        for i in 1..=99 {
+            let cand = if i == 1 { base.clone() } else { format!("{base}-{i}") };
+            match self.profiles.iter().find(|p| p.name == cand) {
+                None => {
+                    chosen = Some(cand);
+                    break;
+                }
+                // Worker/script profiles are set up by the user; agents can't claim them.
+                Some(p) if p.mode != AgentMode::Interactive => {
+                    if explicit.is_some() {
+                        return Err(IpcErr(
+                            "RESERVED",
+                            format!("'{cand}' is a {:?} profile set up by the user on this PC; choose another name", p.mode).to_lowercase(),
+                        ));
+                    }
+                }
+                Some(p) if self.sessions.contains_key(&p.agent_id) => {
+                    if explicit.is_some() {
+                        return Err(IpcErr(
+                            "AGENT_BUSY",
+                            format!("'{cand}' is in use by another live session; choose another name (e.g. {cand}-2) or omit name"),
+                        ));
+                    }
+                }
+                Some(_) => {
+                    chosen = Some(cand);
+                    break;
+                }
+            }
+        }
+        let name = chosen.ok_or(IpcErr("AGENT_BUSY", format!("too many live sessions named {base}-…")))?;
+        let created = !self.profiles.iter().any(|p| p.name == name);
+        let r2 = runner.clone();
+        let p = self.save_profile(|pf| {
+            if let Some(a) = pf.agents.iter_mut().find(|a| a.name == name) {
+                // A returning agent keeps its recorded id.
+                a.role = role;
+                a.runner = r2;
+                if project.is_some() {
+                    a.project = project;
+                }
+                if description.is_some() {
+                    a.description = description;
+                }
+                return Ok(a.clone());
+            }
+            let p = AgentProfile {
+                agent_id: agentlan_proto::ids::agent_id(),
+                name,
+                role,
+                project,
+                runner: r2,
+                mode: AgentMode::Interactive,
+                capabilities: vec![],
+                description,
+            };
+            pf.agents.push(p.clone());
+            Ok(p)
+        })?;
+        // Upsert before AgentUp (same link, so the hub learns the new role first).
+        self.register_changed_profiles();
+        let mut v = self.attach_session(conn, p, Some(runner), pid, host_pid, false)?;
+        v["created"] = json!(created);
+        v["updated"] = json!(!created);
+        Ok(v)
+    }
+
     fn pair_paused(&self, sender: &str, peer: &str) -> Result<Option<String>> {
         Ok(self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![format!("pair:{sender}>{peer}")], |r| r.get(0)).optional()?)
     }
@@ -1138,7 +1317,9 @@ impl NodeState {
             .db
             .query_row("SELECT s.sender, m.envelope FROM sent s JOIN messages m USING(msg_id) WHERE s.msg_id=?1", params![msg_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some((sender, env)) = row else { return Ok(()) };
+        let Some((sender, env)) = row else {
+            return Ok(());
+        };
         let env: Amf = serde_json::from_str(&env)?;
         let limits = Limits::from_env();
         let hour = now().timestamp() / 3600;
@@ -1191,7 +1372,9 @@ impl NodeState {
             Target::Handle { handle } => match agentlan_proto::ids::split_handle(handle) {
                 Some((n, a)) if a == self.cfg.alias => match self.profiles.iter().find(|p| p.name == n) {
                     Some(p) => (vec![p.clone()], false),
-                    None => return Err(IpcErr("UNKNOWN_RECIPIENT", format!("no agent '{n}' on this machine"))),
+                    None => {
+                        return Err(IpcErr("UNKNOWN_RECIPIENT", format!("no agent '{n}' on this machine")));
+                    }
                 },
                 Some(_) => (vec![], true),
                 None => return Err(IpcErr("INVALID", format!("bad handle '{handle}'"))),

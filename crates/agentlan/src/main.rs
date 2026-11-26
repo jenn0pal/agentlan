@@ -164,12 +164,13 @@ enum Cmd {
     },
     /// MCP stdio server for an AI agent (Claude Code, Codex, …). Stdout is the MCP channel.
     Mcp {
-        /// Agent profile name, or `auto` (match runner + git remote of the working dir).
+        /// Start as an existing agent profile (or `auto`: match the git remote of the working
+        /// dir). Usually omitted: the agent calls `connect` and `register` itself.
         #[arg(long)]
-        agent: String,
-        /// claude-code | codex | generic — picks the message translator.
-        #[arg(long, default_value = "generic")]
-        runner: String,
+        agent: Option<String>,
+        /// claude-code | codex | generic — message format (default: detected from the MCP client).
+        #[arg(long)]
+        runner: Option<String>,
     },
     /// Run a runner hook (reads the hook JSON on stdin). Example: `hook claude post-tool-use --agent backend`.
     Hook {
@@ -252,6 +253,8 @@ enum HooksCmd {
 enum NodeCmd {
     /// Run the node daemon.
     Run,
+    /// Stop the node daemon running for this home (e.g. one started by an agent's `connect`).
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -330,9 +333,9 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             HubCmd::Run { listen } => agentlan_hub::run(home, listen).await?,
         },
         Cmd::Up { name, listen, advertise, tailscale, alias } => {
-            if node_running(home).await {
-                bail!("an AgentLAN node is already running for {} — stop it first (or use `agentlan status`)", home.display());
-            }
+            // The node may already be running (e.g. started by an agent's `connect`): then only
+            // the server starts here and the node is left as it is.
+            let node_up = node_running(home).await;
             let fresh = !agentlan_hub::hub_dir(home).join("hub.json").exists();
             let listen_override = if fresh {
                 let l = listen.clone().unwrap_or_else(|| format!("0.0.0.0:{}", agentlan_hub::DEFAULT_PORT));
@@ -391,19 +394,26 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 bail!("no LAN or Tailscale address found for other PCs; pass --advertise HOST:PORT");
             }
             let code = agentlan_hub::invite(home, addrs.clone(), Duration::from_secs(15 * 60))?;
-            let node_home = home.to_path_buf();
-            let node_task = tokio::spawn(async move { agentlan_node::run(&node_home).await });
             println!("✓ AgentLAN server listening on {bound}; other PCs reach it at: {}", addrs.join(", "));
             println!("\nOn each other PC, run (code valid 15 min; `agentlan hub invite` makes more):\n\n  agentlan connect {}\n", code.encode());
-            println!("Add an agent here:  agentlan agent add <name> --role <role> --runner claude-code|codex");
-            tokio::select! {
-                r = hub_task => r??,
-                r = node_task => r??,
+            println!("Agents connect from their session through the agentlan MCP tools (`connect`, then `register`).");
+            if node_up {
+                println!("(this PC's node was already running and keeps running)");
+                hub_task.await??;
+            } else {
+                let node_home = home.to_path_buf();
+                let node_task = tokio::spawn(async move { agentlan_node::run(&node_home).await });
+                tokio::select! {
+                    r = hub_task => r??,
+                    r = node_task => r??,
+                }
             }
         }
         Cmd::Connect { code, alias } => {
             if node_running(home).await {
-                bail!("an AgentLAN node is already running for {}", home.display());
+                let cfg = agentlan_node::load_config(home)?;
+                println!("✓ this PC's node is already running (network '{}' as {})", cfg.net, cfg.alias);
+                return Ok(());
             }
             match agentlan_node::load_config(home) {
                 Ok(cfg) => {
@@ -424,7 +434,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                     println!("✓ joined network '{}' as {alias}", code.net);
                 }
             }
-            eprintln!("Starting the node… add an agent with:  agentlan agent add <name> --role <role> --runner claude-code|codex");
+            eprintln!("Starting the node… agents on this PC connect through the agentlan MCP tools (`connect`, then `register`).");
             agentlan_node::run(home).await?;
         }
         Cmd::Join { code, alias } => {
@@ -434,6 +444,21 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             println!("✓ joined network '{}' as {alias} ({mid})\nnext: `agentlan agent add …`, then `agentlan node run`", code.net);
         }
         Cmd::Node { cmd: NodeCmd::Run } => agentlan_node::run(home).await?,
+        Cmd::Node { cmd: NodeCmd::Stop } => {
+            if !agentlan_node::is_running(home).await {
+                println!("no AgentLAN node is running for {}", home.display());
+                return Ok(());
+            }
+            call(home, IpcOp::Shutdown).await?;
+            for _ in 0..50 {
+                if !agentlan_node::is_running(home).await {
+                    println!("✓ node stopped");
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            bail!("the node did not stop");
+        }
         Cmd::Agent { cmd } => match cmd {
             AgentCmd::Add { name, role, project, runner, mode } => {
                 let mode = match mode.as_str() {
@@ -511,7 +536,9 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 s.trim_end().to_string()
             });
         }
-        Cmd::Attach { agent, takeover, json } => stream(home, Some(IpcOp::Attach { agent, runner: Some("cli".into()), pid: Some(std::process::id()), takeover }), json).await?,
+        Cmd::Attach { agent, takeover, json } => {
+            stream(home, Some(IpcOp::Attach { agent, runner: Some("cli".into()), pid: Some(std::process::id()), host_pid: None, takeover }), json).await?
+        }
         Cmd::Watch { as_agent, json } => stream(home, Some(IpcOp::Watch { agent: as_agent }), json).await?,
         Cmd::Send { as_agent, target, text, subject, intent, id, reply_to, thread, stdin, json } => {
             let mut draft = if stdin || text.as_deref() == Some("-") {
@@ -591,9 +618,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             println!("✓ acked {message_id}");
         }
         Cmd::Mcp { agent, runner } => {
-            let r = agentlan_mcp::Runner::parse(&runner);
-            let agent = if agent == "auto" { agentlan_mcp::resolve_auto(home, r.key(), &std::env::current_dir()?)? } else { agent };
-            agentlan_mcp::serve(home.to_path_buf(), agent, r).await?;
+            agentlan_mcp::serve(home.to_path_buf(), agent, runner.as_deref().map(agentlan_mcp::Runner::parse)).await?;
         }
         Cmd::Hook { runner, event, agent } => {
             if runner != "claude" && runner != "claude-code" {

@@ -26,7 +26,33 @@ pub enum IpcOp {
         pid: Option<u32>,
         #[serde(default)]
         takeover: bool,
+        /// The process hosting the adapter (e.g. the Claude Code session), so hooks
+        /// running in that session can find this identity.
+        #[serde(default)]
+        host_pid: Option<u32>,
     },
+    /// An agent assigns itself an identity: create (or reuse, by name) a local profile
+    /// with the role it chose, and attach this connection to it. On an already attached
+    /// connection it updates that agent's role/project/description instead. Never grants
+    /// worker mode and never takes over a live session or a user-created worker profile.
+    Register {
+        /// Defaults to the role (with -2, -3… if that name is in use).
+        #[serde(default)]
+        name: Option<String>,
+        role: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        runner: Option<String>,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        host_pid: Option<u32>,
+    },
+    /// Stop the node daemon (local clients only; the IPC endpoint is private to this user).
+    Shutdown,
     Detach,
     Whoami,
     Status,
@@ -67,7 +93,14 @@ pub enum IpcOp {
     },
     /// Identity, peers and an unread summary for an agent, without attaching or
     /// surfacing anything (used by hooks).
-    Peek { agent: String },
+    /// With `hostPids` instead of `agent`: the identity registered by the nearest of
+    /// those processes (the hook's ancestors), i.e. the agent of this host session.
+    Peek {
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        host_pids: Vec<u32>,
+    },
     /// Lift a loop-guard pause on a thread (the CLI only sends this after a human
     /// confirmed on an interactive terminal).
     ResumeThread { thread_id: String },

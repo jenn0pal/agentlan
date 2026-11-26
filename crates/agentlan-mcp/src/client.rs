@@ -1,4 +1,5 @@
-//! A long-lived IPC client to the local node that holds one attached session.
+//! A long-lived IPC client to the local node. Each identity in an adapter (the main
+//! agent, each subagent) has its own client, i.e. its own attached node session.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,6 +22,26 @@ struct Live {
     alive: Arc<AtomicBool>,
     /// Serialises line writes so concurrent calls can't interleave bytes.
     wlock: Arc<Mutex<()>>,
+    reader: tokio::task::AbortHandle,
+}
+
+/// What a client's connection is bound to on the node.
+#[derive(Clone, Debug)]
+pub enum Bind {
+    /// Not an agent session (roster lookups before registering).
+    None,
+    /// An existing profile, by name (`agentlan mcp --agent <name>`).
+    Attach(String),
+    /// A self-assigned identity (the `register` tool).
+    Register(RegisterArgs),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RegisterArgs {
+    pub name: Option<String>,
+    pub role: String,
+    pub project: Option<String>,
+    pub description: Option<String>,
 }
 
 async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io::Result<()> {
@@ -31,8 +52,9 @@ async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io:
 
 pub struct NodeClient {
     home: PathBuf,
-    agent: String,
+    bind: std::sync::Mutex<Bind>,
     runner: String,
+    host_pid: Option<u32>,
     live: Mutex<Option<Live>>,
     next: AtomicU64,
     /// Set when the node tells us this session was taken over or rejected.
@@ -52,17 +74,35 @@ impl std::fmt::Display for CallError {
 }
 
 impl NodeClient {
-    pub fn new(home: PathBuf, agent: String, runner: String) -> NodeClient {
-        NodeClient { home, agent, runner, live: Mutex::new(None), next: AtomicU64::new(1), ended: Arc::new(Mutex::new(None)) }
+    pub fn new(home: PathBuf, bind: Bind, runner: String, host_pid: Option<u32>) -> NodeClient {
+        NodeClient {
+            home,
+            bind: std::sync::Mutex::new(bind),
+            runner,
+            host_pid,
+            live: Mutex::new(None),
+            next: AtomicU64::new(1),
+            ended: Arc::new(Mutex::new(None)),
+        }
     }
 
     async fn open(&self) -> Result<(Live, Value)> {
+        // A PC that has joined gets its node started on demand (it keeps running after
+        // this session ends); one that hasn't must `connect` with a join code first.
+        if !agentlan_node::is_running(&self.home).await {
+            if agentlan_node::load_config(&self.home).is_err() {
+                anyhow::bail!(
+                    "NOT_JOINED: this PC hasn't joined an AgentLAN network yet; call `connect` with the join code from the server (`agentlan up` prints it)"
+                );
+            }
+            agentlan_node::ensure_running(&self.home).await.map_err(|e| anyhow!("NODE_DOWN: {e:#}"))?;
+        }
         let name = agentlan_node::ipc_name(&self.home)?;
         let stream = Arc::new(Stream::connect(name).await.map_err(|e| anyhow!("NODE_DOWN: the agentlan node is not running ({e})"))?);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let wlock = Arc::new(Mutex::new(()));
-        {
+        let reader = {
             let (stream, pending, alive, ended, wlock) = (stream.clone(), pending.clone(), alive.clone(), self.ended.clone(), wlock.clone());
             tokio::spawn(async move {
                 let mut rd = BufReader::new(&*stream);
@@ -107,14 +147,57 @@ impl NodeClient {
                 for (_, tx) in pending.lock().await.drain() {
                     let _ = tx.send(Err(IpcError { code: "NODE_DOWN".into(), msg: "connection to the node closed".into() }));
                 }
-            });
+            })
+            .abort_handle()
+        };
+        let live = Live { stream, pending, alive, wlock, reader };
+        let bind = self.bind.lock().unwrap().clone();
+        let pid = Some(std::process::id());
+        let op = match &bind {
+            Bind::None => return Ok((live, Value::Null)),
+            Bind::Attach(agent) => IpcOp::Attach { agent: agent.clone(), runner: Some(self.runner.clone()), pid, takeover: false, host_pid: self.host_pid },
+            Bind::Register(a) => IpcOp::Register {
+                name: a.name.clone(),
+                role: a.role.clone(),
+                project: a.project.clone(),
+                description: a.description.clone(),
+                runner: Some(self.runner.clone()),
+                pid,
+                host_pid: self.host_pid,
+            },
+        };
+        let attached = match self.raw(&live, op).await {
+            Ok(v) => v,
+            Err(e) => {
+                live.reader.abort();
+                anyhow::bail!("{}: {}", e.code, e.msg);
+            }
+        };
+        // After a node restart, re-register under the name we got (keeps the recorded id).
+        if let Bind::Register(mut a) = bind
+            && let Some(n) = attached["agent"]["name"].as_str()
+        {
+            a.name = Some(n.to_string());
+            *self.bind.lock().unwrap() = Bind::Register(a);
         }
-        let live = Live { stream, pending, alive, wlock };
-        let attached = self
-            .raw(&live, IpcOp::Attach { agent: self.agent.clone(), runner: Some(self.runner.clone()), pid: Some(std::process::id()), takeover: false })
-            .await
-            .map_err(|e| anyhow!("{}: {}", e.code, e.msg))?;
         Ok((live, attached))
+    }
+
+    /// Update the args used if this identity has to re-register after a node restart.
+    pub fn set_register_args(&self, a: RegisterArgs) {
+        let mut b = self.bind.lock().unwrap();
+        if matches!(*b, Bind::Register(_)) {
+            *b = Bind::Register(a);
+        }
+    }
+
+    /// End this identity's session (the agent left) and close the connection.
+    pub async fn close(&self) {
+        let _ = self.call(IpcOp::Detach).await;
+        *self.ended.lock().await = Some("session ended: left".into());
+        if let Some(l) = self.live.lock().await.take() {
+            l.reader.abort();
+        }
     }
 
     async fn raw(&self, live: &Live, op: IpcOp) -> std::result::Result<Value, IpcError> {
@@ -139,7 +222,7 @@ impl NodeClient {
         rx.await.unwrap_or_else(|_| Err(IpcError { code: "NODE_DOWN".into(), msg: "connection closed".into() }))
     }
 
-    /// Attach now (used at startup to build the initial instructions).
+    /// Open the connection and bind it now; returns the node's attach/register result.
     pub async fn connect(&self) -> Result<Value> {
         let (live, attached) = self.open().await?;
         *self.live.lock().await = Some(live);
