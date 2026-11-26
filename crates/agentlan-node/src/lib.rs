@@ -4,6 +4,7 @@
 
 mod ipc;
 mod link;
+pub mod netif;
 mod state;
 
 use std::path::{Path, PathBuf};
@@ -191,9 +192,8 @@ pub fn machine_info(share_hardware: bool) -> MachineReported {
         cpu: None,
         cpu_cores: None,
         ram_gb: None,
-        addrs: if_addrs::get_if_addrs()
-            .map(|v| v.into_iter().filter(|i| !i.is_loopback() && i.ip().is_ipv4()).map(|i| i.ip().to_string()).collect())
-            .unwrap_or_default(),
+        // Only addresses peers can use: LAN and Tailscale (virtual bridges / other VPNs excluded).
+        addrs: netif::local_addrs().into_iter().filter(|a| a.kind != netif::AddrKind::Other).map(|a| a.ip.to_string()).collect(),
         agentlan_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     if share_hardware {

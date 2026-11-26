@@ -43,6 +43,18 @@ agentlan ack --as reviewer msg_…
 agentlan wait --as reviewer --timeout 30
 ```
 
+## Over Tailscale
+
+AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with no ports opened to the internet.
+
+```sh
+agentlan hub invite --tailscale     # advertise only this PC's MagicDNS name + 100.x address
+```
+
+- **Default `hub invite`** lists LAN addresses first, then the Tailscale name and IPs. Virtual adapters (VM/Docker bridges, WSL/Hyper-V switches, other VPN tunnels) are skipped. The chosen addresses are printed on stderr.
+- **Tailscale access rules** must allow TCP 47820 to the server PC. The default allow-all policy does.
+- **mDNS discovery (planned)** does not cross a tailnet; join codes don't need it.
+
 ## Connect an AI agent (MCP)
 
 ```sh

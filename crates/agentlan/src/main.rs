@@ -149,9 +149,13 @@ enum HubCmd {
     },
     /// Print a one-time join code.
     Invite {
-        /// Address(es) other PCs should use to reach this server (default: this PC's LAN IPs).
+        /// Address(es) other PCs should use to reach this server
+        /// (default: this PC's LAN addresses, then its Tailscale name/IPs; virtual adapters skipped).
         #[arg(long)]
         addr: Vec<String>,
+        /// Only advertise this PC's Tailscale MagicDNS name and tailnet IPs.
+        #[arg(long, conflicts_with = "addr")]
+        tailscale: bool,
         #[arg(long, default_value_t = 15)]
         ttl_min: u64,
     },
@@ -212,18 +216,24 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 println!("✓ server created in {}\n  key fingerprint {}\n  listens on {}", agentlan_hub::hub_dir(home).display(), info.fingerprint, info.listen);
                 println!("next: `agentlan hub run`, then `agentlan hub invite` for each PC");
             }
-            HubCmd::Invite { addr, ttl_min } => {
+            HubCmd::Invite { addr, tailscale, ttl_min } => {
                 let addrs = if addr.is_empty() {
                     let hf = agentlan_hub::load(home)?;
-                    let port = hf.listen.rsplit(':').next().unwrap_or("47820").to_string();
-                    let ips = agentlan_node::machine_info(false).addrs;
-                    if ips.is_empty() {
-                        bail!("no LAN address found; pass --addr HOST:PORT");
+                    let port: u16 = hf.listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(agentlan_hub::DEFAULT_PORT);
+                    let scope = if tailscale { agentlan_node::netif::InviteScope::Tailscale } else { agentlan_node::netif::InviteScope::Default };
+                    let a = agentlan_node::netif::invite_addrs(port, scope);
+                    if a.is_empty() {
+                        if tailscale {
+                            bail!("Tailscale is not running on this PC (or its CLI was not found); start it, or pass --addr HOST:PORT");
+                        }
+                        bail!("no usable LAN or Tailscale address found; pass --addr HOST:PORT");
                     }
-                    ips.into_iter().map(|ip| format!("{ip}:{port}")).collect()
+                    a
                 } else {
                     addr
                 };
+                // stdout stays just the code (scriptable); the address list goes to stderr.
+                eprintln!("join code advertises: {}", addrs.join(", "));
                 let code = agentlan_hub::invite(home, addrs, Duration::from_secs(ttl_min * 60))?;
                 println!("{}", code.encode());
             }

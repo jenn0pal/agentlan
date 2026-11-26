@@ -1040,3 +1040,10 @@ Where the code differs from this spec, and why:
 **Single instance**
 - Hub and node each hold an OS file lock for their home directory.
 - The hub binds its port before changing any saved presence state.
+
+**Tailscale (2026-11-26).** Over a tailnet, AgentLAN reaches PCs beyond one LAN with no change to the protocol.
+- **Advertised addresses.** `hub invite` classifies interfaces as LAN, Tailscale (100.64.0.0/10) or other, and drops virtual bridges and other VPNs. `--tailscale` advertises the MagicDNS name (read from `tailscale status --json`) and the tailnet IPs.
+- **Reported addresses.** `MachineInfo.addrs` reports only LAN and Tailscale addresses.
+- **Encryption.** Noise and join tokens still apply on top of WireGuard.
+- **Still to verify:** the Windows firewall rule must also allow 100.64.0.0/10, and a test across two tailnet devices is pending.
+
