@@ -136,6 +136,11 @@ pub struct NodeState {
     cfg: NodeFile,
     reported: MachineReported,
     profiles: Vec<AgentProfile>,
+    /// Profile JSON last registered with the hub, by agent id (to upsert new/edited ones).
+    registered: HashMap<String, String>,
+    /// profiles.json modification time, polled on ticks so `agent add` takes effect live.
+    profiles_mtime: Option<std::time::SystemTime>,
+    ticks: u64,
     hub: HubStatus,
     hub_tx: Option<mpsc::Sender<NodeToHub>>,
     link: mpsc::UnboundedSender<LinkCtl>,
@@ -211,6 +216,9 @@ impl NodeState {
             cfg,
             reported,
             profiles,
+            registered: HashMap::new(),
+            profiles_mtime: None,
+            ticks: 0,
             hub: HubStatus::Offline,
             hub_tx: None,
             link,
@@ -277,6 +285,14 @@ impl NodeState {
                 self.push_all("hub", json!({"status": "offline"}));
             }
             NCmd::Tick => {
+                self.ticks += 1;
+                if self.ticks % 10 == 0 {
+                    let m = std::fs::metadata(self.home.join("node").join("profiles.json")).and_then(|m| m.modified()).ok();
+                    if m != self.profiles_mtime {
+                        self.profiles_mtime = m;
+                        self.reload_profiles();
+                    }
+                }
                 self.tick();
                 self.pump()?;
             }
@@ -308,6 +324,21 @@ impl NodeState {
         match crate::load_profiles(&self.home) {
             Ok(pf) => self.profiles = pf.agents,
             Err(e) => warn!("node: cannot read profiles: {e:#}"),
+        }
+        // Agents added or edited while the node runs: register them with the hub before
+        // anything they send (same link, so the upsert is processed first).
+        if self.hub == HubStatus::Ready {
+            let changed: Vec<AgentProfile> = self
+                .profiles
+                .iter()
+                .filter(|p| self.registered.get(&p.agent_id).is_none_or(|j| serde_json::to_string(p).ok().as_ref() != Some(j)))
+                .cloned()
+                .collect();
+            for p in changed {
+                if self.send_live(NodeToHub::ProfileUpsert { profile: p.clone() }) {
+                    self.registered.insert(p.agent_id.clone(), serde_json::to_string(&p).unwrap_or_default());
+                }
+            }
         }
     }
 
@@ -484,6 +515,8 @@ impl NodeState {
         // Sessions that ended while the hub was away are covered by resync (not attached ⇒ left).
         self.ended.clear();
         self.reload_profiles();
+        // Resync carries every profile.
+        self.registered = self.profiles.iter().map(|p| (p.agent_id.clone(), serde_json::to_string(p).unwrap_or_default())).collect();
         self.send_live(NodeToHub::MachineInfo { reported: self.reported.clone() });
         let attached = self
             .sessions

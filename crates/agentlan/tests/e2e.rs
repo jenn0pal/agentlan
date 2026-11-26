@@ -880,3 +880,58 @@ fn group_sends_respect_paused_pairs() {
     assert_eq!(r["local"], 0, "paused local pair skipped: {r}");
     assert_eq!(r["remote"]["count"], 0, "paused remote pair excluded by the hub: {r}");
 }
+
+/// The one-liners: `agentlan up` on the server PC prints a connect command, and
+/// `agentlan connect <code>` on another PC joins and runs — then they can talk.
+#[test]
+fn up_and_connect_one_liners() {
+    let mut e = Env::new();
+    let addr = e.addr();
+    let mut up = e
+        .cmd("srv", &["up", "--name", "e2e", "--listen", &addr, "--advertise", &addr, "--alias", "pc-srv"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = up.stdout.take().unwrap();
+    e.kids.push(up);
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let t0 = Instant::now();
+    let code = loop {
+        let line = rx.recv_timeout(Duration::from_secs(15)).expect("`up` printed a connect command");
+        if let Some(rest) = line.trim().strip_prefix("agentlan connect ") {
+            break rest.trim().to_string();
+        }
+        assert!(t0.elapsed() < Duration::from_secs(15));
+    };
+    assert!(code.starts_with("AGENTLAN1-"));
+
+    e.spawn("pc2", &["connect", &code, "--alias", "pc-two"]);
+    let (srv, pc2) = (e.home("srv"), e.home("pc2"));
+    wait_until("both nodes up", T, || e.cmd_ok(&srv) && e.cmd_ok(&pc2));
+    wait_until("both nodes ready", T, || e.status("srv")["hub"] == "ready" && e.status("pc2")["hub"] == "ready");
+
+    e.run("srv", &["agent", "add", "lead", "--role", "lead"]);
+    e.run("pc2", &["agent", "add", "helper", "--role", "helper"]);
+    // Agents added while the node runs are registered live and show up on other PCs.
+    wait_until("helper (added live) visible on the server PC", T, || {
+        e.json("srv", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "helper@pc-two")
+    });
+    let r = e.json("srv", &["send", "--as", "lead", "@helper@pc-two", "hello from up", "--json"]);
+    assert_eq!(r["remote"]["status"], "accepted", "{r}");
+    wait_until("delivered", T, || {
+        e.json("pc2", &["inbox", "--as", "helper", "--json"])["messages"].as_array().unwrap().iter().any(|m| m["parts"][0]["text"] == "hello from up")
+    });
+
+    // Running `connect` again on a joined PC needs no code (it just runs the node);
+    // here it refuses because the node is already running.
+    let again = e.cmd("pc2", &["connect"]).output().unwrap();
+    assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("already using this directory"));
+}
