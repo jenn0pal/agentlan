@@ -11,6 +11,18 @@
 >
 > Expect breaking changes before 1.0.
 
+**Quick start**
+
+1. Install on every PC:
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.sh | sh
+   ```
+   On Windows: `irm https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.ps1 | iex`
+2. Run `agentlan up` on the PC you pick as the server.
+3. Run the `agentlan connect …` line it prints on every other PC.
+
+Details are in [Install](#install-one-line) and [Run it](#run-it-one-command-per-pc).
+
 ## Features
 
 **Connecting**
@@ -52,39 +64,77 @@
 
 For the full design, see [`PROPOSAL.md`](PROPOSAL.md). For an animated walkthrough, open [`process-flow.html`](process-flow.html) in a browser.
 
-## Quick start
+## Install (one line)
 
-You need Rust 1.89 or newer.
-
+**macOS / Linux**
 ```sh
-cargo build --release               # → target/release/agentlan
-cargo test --workspace              # unit tests + end-to-end tests (real processes on 127.0.0.1)
+curl -fsSL https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.sh | sh
 ```
 
-**1. On the PC you choose as the server**
-
-```sh
-agentlan hub init --name home-lab
-agentlan hub run                       # keep running (TCP 47820)
-agentlan hub invite                    # one-time join code per PC (valid 15 min)
-agentlan hub invite --tailscale        # …or advertise only this PC's Tailscale name
+**Windows (PowerShell)**
+```powershell
+irm https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.ps1 | iex
 ```
 
-**2. On every PC, including the server PC if agents run there**
+The installer downloads the prebuilt binary for your machine from [Releases](https://github.com/jenn0pal/agentlan/releases), verifies its SHA-256 checksum and puts `agentlan` on your PATH:
+- **macOS / Linux:** `~/.local/bin`
+- **Windows:** `%LOCALAPPDATA%\Programs\agentlan`
 
+Prebuilt binaries cover macOS (Apple Silicon and Intel), Linux (x64 and ARM64; static, so any distro) and Windows x64.
+
+**Options:**
+- **Pin a version:** `AGENTLAN_VERSION=v0.1.0`
+- **Choose where it goes:** `AGENTLAN_INSTALL_DIR=…`
+- **Build from source instead:** `AGENTLAN_FROM_SOURCE=1`
+
+**From source (Rust 1.89 or newer):** `cargo install --locked --git https://github.com/jenn0pal/agentlan agentlan`
+
+## Run it (one command per PC)
+
+**1. On the PC you pick as the server** (any Mac or Windows PC):
 ```sh
-agentlan join AGENTLAN1-…
-agentlan agent add backend --role backend --runner claude-code --project github.com/acme/shop-api
-agentlan node run                      # keep running
+agentlan up
+```
+It sets everything up the first time, starts the server and this PC's node, and prints a line like:
+```
+  agentlan connect AGENTLAN1-eyJuZXQiOi…
 ```
 
-**3. Look around and send a message**
-
+**2. On every other PC**, paste that line:
 ```sh
-agentlan ls                            # agents: role, project, presence, same-PC flag
-agentlan machines                      # PCs: OS, CPU, RAM, agents online
-agentlan send --as backend @reviewer@win-pc "PR 12 is ready" --subject "review please"
+agentlan connect AGENTLAN1-eyJuZXQiOi…
+```
+After the first time, plain `agentlan connect` starts the node again. Over Tailscale, use `agentlan up --tailscale` to advertise the server's MagicDNS name.
+
+**3. Add an agent and talk:**
+```sh
+agentlan agent add backend --role backend --runner claude-code    # on any PC; picked up live
+agentlan ls                                                       # who's online: roles, projects, machines
+agentlan send --as backend @reviewer@win-pc "PR 12 is ready"
 agentlan inbox --as reviewer
+```
+
+**Keep it running.** Leave `agentlan up` / `agentlan connect` running in a terminal. On macOS and Linux you can also background it with `nohup agentlan up > ~/agentlan.log 2>&1 &`. Installing it as a login service comes in Phase 3.
+
+**If the server is a Windows PC**, allow `agentlan` through Windows Firewall when prompted (TCP 47820, Private networks). The other PCs only connect out.
+
+<details>
+<summary>Advanced: the individual commands behind <code>up</code> / <code>connect</code></summary>
+
+```sh
+# server PC
+agentlan hub init --name home-lab && agentlan hub run    # server only
+agentlan hub invite [--tailscale | --addr HOST:PORT]     # one-time join code per PC (15 min)
+# each PC
+agentlan join AGENTLAN1-… && agentlan node run           # node only
+```
+</details>
+
+### Build and test
+
+```sh
+cargo build --release      # → target/release/agentlan
+cargo test --workspace     # unit tests + end-to-end tests (real processes on 127.0.0.1)
 ```
 
 ## Connect your AI agents (MCP)
