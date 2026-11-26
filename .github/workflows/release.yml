@@ -103,12 +103,27 @@ jobs:
           sh install.sh
           "$AGENTLAN_INSTALL_DIR/agentlan" --version
           "$AGENTLAN_INSTALL_DIR/agentlan" --help >/dev/null
+      - name: install.sh (unpinned "latest", as in the README one-liner)
+        if: runner.os != 'Windows'
+        env:
+          AGENTLAN_INSTALL_DIR: ${{ runner.temp }}/agl-latest
+        run: |
+          sh install.sh
+          "$AGENTLAN_INSTALL_DIR/agentlan" --version
       - name: install.ps1
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           AGENTLAN_VERSION: ${{ github.ref_name }}
           AGENTLAN_INSTALL_DIR: ${{ runner.temp }}\agl-bin
+        run: |
+          ./install.ps1
+          & "$env:AGENTLAN_INSTALL_DIR\agentlan.exe" --version
+      - name: install.ps1 (unpinned "latest", as in the README one-liner)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AGENTLAN_INSTALL_DIR: ${{ runner.temp }}\agl-latest
         run: |
           ./install.ps1
           & "$env:AGENTLAN_INSTALL_DIR\agentlan.exe" --version

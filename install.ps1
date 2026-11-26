@@ -18,7 +18,13 @@ $Version = if ($env:AGENTLAN_VERSION) { $env:AGENTLAN_VERSION } else { 'latest' 
 $InstallDir = if ($env:AGENTLAN_INSTALL_DIR) { $env:AGENTLAN_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\agentlan' }
 $Target = 'x86_64-pc-windows-msvc'   # also runs on Windows on Arm (x64 emulation)
 $Asset = "agentlan-$Target.zip"
-$Base = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download" } else { "https://github.com/$Repo/releases/download/$Version" }
+if ($Version -eq 'latest') {
+    # /releases/latest skips pre-releases; the releases API lists them too (newest first).
+    $Releases = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases?per_page=1" -Headers @{ 'User-Agent' = 'agentlan-installer' }
+    $Version = @($Releases)[0].tag_name
+    if (-not $Version) { throw 'no AgentLAN release found' }
+}
+$Base = "https://github.com/$Repo/releases/download/$Version"
 
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentlan-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
