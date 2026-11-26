@@ -1,96 +1,161 @@
-# agentlan
+# AgentLAN
 
-Link AI coding agents (Claude Code, Codex, scripts…) across Mac and Windows PCs on your LAN.
-Design: [`PROPOSAL.md`](PROPOSAL.md) · interactive flow: [`process-flow.html`](process-flow.html).
+**A LAN intercom for AI coding agents.** AgentLAN links Claude Code, Codex and your own scripts running on different Mac and Windows PCs, so they can find each other and talk. Every agent has a recorded identity, a role and a project, and the network announces it when the agent connects. Agents on the same PC talk directly through a local daemon, without touching the network.
 
-**Status: Milestone 1, plus the MCP adapter.**
+> **Status: alpha (v0.1).**
+> - **Built and tested on macOS:** the core system and the MCP adapter.
+> - **Not yet built on Windows**, though the code is written to be cross-platform.
+> - **Not yet tested across two physical machines.** End-to-end tests run every process on one machine over loopback.
+>
+> Expect breaking changes before 1.0.
 
-| Works and is tested on macOS | Not built yet |
-|---|---|
-| • server (hub) on any PC<br>• join codes<br>• Noise-encrypted links<br>• machine and agent registry<br>• roster on connect and join/leave announcements<br>• same-PC routing through the local daemon (works with the server down)<br>• cross-PC messages with store-and-forward, outbox and retry de-duplication<br>• CLI with JSON in and out<br>• MCP adapter for Claude Code (XML-wrapped text) and Codex (JSON) | • mDNS discovery<br>• Claude hooks<br>• auto-wake<br>• request/reply<br>• `hub move`<br>• installers |
+## Features
 
-**Windows:** the code is written to be cross-platform, but it has not been built or run on Windows yet.
+**Connecting**
+- **One Rust binary.** Any PC can be the server. Every PC runs a small daemon, and each AI agent gets an MCP adapter.
+- **Identity and roster.** Each agent has a permanent `agt_…` id, a role, a project, a runner and its machine. A newcomer receives the roster, its own project first, with same-machine peers flagged.
+- **Machine details.** The registry records each PC's OS, CPU, RAM and addresses (shared by default; `share_hardware = false` turns it off), so agents can choose peers sensibly.
 
-## Build
+**Messaging**
+- **Same-PC routing.** Messages between agents on one PC go through the local daemon. They never cross the network and keep working when the server is down.
+- **Durable cross-PC messaging.**
+  - Messages are stored and forwarded, and offline mail waits up to 24 hours.
+  - Delivery is in order per sender.
+  - Retry keys stop retries from duplicating messages.
+  - A queued outbox drains when the server comes back.
+- **AMF/1, one runner-agnostic message format.** Its parts use the same shape as the [A2A](https://a2a-protocol.org) protocol. Small translators at the edge render it per runner:
+  - Claude Code sees peer messages wrapped and marked untrusted;
+  - Codex gets JSON;
+  - scripts use the CLI with JSON in and out.
 
-```sh
-cargo build --release        # → target/release/agentlan   (Rust ≥ 1.89)
-cargo test --workspace       # unit tests + end-to-end tests (real processes on 127.0.0.1)
+**Security and networking**
+- **Encrypted, authenticated links.** Every link uses the [Noise](https://noiseprotocol.org) XX handshake with a pinned server key and one-time join codes.
+- **Tailscale-aware.** `hub invite --tailscale` advertises this PC's MagicDNS name, so agents can link across sites over your tailnet.
+
+## How it works
+
+```
+  PC-A (macOS)                           PC-B (any PC: server)               PC-C (Windows)
+┌───────────────────────────┐          ┌────────────────────────┐          ┌───────────────────────────┐
+│ Claude Code     Codex     │          │ agentlan hub           │          │ Codex          script     │
+│  └ agentlan mcp └ agentlan mcp       │  registry · presence   │          │  └ agentlan mcp └ CLI JSON│
+│        │ local IPC │      │  Noise   │  routing · mailboxes   │  Noise   │        │ local IPC │      │
+│   ┌──────────────────┐    │  over    └───────────▲────────────┘  over    │   ┌──────────────────┐    │
+│   │  agentlan node   │────┼──── TCP ─────────────┴───────────── TCP ─────┼───│  agentlan node   │    │
+│   │  (local router)  │    │                                              │   │  (local router)  │    │
+│   └──────────────────┘    │                                              │   └──────────────────┘    │
+└───────────────────────────┘                                              └───────────────────────────┘
+   same-PC messages stay inside the daemon; cross-PC messages go node → hub → node
 ```
 
-## Try it on one LAN
+For the full design, see [`PROPOSAL.md`](PROPOSAL.md). For an animated walkthrough, open [`process-flow.html`](process-flow.html) in a browser.
 
-Every PC uses the same `agentlan` binary.
+## Quick start
+
+You need Rust 1.89 or newer.
 
 ```sh
-# 1. On the PC you pick as the server
+cargo build --release               # → target/release/agentlan
+cargo test --workspace              # unit tests + end-to-end tests (real processes on 127.0.0.1)
+```
+
+**1. On the PC you choose as the server**
+
+```sh
 agentlan hub init --name home-lab
-agentlan hub run                      # keep running (TCP 47820; on Windows allow it through the firewall)
-agentlan hub invite                   # prints AGENTLAN1-…  (one code per PC, valid 15 min)
+agentlan hub run                       # keep running (TCP 47820)
+agentlan hub invite                    # one-time join code per PC (valid 15 min)
+agentlan hub invite --tailscale        # …or advertise only this PC's Tailscale name
+```
 
-# 2. On every PC, including the server PC if agents run there
-agentlan join AGENTLAN1-…               # pins the server key, enrols this PC
+**2. On every PC, including the server PC if agents run there**
+
+```sh
+agentlan join AGENTLAN1-…
 agentlan agent add backend --role backend --runner claude-code --project github.com/acme/shop-api
-agentlan node run                     # keep running
+agentlan node run                      # keep running
+```
 
-# 3. Use it
-agentlan ls                           # who is online, roles, projects, same-PC flag
-agentlan machines                     # PCs with OS / CPU / RAM
-agentlan attach backend               # hold a session and stream events (Ctrl-C detaches)
+**3. Look around and send a message**
+
+```sh
+agentlan ls                            # agents: role, project, presence, same-PC flag
+agentlan machines                      # PCs: OS, CPU, RAM, agents online
 agentlan send --as backend @reviewer@win-pc "PR 12 is ready" --subject "review please"
 agentlan inbox --as reviewer
-agentlan ack --as reviewer msg_…
-agentlan wait --as reviewer --timeout 30
+```
+
+## Connect your AI agents (MCP)
+
+```sh
+# Claude Code (per project)
+claude mcp add -s local agentlan -- agentlan mcp --agent backend --runner claude-code
+# Codex CLI (picks the profile from runner + git remote)
+codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
+```
+
+**Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message`, `ack`.
+
+**Scripts and other agents** use the CLI:
+
+```sh
+agentlan attach ci-bot --json &        # announce + stream events as JSON lines
+echo '{"to":{"kind":"role","role":"qa"},"intent":"status","subject":"CI green"}' \
+  | agentlan send --as ci-bot --stdin --json
+agentlan wait --as ci-bot --json
 ```
 
 ## Over Tailscale
 
 AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with no ports opened to the internet.
 
-```sh
-agentlan hub invite --tailscale     # advertise only this PC's MagicDNS name + 100.x address
-```
-
-- **Default `hub invite`** lists LAN addresses first, then the Tailscale name and IPs. Virtual adapters (VM/Docker bridges, WSL/Hyper-V switches, other VPN tunnels) are skipped. The chosen addresses are printed on stderr.
+- **Choosing addresses.** `hub invite --tailscale` advertises only the MagicDNS name and the 100.x address. The default `hub invite` lists LAN addresses first, then Tailscale, and skips VM/Docker bridges, WSL/Hyper-V switches and other VPN tunnels. The chosen addresses are printed to stderr.
 - **Tailscale access rules** must allow TCP 47820 to the server PC. The default allow-all policy does.
-- **mDNS discovery (planned)** does not cross a tailnet; join codes don't need it.
 
-## Connect an AI agent (MCP)
+## Security model
 
-```sh
-# Claude Code (per project): Claude sees peer messages wrapped as <agentlan_message … untrusted="true">
-claude mcp add -s local agentlan -- agentlan mcp --agent backend --runner claude-code
-# Codex CLI: Codex gets JSON (structuredContent mirrored in the text)
-codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
-```
+- **Network membership.** PCs join with a one-time code that contains the server's full public key, so a fake server is rejected during the handshake. The server then pins each PC's key.
+- **Peer messages are untrusted data.** They are never instructions. The protocol has no "execute" verb. Adapters mark peer content as untrusted, and a peer cannot close Claude's wrapper early.
+- **Auto-wake is off by default.** Agents can't start work in another agent's session unless that profile is a dedicated worker. See §7.5 of the proposal for the impact analysis.
+- **Same OS user.** Local IPC is restricted to your user account; agents running as that user can act as that user's agents.
 
-**Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message` (≤ 45 s), `ack`.
+## Configuration
 
-**Result format:** every result carries structured AMF/1 JSON and an unread summary.
-
-**`--agent auto`** picks the profile whose runner matches and whose `--project` equals the git remote of the working directory.
-
-**Scripts and other agents.** Add `--json` to get JSON out, and use `send --stdin` to pass an AMF/1 draft in:
-
-```sh
-echo '{"to":{"kind":"role","role":"qa"},"intent":"status","subject":"CI green"}' \
-  | agentlan send --as ci-bot --stdin --json
-```
-
-## Data location
-
-The default location is the per-user app-data directory. Override it with `--home DIR` or `AGENTLAN_HOME`.
-
-| Path | Contents |
+| | |
 |---|---|
-| `hub/` | `hub.key`, `hub.json`, `hub.db` |
-| `node/` | `node.key`, `node.json`, `profiles.json`, `node.db`, and `node.sock` on macOS/Linux (a named pipe on Windows) |
+| **Data directory** | The per-user app-data folder by default (`--home DIR` or `AGENTLAN_HOME` overrides it). It holds `hub/` (`hub.key`, `hub.json`, `hub.db`) and `node/` (`node.key`, `node.json`, `profiles.json`, `node.db`, plus the IPC socket). |
+| **Environment variables** | `AGENTLAN_LOG` (log level), `AGENTLAN_HEARTBEAT_MS`, `AGENTLAN_LEASE_MS`, `AGENTLAN_BACKOFF_MAX_MS` |
 
-## Development knobs
+## Project layout
 
-| Variable | Purpose |
+| Crate | Purpose |
 |---|---|
-| `AGENTLAN_LOG=info` | Log verbosity |
-| `AGENTLAN_HEARTBEAT_MS` | Heartbeat interval |
-| `AGENTLAN_LEASE_MS` | How long before a silent PC counts as lost |
-| `AGENTLAN_BACKOFF_MAX_MS` | Maximum reconnect backoff |
+| `agentlan-proto` | AMF/1 message format, registry records, wire frames, IPC protocol, join codes (no I/O) |
+| `agentlan-net` | Noise XX handshake and chunked, encrypted framing |
+| `agentlan-store` | SQLite helpers (WAL, `synchronous=FULL`) |
+| `agentlan-hub` | Server: registry, sequenced events, fenced sessions, transactional routing, in-order delivery pump |
+| `agentlan-node` | Per-PC daemon: local router, durable inbox/outbox, server link, interface classification |
+| `agentlan-mcp` | MCP stdio adapter ([rmcp](https://crates.io/crates/rmcp)) with per-runner translators |
+| `agentlan` | The single binary: CLI, `hub`, `node`, `mcp` |
+
+## Roadmap
+
+**Phase 2 (in progress)**
+- Request/reply that waits for the answer.
+- Claude Code hooks.
+- Opt-in wake for worker agents.
+- Loop-guard budgets.
+- Tests for role and project broadcasts.
+
+**Phase 3**
+- Background services: macOS LaunchAgent and Windows startup task.
+- mDNS discovery.
+- Moving the server to another PC, and server backups.
+- `doctor` command and a terminal dashboard.
+- Installers and code signing.
+
+**Still to verify:** Windows builds, and a real test across two machines (LAN and Tailscale).
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
