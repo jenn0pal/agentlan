@@ -657,3 +657,78 @@ fn mcp_request_tool_and_cancelled_wait() {
     let again = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 10}));
     assert_eq!(again["structuredContent"]["messages"][0]["subject"], "after-cancel", "{again}");
 }
+
+/// Run a Claude Code hook the way Claude does: JSON on stdin; stdout is JSON or empty.
+fn hook(e: &Env, home: &str, event: &str, agent: &str, session: &str) -> Option<Value> {
+    let mut child = e.cmd(home, &["hook", "claude", event, "--agent", agent]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    {
+        use std::io::Write;
+        let inp = serde_json::json!({"session_id": session, "hook_event_name": event, "cwd": "/tmp", "stop_hook_active": false});
+        child.stdin.take().unwrap().write_all(inp.to_string().as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "hook {event} failed: {}", String::from_utf8_lossy(&out.stderr));
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(serde_json::from_str(&s).unwrap_or_else(|_| panic!("hook output is not JSON: {s}"))) }
+}
+
+/// Claude Code hooks: identity + peers at session start, pointer-only unread notices
+/// (no peer-written text), no repeats, and Stop continuation only for worker profiles.
+#[test]
+fn claude_hooks_pointer_only_and_worker_only_stop() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code", "--project", "shop"]);
+    e.run("n1", &["agent", "add", "bot", "--role", "fixer", "--runner", "claude-code", "--mode", "worker", "--project", "shop"]);
+    e.run("n2", &["agent", "add", "reviewer", "--role", "reviewer", "--runner", "codex", "--project", "shop"]);
+
+    // Node not running yet: hooks must stay silent and succeed.
+    assert!(hook(&e, "n1", "session-start", "backend", "s0").is_none());
+
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+    let rev = e.stream("n2", &["attach", "reviewer", "--json"]);
+    expect(&rev, "reviewer attached", T, |v| v["event"] == "attached");
+    wait_until("reviewer online on n1", T, || {
+        e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "reviewer@pc-two" && a["state"] == "online")
+    });
+
+    let ss = hook(&e, "n1", "session-start", "backend", "s1").expect("session-start context");
+    assert_eq!(ss["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let c = ss["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(c.contains("you are backend@pc-one") && c.contains("reviewer@pc-two"), "{c}");
+    assert!(hook(&e, "n1", "user-prompt-submit", "backend", "s1").is_none(), "no unread → no output");
+
+    // Mail arrives; the notice names sender/intent/id but never the subject.
+    e.run("n2", &["send", "--as", "reviewer", "@backend@pc-one", "body text", "--subject", "SECRET-SUBJECT", "--intent", "request"]);
+    e.run("n2", &["send", "--as", "reviewer", "@bot@pc-one", "fix it", "--subject", "job"]);
+    wait_until("mail stored on n1", T, || e.status("n1")["outbox"] == 0 && hook(&e, "n1", "user-prompt-submit", "backend", "probe").is_some());
+    let up = hook(&e, "n1", "user-prompt-submit", "backend", "s1").expect("pointer");
+    let t = up["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(t.contains("1 unread") && t.contains("reviewer@pc-two") && t.contains("request"), "{t}");
+    assert!(!t.contains("SECRET-SUBJECT") && !t.contains("body text"), "peer text leaked: {t}");
+
+    // post-tool-use points out each new message once.
+    assert!(hook(&e, "n1", "post-tool-use", "backend", "s2").is_some());
+    assert!(hook(&e, "n1", "post-tool-use", "backend", "s2").is_none(), "no repeat for the same mail");
+
+    // Stop: interactive profiles may always stop; workers continue up to the budget.
+    assert!(hook(&e, "n1", "stop", "backend", "s3").is_none());
+    for i in 0..3 {
+        let st = hook(&e, "n1", "stop", "bot", "s4").unwrap_or_else(|| panic!("worker stop block #{i}"));
+        assert_eq!(st["decision"], "block");
+        assert!(!st["reason"].as_str().unwrap().contains("fix it"));
+    }
+    assert!(hook(&e, "n1", "stop", "bot", "s4").is_none(), "continuation budget exhausted");
+
+    // Peeking never consumed the mail.
+    let w = e.json("n1", &["wait", "--as", "backend", "--timeout", "3", "--json"]);
+    assert_eq!(w["message"]["subject"], "SECRET-SUBJECT");
+
+    // Settings snippet: Stop only for worker profiles.
+    let p_bot = String::from_utf8(e.run("n1", &["hooks", "print", "claude", "--agent", "bot"]).stdout).unwrap();
+    let p_back = String::from_utf8(e.run("n1", &["hooks", "print", "claude", "--agent", "backend"]).stdout).unwrap();
+    assert!(p_bot.contains("\"Stop\"") && !p_back.contains("\"Stop\""));
+    assert!(serde_json::from_str::<Value>(&p_back).unwrap()["hooks"]["PostToolUse"][0]["matcher"] == "*");
+}

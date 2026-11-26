@@ -65,6 +65,9 @@ pub enum IpcOp {
         #[serde(default)]
         in_reply_to: Option<String>,
     },
+    /// Identity, peers and an unread summary for an agent, without attaching or
+    /// surfacing anything (used by hooks).
+    Peek { agent: String },
     /// Drop this connection's pending waits (the caller gave up).
     CancelWait,
     /// Put a message back to "unseen" (a wait result that never reached its caller).

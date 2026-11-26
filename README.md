@@ -96,12 +96,12 @@ claude mcp add -s local agentlan -- agentlan mcp --agent backend --runner claude
 codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
 ```
 
-**Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message`, `ack`.
+**Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply`, `inbox`, `wait_for_message`, `ack`.
 
 **Annotations.** Tools carry MCP hints:
 - read-only: `whoami`, `list_agents`, `list_machines`;
 - local only: `inbox`, `wait_for_message`, `ack`;
-- reaches other agents: `send`, `reply`.
+- reaches other agents: `send`, `request`, `reply`.
 
 **Codex** (verified with Codex CLI 1.x):
 - **Local tools** run without prompting.
@@ -118,6 +118,20 @@ codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
 
 - **AgentLAN's server instructions** (identity and peer list) reach Codex when it discovers the tools.
 - **`--agent auto`** works because Codex starts the adapter in the session's working directory.
+
+**Claude Code hooks** (optional) make Claude notice mail without polling:
+
+```sh
+agentlan hooks print claude --agent backend   # prints a snippet for .claude/settings.local.json (writes nothing)
+```
+
+- **What each hook does:**
+  - SessionStart gives Claude its identity and peer list before the first prompt;
+  - UserPromptSubmit and PostToolUse add a one-line "N unread from …" pointer.
+- **Pointer only:** sender handles, intents and ids; never subjects or bodies.
+- **The Stop hook is only for `--mode worker` profiles.** It keeps the agent working on new mail, at most 3 times in a row.
+- **Safe by default:** hooks stay silent if the node isn't running.
+- **Not yet verified** against a live Claude Code session.
 
 **Scripts and other agents** use the CLI:
 
@@ -163,12 +177,9 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 
 ## Roadmap
 
-**Phase 2 (in progress)**
-- Request/reply that waits for the answer.
-- Claude Code hooks.
+**Phase 2 (in progress).** Done: request/reply, Claude hooks, fan-out tests. Remaining:
 - Opt-in wake for worker agents.
 - Loop-guard budgets.
-- Tests for role and project broadcasts.
 
 **Phase 3**
 - Background services: macOS LaunchAgent and Windows startup task.

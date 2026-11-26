@@ -903,6 +903,27 @@ impl NodeState {
                 self.waiters.push(Waiter { conn, req: req.id, agent: p.agent_id, deadline: Instant::now() + Duration::from_millis(t), in_reply_to });
                 Ok(None)
             }
+            IpcOp::Peek { agent } => {
+                let p = self.agent_for(conn, Some(&agent))?;
+                let mut st = self.db.prepare(
+                    "SELECT m.envelope FROM inbox i JOIN messages m USING(msg_id) WHERE i.agent_id=?1 AND i.state='stored' ORDER BY i.rowid LIMIT 5",
+                )?;
+                let latest: Vec<Value> = st
+                    .query_map(params![p.agent_id], |r| r.get::<_, String>(0))?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| serde_json::from_str::<Amf>(&e).ok())
+                    .map(|m| json!({"id": m.id, "from": m.from.handle, "intent": m.intent, "sameMachine": self.profiles.iter().any(|x| x.agent_id == m.from.agent)}))
+                    .collect();
+                drop(st);
+                let project = p.project.clone();
+                let mut roster = self.roster(None, None);
+                roster.retain(|e| e.agent.profile.agent_id != p.agent_id);
+                roster.sort_by_key(|e| (e.agent.profile.project != project, !e.same_machine, e.agent.state != PresenceState::Online));
+                Ok(Some(json!({
+                    "agent": self.local_record(&p), "alias": self.cfg.alias, "machineId": self.cfg.machine_id, "hub": self.hub_label(),
+                    "unread": self.unread_count(&p.agent_id)?, "unreadLatest": latest, "roster": roster,
+                })))
+            }
             IpcOp::CancelWait => {
                 let (gone, keep): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.conn == conn);
                 self.waiters = keep;

@@ -1,5 +1,7 @@
 //! `agentlan` — one binary: hub, node daemon and CLI client.
 
+mod hooks;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -141,6 +143,20 @@ enum Cmd {
         #[arg(long, default_value = "generic")]
         runner: String,
     },
+    /// Run a runner hook (reads the hook JSON on stdin). Example: `hook claude post-tool-use --agent backend`.
+    Hook {
+        /// claude
+        runner: String,
+        /// session-start | user-prompt-submit | post-tool-use | stop
+        event: String,
+        #[arg(long, default_value = "auto")]
+        agent: String,
+    },
+    /// Hook configuration helpers.
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
     /// Wait for the next message.
     Wait {
         #[arg(long = "as")]
@@ -181,6 +197,17 @@ enum HubCmd {
 }
 
 #[derive(Subcommand)]
+enum HooksCmd {
+    /// Print the hook settings snippet for a runner (does not write any file).
+    Print {
+        /// claude
+        runner: String,
+        #[arg(long)]
+        agent: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum NodeCmd {
     /// Run the node daemon.
     Run,
@@ -216,6 +243,14 @@ async fn main() {
     let cli = Cli::parse();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("AGENTLAN_LOG").unwrap_or_else(|_| "warn".into())).with_writer(std::io::stderr).init();
     let home = cli.home.clone().unwrap_or_else(default_home);
+    let home_explicit = cli.home.is_some();
+    if let Cmd::Hooks { cmd: HooksCmd::Print { runner, agent } } = &cli.cmd {
+        if let Err(e) = hooks::print(&home, runner, agent, home_explicit) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = run(cli.cmd, &home).await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -425,6 +460,13 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             let agent = if agent == "auto" { agentlan_mcp::resolve_auto(home, r.key(), &std::env::current_dir()?)? } else { agent };
             agentlan_mcp::serve(home.to_path_buf(), agent, r).await?;
         }
+        Cmd::Hook { runner, event, agent } => {
+            if runner != "claude" && runner != "claude-code" {
+                bail!("only Claude Code hooks are supported (runner 'claude')");
+            }
+            hooks::run(home, &event, &agent).await?;
+        }
+        Cmd::Hooks { .. } => unreachable!("handled before dispatch"),
         Cmd::Wait { as_agent, timeout, json } => {
             let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
             print_value(&v, json, |v| match v["message"].as_object() {
@@ -450,7 +492,7 @@ async fn connect(home: &Path) -> Result<Stream> {
 }
 
 /// One request, one response (pushes are ignored).
-async fn call(home: &Path, op: IpcOp) -> Result<Value> {
+pub(crate) async fn call(home: &Path, op: IpcOp) -> Result<Value> {
     let conn = connect(home).await?;
     let mut rd = BufReader::new(&conn);
     let mut wr = &conn;
