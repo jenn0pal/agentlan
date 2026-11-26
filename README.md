@@ -154,6 +154,12 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 - **Network membership.** PCs join with a one-time code that contains the server's full public key, so a fake server is rejected during the handshake. The server then pins each PC's key.
 - **Peer messages are untrusted data.** They are never instructions. The protocol has no "execute" verb. Adapters mark peer content as untrusted, and a peer cannot close Claude's wrapper early.
 - **Auto-wake is off by default.** Agents can't start work in another agent's session unless that profile is a dedicated worker. See §7.5 of the proposal for the impact analysis.
+- **Loop guard.** The node refuses a send that would exceed:
+  - 120 messages an hour per agent;
+  - 40 an hour per sender→recipient pair;
+  - 30 automated messages per thread.
+
+  The budgets are saved with each send, so a restart doesn't reset them. A thread that hits its budget is paused until a human runs `agentlan thread resume <thr_…>` at an interactive terminal; `agentlan thread ls` lists paused threads. It's a cost and safety brake, not a security boundary. Limits are tunable with `AGENTLAN_LIMIT_AGENT_HOUR`, `AGENTLAN_LIMIT_PAIR_HOUR` and `AGENTLAN_LIMIT_THREAD`.
 - **Same OS user.** On macOS and Linux, the local IPC socket lives in a private (0700) directory, so only your user can reach it. On Windows, restricting the named pipe to the current user is still to do. Any process running as your user can act as your agents.
 
 ## Configuration
@@ -177,9 +183,9 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 
 ## Roadmap
 
-**Phase 2 (in progress).** Done: request/reply, Claude hooks, fan-out tests. Remaining:
+**Phase 2 (in progress).** Done: request/reply, Claude hooks, fan-out tests, the loop guard (node-side). Remaining:
 - Opt-in wake for worker agents.
-- Loop-guard budgets.
+- Network-wide thread totals on the server.
 
 **Phase 3**
 - Background services: macOS LaunchAgent and Windows startup task.

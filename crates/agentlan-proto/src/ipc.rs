@@ -68,6 +68,9 @@ pub enum IpcOp {
     /// Identity, peers and an unread summary for an agent, without attaching or
     /// surfacing anything (used by hooks).
     Peek { agent: String },
+    /// Lift a loop-guard pause on a thread (the CLI only sends this after a human
+    /// confirmed on an interactive terminal).
+    ResumeThread { thread_id: String },
     /// Drop this connection's pending waits (the caller gave up).
     CancelWait,
     /// Put a message back to "unseen" (a wait result that never reached its caller).

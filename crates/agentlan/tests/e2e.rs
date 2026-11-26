@@ -18,6 +18,7 @@ struct Env {
     root: PathBuf,
     port: u16,
     kids: Vec<Child>,
+    extra_env: Vec<(&'static str, String)>,
 }
 
 impl Env {
@@ -27,7 +28,7 @@ impl Env {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        Env { root, port, kids: vec![] }
+        Env { root, port, kids: vec![], extra_env: vec![] }
     }
 
     fn home(&self, name: &str) -> PathBuf {
@@ -38,6 +39,9 @@ impl Env {
         let mut c = Command::new(BIN);
         c.arg("--home").arg(self.home(home)).args(args);
         c.env("AGENTLAN_HEARTBEAT_MS", "300").env("AGENTLAN_LEASE_MS", "2000").env("AGENTLAN_BACKOFF_MAX_MS", "400").env("AGENTLAN_LOG", "warn");
+        for (k, v) in &self.extra_env {
+            c.env(k, v);
+        }
         c
     }
 
@@ -101,10 +105,11 @@ impl Env {
         hub
     }
 
-    fn start_node(&mut self, home: &str) {
-        self.spawn(home, &["node", "run"]);
+    fn start_node(&mut self, home: &str) -> usize {
+        let idx = self.spawn(home, &["node", "run"]);
         let h = self.home(home);
         wait_until("node IPC up", Duration::from_secs(10), || self.cmd_ok(&h));
+        idx
     }
 
     fn cmd_ok(&self, home: &Path) -> bool {
@@ -731,4 +736,58 @@ fn claude_hooks_pointer_only_and_worker_only_stop() {
     let p_back = String::from_utf8(e.run("n1", &["hooks", "print", "claude", "--agent", "backend"]).stdout).unwrap();
     assert!(p_bot.contains("\"Stop\"") && !p_back.contains("\"Stop\""));
     assert!(serde_json::from_str::<Value>(&p_back).unwrap()["hooks"]["PostToolUse"][0]["matcher"] == "*");
+}
+
+
+/// Loop guard: a thread pauses after its automated-message budget, the pause survives a
+/// node restart, resuming needs a human at a terminal, and per-pair rate limits apply.
+#[test]
+fn loop_guard_pauses_threads_and_limits_pairs() {
+    let mut e = Env::new();
+    e.extra_env = vec![("AGENTLAN_LIMIT_THREAD", "3".into()), ("AGENTLAN_LIMIT_PAIR_HOUR", "6".into())];
+    e.network(&[("n1", "pc-one")]);
+    e.run("n1", &["agent", "add", "a", "--role", "dev"]);
+    e.run("n1", &["agent", "add", "b", "--role", "dev"]);
+    let node = e.start_node("n1");
+
+    let send = |e: &Env, thread: &str| e.cmd("n1", &["send", "--as", "a", "@b@pc-one", "ping", "--thread", thread]).output().unwrap();
+    for _ in 0..3 {
+        assert!(send(&e, "thr_loop").status.success());
+    }
+    let paused = send(&e, "thr_loop");
+    assert!(!paused.status.success());
+    assert!(String::from_utf8_lossy(&paused.stderr).contains("PAUSED"), "{}", String::from_utf8_lossy(&paused.stderr));
+    assert_eq!(e.status("n1")["pausedThreads"][0]["threadId"], "thr_loop");
+
+    // The pause is persisted: still paused after a node restart.
+    e.kill(node);
+    e.start_node("n1");
+    assert!(String::from_utf8_lossy(&send(&e, "thr_loop").stderr).contains("PAUSED"));
+
+    // Resuming refuses without a terminal (an agent can run the CLI too)…
+    let no_tty = e.cmd("n1", &["thread", "resume", "thr_loop"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!no_tty.status.success() && String::from_utf8_lossy(&no_tty.stderr).contains("interactive terminal"));
+    // …and works for a human at a (pseudo-)terminal who confirms.
+    let mut pty = Command::new("python3")
+        .args(["-c", "import pty,sys; sys.exit(pty.spawn(sys.argv[1:]) >> 8)", BIN, "--home"])
+        .arg(e.home("n1"))
+        .args(["thread", "resume", "thr_loop"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        std::thread::sleep(Duration::from_millis(500));
+        pty.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    }
+    let out = pty.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("resumed thr_loop"), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(send(&e, "thr_loop").status.success(), "thread usable again after resume");
+
+    // Per-pair hourly limit: 4 sends so far to b; two more fit, the next is rate-limited.
+    assert!(send(&e, "thr_x").status.success());
+    assert!(send(&e, "thr_y").status.success());
+    let limited = send(&e, "thr_z");
+    assert!(String::from_utf8_lossy(&limited.stderr).contains("RATE_LIMITED"), "{}", String::from_utf8_lossy(&limited.stderr));
 }

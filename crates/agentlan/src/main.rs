@@ -100,6 +100,9 @@ enum Cmd {
         id: Option<String>,
         #[arg(long = "reply-to")]
         reply_to: Option<String>,
+        /// Continue an existing thread (thr_…).
+        #[arg(long)]
+        thread: Option<String>,
         #[arg(long)]
         stdin: bool,
         #[arg(long)]
@@ -152,6 +155,11 @@ enum Cmd {
         #[arg(long, default_value = "auto")]
         agent: String,
     },
+    /// Loop-guard threads.
+    Thread {
+        #[command(subcommand)]
+        cmd: ThreadCmd,
+    },
     /// Hook configuration helpers.
     Hooks {
         #[command(subcommand)]
@@ -194,6 +202,14 @@ enum HubCmd {
         #[arg(long)]
         listen: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ThreadCmd {
+    /// List threads paused by the loop guard.
+    Ls,
+    /// Resume a paused thread. Must be run by a human at an interactive terminal.
+    Resume { thread_id: String },
 }
 
 #[derive(Subcommand)]
@@ -374,7 +390,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         }
         Cmd::Attach { agent, takeover, json } => stream(home, Some(IpcOp::Attach { agent, runner: Some("cli".into()), pid: Some(std::process::id()), takeover }), json).await?,
         Cmd::Watch { as_agent, json } => stream(home, Some(IpcOp::Watch { agent: as_agent }), json).await?,
-        Cmd::Send { as_agent, target, text, subject, intent, id, reply_to, stdin, json } => {
+        Cmd::Send { as_agent, target, text, subject, intent, id, reply_to, thread, stdin, json } => {
             let mut draft = if stdin || text.as_deref() == Some("-") {
                 let mut buf = String::new();
                 std::io::stdin().read_to_string(&mut buf)?;
@@ -392,6 +408,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             draft.intent = intent.or(draft.intent);
             draft.id = id.or(draft.id);
             draft.in_reply_to = reply_to.or(draft.in_reply_to);
+            draft.thread_id = thread.or(draft.thread_id);
             let v = call(home, IpcOp::Send { as_agent: Some(as_agent), draft }).await?;
             print_value(&v, json, |v| {
                 let remote = &v["remote"];
@@ -467,6 +484,32 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             hooks::run(home, &event, &agent).await?;
         }
         Cmd::Hooks { .. } => unreachable!("handled before dispatch"),
+        Cmd::Thread { cmd: ThreadCmd::Ls } => {
+            let v = call(home, IpcOp::Status).await?;
+            let p = v["pausedThreads"].as_array().cloned().unwrap_or_default();
+            if p.is_empty() {
+                println!("(no paused threads)");
+            }
+            for t in p {
+                println!("{}  paused {}  — {}", t["threadId"].as_str().unwrap_or("?"), t["pausedAt"].as_str().unwrap_or("?"), t["reason"].as_str().unwrap_or(""));
+            }
+        }
+        Cmd::Thread { cmd: ThreadCmd::Resume { thread_id } } => {
+            use std::io::{BufRead, IsTerminal, Write};
+            // An agent can run this CLI too; requiring a terminal keeps resuming a human act.
+            if !std::io::stdin().is_terminal() {
+                bail!("`thread resume` must be run by a human at an interactive terminal");
+            }
+            print!("Resume thread {thread_id}? Agents in it may exchange automated messages again. [y/N] ");
+            std::io::stdout().flush()?;
+            let mut ans = String::new();
+            std::io::stdin().lock().read_line(&mut ans)?;
+            if !matches!(ans.trim(), "y" | "Y" | "yes") {
+                bail!("not resumed");
+            }
+            let v = call(home, IpcOp::ResumeThread { thread_id: thread_id.clone() }).await?;
+            println!("{}", if v["resumed"] == true { format!("✓ resumed {thread_id}") } else { format!("{thread_id} was not paused") });
+        }
         Cmd::Wait { as_agent, timeout, json } => {
             let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
             print_value(&v, json, |v| match v["message"].as_object() {
