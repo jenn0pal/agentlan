@@ -2,9 +2,11 @@ name: Release
 
 # Push a tag like v0.1.0 to build binaries for every platform, publish them as a
 # GitHub Release (with SHA-256 checksums), then smoke-test the one-line installers.
+# Run it manually (workflow_dispatch) for a dry run: builds + checksums, no publishing.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -74,15 +76,19 @@ jobs:
           pattern: dist-*
           path: dist
           merge-multiple: true
-      - name: Publish GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+      - name: Assemble and verify SHA256SUMS
         run: |
           cd dist
           # One line per artifact, whatever line endings each .sha256 has.
           for f in *.sha256; do tr -d '\r' < "$f"; echo; done | sed '/^$/d' > SHA256SUMS
           sha256sum -c SHA256SUMS
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
           # vX.Y.Z → normal release (becomes "latest"); vX.Y.Z-suffix → pre-release.
           case "$TAG" in *-*) pre="--prerelease" ;; *) pre="" ;; esac
           notes="Install (macOS/Linux): curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
@@ -97,6 +103,7 @@ jobs:
   smoke:
     name: installer smoke test (${{ matrix.os }})
     needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
