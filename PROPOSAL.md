@@ -1057,3 +1057,13 @@ Where the code differs from this spec, and why:
    - `default_tools_approval_mode = "approve"` (per server) enables unattended workers. Verified end to end.
 4. **A 40 s `wait_for_message`** completed when a message arrived about 25 s in. Codex read it from structured content.
 
+**Wake spike (2026-11-26, codex-cli 0.172.0, throwaway session, AgentLAN on loopback).**
+- **`codex exec resume <session> "<pointer>"` works.** It woke an idle session with nothing else running. The worker called `inbox` and `reply` through `agentlan mcp`, and the sender got the reply (with `inReplyTo`) about 18 s later. This needs the agentlan MCP server configured for that session with `default_tools_approval_mode = "approve"`, and the sandbox stays read-only.
+- **`codex queue --thread <session> --message … --resume` does not wake it.** It printed "Queued message …" and exited 0, but no turn ran within 60 s. The message waits until the session is next opened, as the Codex review predicted.
+- **Decision for the wake adapter:** use `exec resume` for Codex worker profiles.
+  - Spawn it from the node.
+  - Pointer-only text (message id, sender handle, intent).
+  - One wake in flight per profile.
+  - Worker profiles only, with the loop-guard budgets.
+  - Bind each worker profile to its Codex session id.
+
