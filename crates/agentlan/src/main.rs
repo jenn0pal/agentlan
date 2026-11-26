@@ -271,7 +271,8 @@ enum WakeCmd {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
         /// Claude Code only: run your own Claude CLI (sets CLAUDE_CODE_EXECUTABLE). It must take
-        /// Claude's normal arguments (an .exe/.cmd or script that passes them through).
+        /// Claude's normal arguments. On Windows it must be an .exe (scripts can't be started
+        /// without a shell); for a wrapper that only sets variables, use --env instead.
         #[arg(long, value_name = "PATH")]
         claude_cli: Option<PathBuf>,
     },

@@ -103,7 +103,7 @@ pub struct Adapter {
 pub const WORKER_TOOLS: [&str; 9] = ["whoami", "list_agents", "list_machines", "send", "request", "reply", "inbox", "wait_for_message", "ack"];
 
 /// Resolve `--agent auto`: the profile whose runner matches (any, if not given) and whose
-/// project equals the git remote of the working directory.
+/// project matches the git remote of the working directory.
 pub fn resolve_auto(home: &Path, runner: Option<&str>, cwd: &Path) -> Result<String> {
     let profiles = agentlan_node::load_profiles(home)?.agents;
     let Some(project) = setup::git_project(cwd) else {
@@ -880,8 +880,14 @@ impl Adapter {
                 };
                 let sent = call!(IpcOp::Send { as_agent: None, draft });
                 // Answering a message handles it (unless this is only an interim update).
-                let acked = args.get("ack").and_then(|v| v.as_bool()).unwrap_or(true)
-                    && client.call(IpcOp::Ack { agent: None, message_id: mid.to_string() }).await.is_ok();
+                // Not if the reply didn't go out (rejected by the hub): the original is still open.
+                let want_ack = match args.get("ack") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::String(s)) => !s.eq_ignore_ascii_case("false"),
+                    _ => true,
+                };
+                let rejected = sent["remote"]["status"] == "rejected" && sent["local"].as_u64().unwrap_or(0) == 0;
+                let acked = want_ack && !rejected && client.call(IpcOp::Ack { agent: None, message_id: mid.to_string() }).await.is_ok();
                 let unread = self.footer(&client).await;
                 let text = if acked { format!("{}\nMarked {mid} handled.", render::sent(&sent)) } else { render::sent(&sent) };
                 self.result(text, json!({"sent": sent, "acked": acked, "unread": unread}), &unread)

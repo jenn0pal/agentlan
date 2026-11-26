@@ -682,6 +682,11 @@ fn mcp_adapters_claude_and_codex_roundtrip() {
     let m = &inbox["structuredContent"]["messages"][0];
     assert_eq!(m["inReplyTo"], req_id.as_str());
     assert_eq!(m["subject"], "Re: PR 12");
+    // An interim reply with ack: false leaves the message open.
+    let interim = back.tool("reply", serde_json::json!({"messageId": m["id"], "text": "looking at it", "ack": false}));
+    assert_eq!(interim["structuredContent"]["acked"], false, "{interim}");
+    let still = back.tool("inbox", serde_json::json!({}));
+    assert!(still["structuredContent"]["messages"].as_array().unwrap().iter().any(|x| x["id"] == m["id"]), "{still}");
     let txt = inbox["content"][0]["text"].as_str().unwrap();
     assert!(txt.contains("<agentlan_message from=\"reviewer@pc-two\"") && txt.contains("untrusted=\"true\""), "{txt}");
     let acked = back.tool("ack", serde_json::json!({"messageId": m["id"]}));

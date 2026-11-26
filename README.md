@@ -286,10 +286,10 @@ agentlan wake ls                                               # last wake, outc
 
 ```sh
 agentlan wake enable builder --agent claude --env CLAUDE_CONFIG_DIR=C:\Users\me\.claude-stm   # another account/config
-agentlan wake enable builder --agent claude --claude-cli C:\tools\claude-stm.cmd                # your own Claude CLI
+agentlan wake enable builder --agent claude --claude-cli C:\tools\claude.exe                    # your own Claude CLI (a program, not a script)
 ```
 
-These settings are stored with the worker, in this PC's private AgentLAN data folder, so they don't depend on which terminal started the node. `agentlan wake ls` shows the variable names but never their values. The variables AgentLAN uses for the lockdown (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`) can't be overridden.
+On Windows, `--claude-cli` must point at an `.exe`, because the Claude adapter starts it without a shell. For a wrapper script that only sets variables, pass those variables with `--env`. These settings are stored with the worker, in this PC's private AgentLAN data folder, so they don't depend on which terminal started the node. `agentlan wake ls` shows the variable names but never their values. The variables AgentLAN uses for the lockdown (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`) can't be overridden.
 
 - **Who can wake a worker:**
   - **Direct mail** (`@builder@pc`).

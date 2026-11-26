@@ -93,17 +93,23 @@ mod tests {
     }
 }
 
-/// Do two project names refer to the same project? Exact (case-insensitive) match, or the
-/// same repository name: `github.com/acme/shop` matches `shop`, since a checkout without
-/// a git remote (or a runner that can't read it) falls back to the folder name.
+/// Do two project names refer to the same project? Exact (case-insensitive) match, or,
+/// when one side is a bare name (the folder-name fallback of a checkout without a git
+/// remote), the same repository name: `github.com/acme/shop` matches `shop`. Two full
+/// names must match exactly (`github.com/a/api` is not `github.com/b/api`).
 pub fn same_project(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim().trim_end_matches('/').trim_end_matches(".git").to_ascii_lowercase();
+    let norm = |s: &str| s.trim().replace('\\', "/").trim_end_matches('/').trim_end_matches(".git").trim_end_matches('/').to_ascii_lowercase();
     let (a, b) = (norm(a), norm(b));
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let last = |s: &str| s.rsplit(['/', ':', '\\']).next().unwrap_or("").to_string();
-    a == b || last(&a) == last(&b)
+    if a == b {
+        return true;
+    }
+    let bare = |s: &str| !s.contains('/') && !s.contains(':');
+    let last = |s: &str| s.rsplit(['/', ':']).next().unwrap_or("").to_string();
+    let (la, lb) = (last(&a), last(&b));
+    !la.is_empty() && la == lb && (bare(&a) || bare(&b))
 }
 
 /// Does an agent's project match a wanted one (`project:P`, `role:R@P`)?
@@ -122,8 +128,13 @@ mod project_tests {
         assert!(same_project("agentlan", "agentlan.git"));
         assert!(!same_project("github.com/jenn0pal/agentlan", "ailink"));
         assert!(!same_project("", "x"));
-        assert!(project_matches(Some("C:\\Workspace\\ai\\agentlan"), "github.com/x/agentlan"));
+        // Two full names: exact only, even with the same repository name.
+        assert!(!same_project("github.com/acme/api", "github.com/other/api"));
+        assert!(!same_project("github.com/acme/api", "gitlab.com/acme/api"));
+        // Degenerate names never match through an empty last segment.
+        assert!(!same_project("github.com/", "gitlab.com/"));
+        assert!(!same_project("c:", "d:"));
+        assert!(same_project("Agentlan", r"github.com\jenn0pal\agentlan"), "Windows separators");
         assert!(!project_matches(None, "agentlan"));
     }
 }
-

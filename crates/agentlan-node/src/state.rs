@@ -560,7 +560,6 @@ impl NodeState {
         Ok(())
     }
 
-    /// Terminal outcome for a submit: update the cached result and drop the row together.
     /// A request's send result as it stands now (the hub's verdict may have arrived since
     /// the request was committed).
     fn current_sent(&self, r: &SendResult) -> SendResult {
@@ -575,6 +574,7 @@ impl NodeState {
         }
     }
 
+    /// Terminal outcome for a submit: update the cached result and drop the row together.
     fn settle_submit(&mut self, msg_id: &str, remote: RemoteResult) -> Result<()> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let r = (|| -> Result<()> {
