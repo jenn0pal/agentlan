@@ -505,6 +505,11 @@ fn agents_connect_and_register_themselves() {
     assert_eq!(c["structuredContent"]["network"], "e2e");
     assert_eq!(c["structuredContent"]["hub"], "ready", "{c}");
     let r = a.tool("register", serde_json::json!({"role": "backend", "description": "orders API"}));
+    // Registering again for the same role (e.g. after `connect` with a role, as the setup
+    // instructions suggest) returns this session's identity instead of adding backend-2.
+    let again = a.tool("register", serde_json::json!({"role": "backend"}));
+    assert_eq!(again["structuredContent"]["registered"]["handle"], "backend@pc-one", "{again}");
+    assert_eq!(again["structuredContent"]["identities"], serde_json::json!(["backend"]), "{again}");
     let me = &r["structuredContent"]["registered"];
     assert_eq!(me["handle"], "backend@pc-one", "{r}");
     assert_eq!(me["project"], "shop", "project defaults to the folder: {r}");

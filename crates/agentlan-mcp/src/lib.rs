@@ -65,6 +65,8 @@ struct Ident {
     name: String,
     handle: String,
     agent_id: String,
+    role: String,
+    project: Option<String>,
     client: Arc<NodeClient>,
 }
 
@@ -72,7 +74,7 @@ impl Ident {
     fn from_attach(v: &Value, client: Arc<NodeClient>) -> Ident {
         let a = &v["agent"];
         let g = |k: &str| a[k].as_str().unwrap_or_default().to_string();
-        Ident { name: g("name"), handle: g("handle"), agent_id: g("agentId"), client }
+        Ident { name: g("name"), handle: g("handle"), agent_id: g("agentId"), role: g("role"), project: a["project"].as_str().map(String::from), client }
     }
     fn matches(&self, key: &str) -> bool {
         let k = key.trim().trim_start_matches('@');
@@ -164,7 +166,7 @@ pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>)
                     text
                 }
                 Err(e) => {
-                    idents.push(Ident { name: a.clone(), handle: a.clone(), agent_id: String::new(), client });
+                    idents.push(Ident { name: a.clone(), handle: a.clone(), agent_id: String::new(), role: String::new(), project: None, client });
                     format!("AgentLAN: could not attach as '{a}' yet ({e}). Tools will retry automatically once the local `agentlan node` is running.")
                 }
             }
@@ -437,7 +439,17 @@ impl Adapter {
                     Some(i) => Some((i.client.clone(), i.name.clone())),
                     None => return Err(self.error("NOT_REGISTERED", &format!("'{a}' isn't registered in this session; omit `as` to register a new identity"))),
                 },
-                None => reg.name.as_deref().and_then(|n| ids.iter().find(|i| i.matches(n))).map(|i| (i.client.clone(), i.name.clone())),
+                // A name this session registered, or (no name given) this session's identity
+                // with the same role and project: registering again is idempotent, so
+                // `connect` with a role followed by `register` doesn't add a twin.
+                None => match reg.name.as_deref() {
+                    Some(n) => ids.iter().find(|i| i.matches(n)),
+                    None => {
+                        let role = agentlan_proto::ids::normalize_name(&reg.role);
+                        ids.iter().find(|i| i.role == role && i.project == reg.project)
+                    }
+                }
+                .map(|i| (i.client.clone(), i.name.clone())),
             }
         };
         if let Some((client, name)) = existing {
@@ -451,7 +463,11 @@ impl Adapter {
                 host_pid: self.host_pid,
             };
             let v = client.call(op).await.map_err(|e| self.error(&e.code, &e.msg))?;
-            client.set_register_args(RegisterArgs { name: Some(name), ..reg });
+            client.set_register_args(RegisterArgs { name: Some(name.clone()), ..reg });
+            if let Some(i) = self.idents.lock().await.iter_mut().find(|i| i.name == name) {
+                i.role = v["agent"]["role"].as_str().unwrap_or_default().to_string();
+                i.project = v["agent"]["project"].as_str().map(String::from);
+            }
             return Ok(v);
         }
         let client = Arc::new(NodeClient::new(self.home.clone(), Bind::Register(reg), self.rn().key().into(), self.host_pid));

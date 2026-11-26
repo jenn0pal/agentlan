@@ -148,10 +148,11 @@ main() {
   cat <<'EOF'
 
 Next steps:
-  On the PC you pick as the server:   agentlan up
-  On every other PC:                  agentlan connect <code printed by `agentlan up`>
-  Add an agent on a PC:               agentlan agent add backend --role backend --runner claude-code
-  Connect Claude Code to it:          claude mcp add -s local agentlan -- agentlan mcp --agent backend --runner claude-code
+  On the PC you pick as the server:   agentlan up   (prints a join code)
+  Add the MCP tool for your agents:   claude mcp add -s user agentlan -- agentlan mcp
+                                      codex mcp add agentlan -- agentlan mcp
+  Then tell an agent:  "Connect to AgentLAN with code AGENTLAN1-... and register as <role>."
+  (Only the first session on each PC needs the code; each code works for one PC.)
 
 Docs: https://github.com/jenn0pal/agentlan
 EOF
