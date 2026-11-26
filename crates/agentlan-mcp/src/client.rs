@@ -66,8 +66,12 @@ async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io:
     w.write_all(line).await
 }
 
+/// Where new-mail pushes for an identity go (the adapter's live delivery): (name, data).
+pub type PushSink = tokio::sync::mpsc::UnboundedSender<(String, Value)>;
+
 pub struct NodeClient {
     home: PathBuf,
+    sink: Arc<std::sync::Mutex<Option<(String, PushSink)>>>,
     bind: std::sync::Mutex<Bind>,
     runner: String,
     host_pid: Option<u32>,
@@ -93,6 +97,7 @@ impl NodeClient {
     pub fn new(home: PathBuf, bind: Bind, runner: String, host_pid: Option<u32>) -> NodeClient {
         NodeClient {
             home,
+            sink: Arc::new(std::sync::Mutex::new(None)),
             bind: std::sync::Mutex::new(bind),
             runner,
             host_pid,
@@ -120,6 +125,7 @@ impl NodeClient {
         let wlock = Arc::new(Mutex::new(()));
         let reader = {
             let (stream, pending, alive, ended, wlock) = (stream.clone(), pending.clone(), alive.clone(), self.ended.clone(), wlock.clone());
+            let sink = self.sink.clone();
             tokio::spawn(async move {
                 let mut rd = BufReader::new(&*stream);
                 let mut line = String::new();
@@ -148,6 +154,12 @@ impl NodeClient {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        Ok(IpcOut::Push(p)) if p.event == "message" => {
+                            let s = sink.lock().unwrap().clone();
+                            if let Some((name, tx)) = s {
+                                let _ = tx.send((name, p.data));
                             }
                         }
                         Ok(IpcOut::Push(p)) if p.event == "session" => {
@@ -201,6 +213,11 @@ impl NodeClient {
             *self.bind.lock().unwrap() = Bind::Register(a);
         }
         Ok((live, attached))
+    }
+
+    /// Forward this identity's new-mail pushes to the adapter's live delivery.
+    pub fn set_push_sink(&self, name: &str, tx: PushSink) {
+        *self.sink.lock().unwrap() = Some((name.to_string(), tx));
     }
 
     /// Update the args used if this identity has to re-register after a node restart.

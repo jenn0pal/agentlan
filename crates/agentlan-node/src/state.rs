@@ -954,12 +954,14 @@ impl NodeState {
 
     fn notify(&mut self, agent: &str, env: &Amf) -> Result<()> {
         self.maybe_wake(agent, env)?;
-        self.offer_to_waiters(agent, env)?;
+        // `surfaced`: a waiting call (wait_for_message / request) already took it, so the
+        // agent has it in hand and live delivery needn't point at it.
+        let surfaced = self.offer_to_waiters(agent, env)?;
         let handle = self.profiles.iter().find(|p| p.agent_id == agent).map(|p| self.handle_of(p)).unwrap_or_default();
         for (id, c) in &self.conns {
             let wants = c.attached.as_deref() == Some(agent) || matches!(&c.watch, Some(None)) || matches!(&c.watch, Some(Some(a)) if a == agent);
             if wants {
-                self.push(*id, "message", json!({"recipient": agent, "recipientHandle": handle, "message": env}));
+                self.push(*id, "message", json!({"recipient": agent, "recipientHandle": handle, "message": env, "surfaced": surfaced}));
             }
         }
         Ok(())

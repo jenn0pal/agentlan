@@ -294,6 +294,13 @@ enum DevCmd {
         #[arg(long)]
         log: PathBuf,
     },
+    /// Live delivery into a Codex thread (the same path the MCP adapter uses).
+    CodexInject {
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -714,6 +721,10 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             WakeCmd::Now { name } => wakecli::now(home, &name).await?,
         },
         Cmd::Dev { cmd: DevCmd::FakeAcp { log } } => wakecli::fake_acp(&log)?,
+        Cmd::Dev { cmd: DevCmd::CodexInject { thread, text } } => {
+            let how = agentlan_mcp::live::codex_inject(&thread, &text).await?;
+            println!("delivered via {how}");
+        }
         Cmd::Thread { cmd: ThreadCmd::Ls } => {
             let v = call(home, IpcOp::Status).await?;
             let p = v["pausedThreads"].as_array().cloned().unwrap_or_default();

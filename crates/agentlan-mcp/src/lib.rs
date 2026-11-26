@@ -6,6 +6,7 @@
 //! the node, hub and wire carry AMF/1 unchanged.
 
 mod client;
+pub mod live;
 mod render;
 pub mod setup;
 
@@ -17,6 +18,7 @@ use agentlan_proto::ipc::IpcOp;
 use agentlan_proto::join::JoinCode;
 use anyhow::{Result, bail};
 use rmcp::model::{
+    ProtocolVersion,
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData, Implementation, InitializeResult, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, Tool, ToolAnnotations,
 };
@@ -88,7 +90,12 @@ pub struct Adapter {
     /// The process that launched this adapter (the host session), for hooks.
     host_pid: Option<u32>,
     /// From `--runner`, else detected from the MCP client's name on the first call.
-    runner: std::sync::OnceLock<Runner>,
+    runner: Arc<std::sync::OnceLock<Runner>>,
+    /// The Codex thread this session runs in (from tool calls' `_meta.threadId`), for live
+    /// delivery into it.
+    codex_thread: Arc<std::sync::Mutex<Option<String>>>,
+    /// New-mail pushes from every identity's node connection, for live delivery.
+    live_tx: client::PushSink,
     idents: tokio::sync::Mutex<Vec<Ident>>,
     /// Unbound connection for lookups that need no identity (roster, status).
     anon: Arc<NodeClient>,
@@ -156,6 +163,7 @@ pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>,
         },
         other => other.map(String::from),
     };
+    let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut idents = vec![];
     let instructions = match agent {
         Some(a) => {
@@ -164,10 +172,13 @@ pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>,
             match client.connect().await {
                 Ok(att) => {
                     let text = render::instructions(&att, runner.unwrap_or(Runner::Generic));
-                    idents.push(Ident::from_attach(&att, client));
+                    let id = Ident::from_attach(&att, client);
+                    id.client.set_push_sink(&id.name, live_tx.clone());
+                    idents.push(id);
                     text
                 }
                 Err(e) => {
+                    client.set_push_sink(&a, live_tx.clone());
                     idents.push(Ident { name: a.clone(), handle: a.clone(), agent_id: String::new(), role: String::new(), project: None, client });
                     format!("AgentLAN: could not attach as '{a}' yet ({e}). Tools will retry automatically once the local `agentlan node` is running.")
                 }
@@ -175,13 +186,29 @@ pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>,
         }
         None => setup_instructions(note),
     };
-    let cell = std::sync::OnceLock::new();
+    let cell = Arc::new(std::sync::OnceLock::new());
     if let Some(r) = runner {
         let _ = cell.set(r);
     }
+    let codex_thread = Arc::new(std::sync::Mutex::new(None));
     let anon = Arc::new(NodeClient::new(home.clone(), Bind::None, rkey, host_pid));
-    let adapter = Adapter { home, cwd, host_pid, runner: cell, idents: tokio::sync::Mutex::new(idents), anon, instructions, worker };
+    let adapter = Adapter {
+        home,
+        cwd,
+        host_pid,
+        runner: cell.clone(),
+        codex_thread: codex_thread.clone(),
+        live_tx,
+        idents: tokio::sync::Mutex::new(idents),
+        anon,
+        instructions,
+        worker,
+    };
     let service = adapter.serve(rmcp::transport::stdio()).await.map_err(|e| anyhow::anyhow!("mcp init failed: {e}"))?;
+    // Point this session at new mail as it arrives (woken workers are prompted by the node).
+    if !worker {
+        tokio::spawn(live::run(live_rx, service.peer().clone(), cell, codex_thread));
+    }
     service.waiting().await?;
     Ok(())
 }
@@ -480,7 +507,9 @@ impl Adapter {
             let (c, m) = split_err(&e);
             self.error(&c, &m)
         })?;
-        self.idents.lock().await.push(Ident::from_attach(&v, client));
+        let id = Ident::from_attach(&v, client);
+        id.client.set_push_sink(&id.name, self.live_tx.clone());
+        self.idents.lock().await.push(id);
         Ok(v)
     }
 
@@ -943,7 +972,14 @@ impl Adapter {
 
 impl ServerHandler for Adapter {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+        let mut caps = ServerCapabilities::builder().enable_tools().build();
+        // Claude Code channels: lets live delivery reach an idle session (see live.rs).
+        if !self.worker {
+            let mut exp = std::collections::BTreeMap::new();
+            exp.insert("claude/channel".to_string(), Map::new());
+            caps.experimental = Some(exp);
+        }
+        InitializeResult::new(caps)
             .with_server_info(Implementation::new("agentlan", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.instructions.clone())
     }
@@ -956,7 +992,21 @@ impl ServerHandler for Adapter {
         tools().into_iter().find(|t| t.name == name && (!self.worker || WORKER_TOOLS.contains(&name)))
     }
 
+    /// Only revisions with an `initialize` handshake: Claude Code can't carry channel
+    /// messages over the newer handshake-less revision, and falls back to these.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        static VERSIONS: [ProtocolVersion; 4] = [ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2025_03_26, ProtocolVersion::V_2024_11_05];
+        std::borrow::Cow::Borrowed(&VERSIONS)
+    }
+
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+        // Codex sends its thread id with every tool call: remember it for live delivery.
+        if let Some(t) = context.meta.get("threadId").and_then(|v| v.as_str()) {
+            let mut cur = self.codex_thread.lock().unwrap();
+            if cur.as_deref() != Some(t) {
+                *cur = Some(t.to_string());
+            }
+        }
         // Pick the message format from the host (Claude Code, Codex, …) unless --runner set it.
         self.runner.get_or_init(|| {
             let n = context.client_info().map(|i| i.name.to_lowercase()).unwrap_or_default();

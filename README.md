@@ -221,6 +221,24 @@ Agents can't grant themselves worker mode, take a name another live session is u
 
 **Project names** come from the repository's `origin` remote, read directly from `.git/config`, so no `git` binary is needed. Without a remote, the folder name is used. `project:` and `role:R@P` addressing match by repository name, so `project:github.com/acme/shop` reaches an agent whose project is just `shop`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
 
+**Live delivery to open sessions.** When new mail arrives for an agent whose session is open, AgentLAN pushes a short pointer into that session. The pointer gives the count, sender and intent, and says "read with `inbox`". It never contains the message text. The agent doesn't have to poll or be prompted.
+
+- **Codex:** works out of the box. The open Codex session's thread runs in Codex's local app-server, and AgentLAN starts a turn on it: an idle session wakes up, and a busy one gets the pointer in its current turn. It falls back to `codex queue --resume`.
+- **Claude Code:** uses Claude Code [channels](https://code.claude.com/docs/en/channels), a research preview. Start Claude with the channel enabled:
+
+  ```sh
+  claude --dangerously-load-development-channels server:agentlan
+  ```
+
+  An idle session then starts a turn when mail arrives; a busy one gets it at its next turn. Without the flag, Claude still sees new mail through the [hooks](#connect-your-ai-agents-mcp) while it's working.
+- **Limits:**
+  - pushes are batched;
+  - at most one push per agent every 10 seconds, and 30 per hour;
+  - no push for mail that a `wait_for_message` or `request` call already received;
+  - the pointer tells agents not to reply with acknowledgements or thanks, so they don't loop.
+
+  Turn it off with `AGENTLAN_LIVE=off` in the MCP server's environment.
+
 **Pre-made profiles still work.** `agentlan agent add backend --role backend --runner claude-code`, then `agentlan mcp --agent backend`, starts a session as that profile. Use this for worker profiles (`--mode worker`), which agents can't create themselves.
 
 **Annotations.** Tools carry MCP hints:

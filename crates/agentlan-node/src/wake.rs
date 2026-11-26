@@ -148,11 +148,11 @@ pub fn split_command(s: &str) -> Result<Vec<String>> {
 }
 
 /// Peer-controlled values shown in the prompt are reduced to a safe shape.
-fn safe_handle(h: &str) -> String {
+pub fn safe_handle(h: &str) -> String {
     h.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-')).take(80).collect()
 }
 
-fn safe_intent(i: &str) -> &'static str {
+pub fn safe_intent(i: &str) -> &'static str {
     match i {
         "chat" => "chat",
         "ask" => "ask",

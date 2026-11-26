@@ -1183,3 +1183,22 @@ Where the code differs from this spec, and why:
 
   Worker-to-worker loops are bounded by the loop guard (per pair, per thread and per agent), the wake budget (12 per hour per worker) and concurrency (2 per PC).
 
+**Live delivery to open interactive sessions (2026-11-26, user request: "wake up an agent and inject the message even if they are doing something").**
+- **Codex:**
+  - **Shared daemon:** TUI threads run in the shared local app-server daemon, which speaks WebSocket over `~/.codex/app-server-control/app-server-control.sock`.
+  - **Identifying the session:** the MCP adapter learns its thread id from `_meta.threadId` on tool calls.
+  - **Delivery:** `turn/start` starts a turn on an idle thread and steers into a busy one. Verified: an idle throwaway thread answered in 2.6 s.
+  - **Fallback:** `codex queue --resume`.
+- **Claude Code:** channels.
+  - **The adapter declares** `experimental["claude/channel"]` and sends `notifications/claude/channel`.
+  - **Protocol revision:** it advertises only protocol revisions that have an `initialize` handshake. Claude Code can't carry channel messages on 2026-07-28.
+  - **The user opts in** with `--dangerously-load-development-channels server:agentlan` while channels are a research preview.
+  - **Untested alternative:** a SessionStart or Stop hook with `asyncRewake` could wake an idle session without a flag.
+- **Safety:**
+  - pointer only, with sender and intent sanitized;
+  - batched, with at most one push per 10 s and 30 per hour per identity;
+  - no push for mail already handed to a waiting call;
+  - the pointer discourages acknowledgement replies;
+  - the loop guard still applies;
+  - `AGENTLAN_LIVE=off` disables it.
+

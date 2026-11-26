@@ -1245,3 +1245,55 @@ fn worker_wake_over_acp() {
     let b = e.json("n2", &["ls", "--json"])["agents"].as_array().unwrap().iter().find(|a| a["handle"] == "builder@pc-two").cloned().unwrap();
     assert_eq!(b["state"], "offline", "{b}");
 }
+
+/// Wait up to `max` for a JSON-RPC notification with this method; None if it never came.
+fn notification(rx: &mpsc::Receiver<Value>, method: &str, max: Duration) -> Option<Value> {
+    let t = Instant::now();
+    while let Some(left) = max.checked_sub(t.elapsed()) {
+        match rx.recv_timeout(left) {
+            Ok(v) if v["method"] == method => return Some(v),
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    None
+}
+
+/// Live delivery to an open Claude Code session: new mail is pushed as a channel
+/// notification carrying a pointer only (never the message text); mail a waiting call
+/// already took isn't pushed.
+#[test]
+fn live_delivery_pushes_a_channel_pointer() {
+    let mut e = Env::new();
+    let code = {
+        e.run("hub", &["hub", "init", "--name", "e2e", "--listen", &e.addr()]);
+        String::from_utf8(e.run("hub", &["hub", "invite", "--addr", &e.addr()]).stdout).unwrap().trim().to_string()
+    };
+    e.spawn("hub", &["hub", "run"]);
+    wait_port(e.port);
+    let proj = e.root.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut a = Mcp::spawn_plain(&mut e, "n1", "pc-one", &proj);
+    let init = a.init_as("claude-code");
+    assert!(init["capabilities"]["experimental"]["claude/channel"].is_object(), "channel capability declared: {init}");
+    a.tool("connect", serde_json::json!({"code": code, "role": "lead"}));
+    let mut b = Mcp::spawn_plain(&mut e, "n1", "pc-one", &proj);
+    b.init_as("e2e");
+    b.tool("register", serde_json::json!({"role": "peer"}));
+
+    // Taken by a waiting call: no push.
+    let w = a.start("tools/call", serde_json::json!({"name": "wait_for_message", "arguments": {"timeoutS": 15}}));
+    std::thread::sleep(Duration::from_millis(300));
+    b.tool("send", serde_json::json!({"to": "@lead@pc-one", "text": "first, while you wait"}));
+    let got = a.finish(w);
+    assert_eq!(got["structuredContent"]["messages"][0]["parts"][0]["text"], "first, while you wait", "{got}");
+    assert!(notification(&a.rx, "notifications/claude/channel", Duration::from_secs(3)).is_none(), "no push for mail already handed over");
+
+    // New mail while not waiting: one channel notification with a pointer.
+    b.tool("send", serde_json::json!({"to": "@lead@pc-one", "intent": "request", "text": "SECRET BODY: please review"}));
+    let n = notification(&a.rx, "notifications/claude/channel", Duration::from_secs(10)).expect("channel notification");
+    let content = n["params"]["content"].as_str().unwrap();
+    assert!(content.contains("1 new message for lead") && content.contains("peer@pc-one") && content.contains("intent request"), "{content}");
+    assert!(!content.contains("SECRET BODY"), "pointer only: {content}");
+    assert_eq!(n["params"]["meta"]["from"], "peer@pc-one", "{n}");
+}
