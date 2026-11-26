@@ -1,4 +1,4 @@
-# ailink
+# agentlan
 
 Link AI coding agents (Claude Code, Codex, scripts…) across Mac and Windows PCs on your LAN.
 Design: [`PROPOSAL.md`](PROPOSAL.md) · interactive flow: [`process-flow.html`](process-flow.html).
@@ -14,42 +14,42 @@ Design: [`PROPOSAL.md`](PROPOSAL.md) · interactive flow: [`process-flow.html`](
 ## Build
 
 ```sh
-cargo build --release        # → target/release/ailink   (Rust ≥ 1.89)
+cargo build --release        # → target/release/agentlan   (Rust ≥ 1.89)
 cargo test --workspace       # unit tests + end-to-end tests (real processes on 127.0.0.1)
 ```
 
 ## Try it on one LAN
 
-Every PC uses the same `ailink` binary.
+Every PC uses the same `agentlan` binary.
 
 ```sh
 # 1. On the PC you pick as the server
-ailink hub init --name home-lab
-ailink hub run                      # keep running (TCP 47820; on Windows allow it through the firewall)
-ailink hub invite                   # prints AILINK1-…  (one code per PC, valid 15 min)
+agentlan hub init --name home-lab
+agentlan hub run                      # keep running (TCP 47820; on Windows allow it through the firewall)
+agentlan hub invite                   # prints AGENTLAN1-…  (one code per PC, valid 15 min)
 
 # 2. On every PC, including the server PC if agents run there
-ailink join AILINK1-…               # pins the server key, enrols this PC
-ailink agent add backend --role backend --runner claude-code --project github.com/acme/shop-api
-ailink node run                     # keep running
+agentlan join AGENTLAN1-…               # pins the server key, enrols this PC
+agentlan agent add backend --role backend --runner claude-code --project github.com/acme/shop-api
+agentlan node run                     # keep running
 
 # 3. Use it
-ailink ls                           # who is online, roles, projects, same-PC flag
-ailink machines                     # PCs with OS / CPU / RAM
-ailink attach backend               # hold a session and stream events (Ctrl-C detaches)
-ailink send --as backend @reviewer@win-pc "PR 12 is ready" --subject "review please"
-ailink inbox --as reviewer
-ailink ack --as reviewer msg_…
-ailink wait --as reviewer --timeout 30
+agentlan ls                           # who is online, roles, projects, same-PC flag
+agentlan machines                     # PCs with OS / CPU / RAM
+agentlan attach backend               # hold a session and stream events (Ctrl-C detaches)
+agentlan send --as backend @reviewer@win-pc "PR 12 is ready" --subject "review please"
+agentlan inbox --as reviewer
+agentlan ack --as reviewer msg_…
+agentlan wait --as reviewer --timeout 30
 ```
 
 ## Connect an AI agent (MCP)
 
 ```sh
-# Claude Code (per project): Claude sees peer messages wrapped as <ailink_message … untrusted="true">
-claude mcp add -s local ailink -- ailink mcp --agent backend --runner claude-code
+# Claude Code (per project): Claude sees peer messages wrapped as <agentlan_message … untrusted="true">
+claude mcp add -s local agentlan -- agentlan mcp --agent backend --runner claude-code
 # Codex CLI: Codex gets JSON (structuredContent mirrored in the text)
-codex mcp add ailink -- ailink mcp --agent auto --runner codex
+codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
 ```
 
 **Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message` (≤ 45 s), `ack`.
@@ -62,12 +62,12 @@ codex mcp add ailink -- ailink mcp --agent auto --runner codex
 
 ```sh
 echo '{"to":{"kind":"role","role":"qa"},"intent":"status","subject":"CI green"}' \
-  | ailink send --as ci-bot --stdin --json
+  | agentlan send --as ci-bot --stdin --json
 ```
 
 ## Data location
 
-The default location is the per-user app-data directory. Override it with `--home DIR` or `AILINK_HOME`.
+The default location is the per-user app-data directory. Override it with `--home DIR` or `AGENTLAN_HOME`.
 
 | Path | Contents |
 |---|---|
@@ -78,7 +78,7 @@ The default location is the per-user app-data directory. Override it with `--hom
 
 | Variable | Purpose |
 |---|---|
-| `AILINK_LOG=info` | Log verbosity |
-| `AILINK_HEARTBEAT_MS` | Heartbeat interval |
-| `AILINK_LEASE_MS` | How long before a silent PC counts as lost |
-| `AILINK_BACKOFF_MAX_MS` | Maximum reconnect backoff |
+| `AGENTLAN_LOG=info` | Log verbosity |
+| `AGENTLAN_HEARTBEAT_MS` | Heartbeat interval |
+| `AGENTLAN_LEASE_MS` | How long before a silent PC counts as lost |
+| `AGENTLAN_BACKOFF_MAX_MS` | Maximum reconnect backoff |

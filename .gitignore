@@ -3,7 +3,7 @@
 .playwright-mcp/
 .DS_Store
 # local test homes / runtime data
-/.ailink-dev/
+/.agentlan-dev/
 *.db
 *.db-wal
 *.db-shm

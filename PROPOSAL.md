@@ -1,4 +1,4 @@
-# AILink — LAN link for AI agents
+# AgentLAN — LAN link for AI agents
 
 **Proposal v0.4 · 2026-11-26**
 Drafted by Claude Code. Codex CLI (0.172.0) wrote an independent proposal, then critically reviewed v0.1 and the v0.2 additions. §14 records where the two agreed, where they differed and what changed.
@@ -20,10 +20,10 @@ Drafted by Claude Code. Codex CLI (0.172.0) wrote an independent proposal, then 
 
 ## 0. TL;DR
 
-- **One Rust binary, `ailink`**, runs in three roles:
-  - `ailink hub` runs on **any PC you choose** (Mac or Windows), and can move to a different PC later.
-  - `ailink node` is a background daemon on every PC.
-  - `ailink mcp` is the adapter each AI agent launches as an MCP tool server.
+- **One Rust binary, `agentlan`**, runs in three roles:
+  - `agentlan hub` runs on **any PC you choose** (Mac or Windows), and can move to a different PC later.
+  - `agentlan node` is a background daemon on every PC.
+  - `agentlan mcp` is the adapter each AI agent launches as an MCP tool server.
 - **Hub and spoke across machines.** Each node makes one outbound TCP connection to the hub, encrypted and mutually authenticated with Noise. Only the hub opens an inbound port.
 - **Local routing on each machine.** Agents on the same PC talk through their node over local IPC (Unix socket or named pipe). There is no TCP hop and no hub round trip, and it keeps working while the hub is down.
 - **The registry records machines and agents.**
@@ -64,7 +64,7 @@ Drafted by Claude Code. Codex CLI (0.172.0) wrote an independent proposal, then 
 - Cross-machine traffic relays through Anthropic's servers and needs a claude.ai sign-in.
 - It has no shared role and project registry.
 
-AILink is LAN-direct, self-hosted and runner-agnostic, so Claude can talk to Codex.
+AgentLAN is LAN-direct, self-hosted and runner-agnostic, so Claude can talk to Codex.
 
 ---
 
@@ -75,14 +75,14 @@ AILink is LAN-direct, self-hosted and runner-agnostic, so Claude can talk to Cod
 ```
    PC-A (macOS)                         PC-H (any PC: hub + node)                  PC-B (Windows)
  ┌──────────────────────────┐         ┌─────────────────────────────┐          ┌──────────────────────────┐
- │ Claude Code   Codex CLI  │         │ ailink hub                  │          │ Codex CLI     custom bot │
- │  └ailink mcp   └ailink mcp│         │  • registry: machines,      │          │  └ailink mcp   └ailink mcp│
+ │ Claude Code   Codex CLI  │         │ agentlan hub                  │          │ Codex CLI     custom bot │
+ │  └agentlan mcp   └agentlan mcp│         │  • registry: machines,      │          │  └agentlan mcp   └agentlan mcp│
  │       │  IPC     │       │         │    agents, projects (SQLite)│          │       │ IPC (pipe)│      │
  │       ▼  (UDS)   ▼       │ TCP +   │  • presence leases + fences │  TCP +   │       ▼           ▼      │
  │   ┌──────────────────┐   │ Noise   │  • cross-machine routing    │  Noise   │   ┌──────────────────┐   │
- │   │   ailink node    │───┼────────►│  • mailboxes, receipts      │◄─────────┼───│   ailink node    │   │
+ │   │   agentlan node    │───┼────────►│  • mailboxes, receipts      │◄─────────┼───│   agentlan node    │   │
  │   │ local router ◄─┐ │   │outbound │  • journal / audit log      │ outbound │   │ local router     │   │
- │   │ inbox / outbox │ │   │         │  • mDNS _ailink._tcp.local  │          │   │ inbox / outbox   │   │
+ │   │ inbox / outbox │ │   │         │  • mDNS _agentlan._tcp.local  │          │   │ inbox / outbox   │   │
  │   └────────────────┘ │   │         └─────────────────────────────┘          │   └──────────────────┘   │
  │   same-machine msgs ─┘   │                                                  │                          │
  └──────────────────────────┘                                                  └──────────────────────────┘
@@ -90,10 +90,10 @@ AILink is LAN-direct, self-hosted and runner-agnostic, so Claude can talk to Cod
 
 | Component | Runs where | Responsibility |
 |---|---|---|
-| `ailink hub` | **Any one PC you pick**, as a **separate process** from that PC's node, so a hub crash doesn't stop local messaging there | Authoritative registry, presence leases and fencing tokens, cross-machine routing, mailboxes, receipts, rate limits, loop accounting and the journal/audit log |
-| `ailink node` | Every PC, as a per-user background service | Machine key, the single hub connection, machine details, local agent profiles, the **local router**, the durable inbox/outbox, the IPC server and the wake adapters |
-| `ailink mcp` | Launched by each AI agent (stdio) | A thin MCP server that turns tools into IPC calls. It holds no keys and opens no network sockets. |
-| `ailink` CLI/TUI | Anywhere | Setup, `doctor`, human views (`ls`, `machines`, `watch`, `tui`) and manual messages |
+| `agentlan hub` | **Any one PC you pick**, as a **separate process** from that PC's node, so a hub crash doesn't stop local messaging there | Authoritative registry, presence leases and fencing tokens, cross-machine routing, mailboxes, receipts, rate limits, loop accounting and the journal/audit log |
+| `agentlan node` | Every PC, as a per-user background service | Machine key, the single hub connection, machine details, local agent profiles, the **local router**, the durable inbox/outbox, the IPC server and the wake adapters |
+| `agentlan mcp` | Launched by each AI agent (stdio) | A thin MCP server that turns tools into IPC calls. It holds no keys and opens no network sockets. |
+| `agentlan` CLI/TUI | Anywhere | Setup, `doctor`, human views (`ls`, `machines`, `watch`, `tui`) and manual messages |
 
 ### 2.2 Routing paths
 
@@ -128,15 +128,15 @@ Every PC runs the same binary, so any PC can be the hub (§2.4).
 ### 2.4 Running the hub on any PC
 
 **Pick any Mac or Windows PC.**
-- Run `ailink hub init` on the PC you choose. The hub's identity, its key and `hub.db`, lives in that PC's app data.
+- Run `agentlan hub init` on the PC you choose. The hub's identity, its key and `hub.db`, lives in that PC's app data.
 - On Windows, `hub init` asks once for admin rights to add the single inbound firewall rule. On macOS, it checks the Local Network permission.
 - The PC only needs to be on while you want *cross-PC* messaging. Same-PC messaging never needs the hub.
 
 **Moving the hub to another PC.**
-- On the old PC, `ailink hub move` writes a passphrase-encrypted bundle containing the hub key and `hub.db`. Before shutting down, it sends `HubMoving{new_addrs}` to every connected node.
-- On the new PC, `ailink hub import <bundle>` starts the hub.
+- On the old PC, `agentlan hub move` writes a passphrase-encrypted bundle containing the hub key and `hub.db`. Before shutting down, it sends `HubMoving{new_addrs}` to every connected node.
+- On the new PC, `agentlan hub import <bundle>` starts the hub.
 - Nodes keep the same pinned hub key, so they reconnect on their own, using `HubMoving`, mDNS or the join-code addresses. **Nobody re-joins, and every machine and agent ID is unchanged.**
-- **If the old PC died without a move,** import the latest backup. `ailink hub backup` runs nightly and writes the encrypted bundle to a location **you choose on another device**, such as a NAS share, another PC or a USB drive. A backup that only exists on the dead PC is useless. Or start a fresh hub and run `ailink join` on each PC again. Agent IDs are generated on the nodes and machine IDs come from each machine's own key, so all IDs survive even this.
+- **If the old PC died without a move,** import the latest backup. `agentlan hub backup` runs nightly and writes the encrypted bundle to a location **you choose on another device**, such as a NAS share, another PC or a USB drive. A backup that only exists on the dead PC is useless. Or start a fresh hub and run `agentlan join` on each PC again. Agent IDs are generated on the nodes and machine IDs come from each machine's own key, so all IDs survive even this.
 
 **Two hubs up at once.**
 - Nodes only talk to a hub whose key matches their pinned key. Two hubs with *different* keys are simply two separate networks.
@@ -152,8 +152,8 @@ Automatic failover between hubs stays in Phase 3.
 
 | Entity | ID | Created by | Stored |
 |---|---|---|---|
-| **Machine** | `mch_<base32(sha256(first pubkey))[..16]>`, fixed at enrolment | `ailink join`, which generates an X25519 static key pair | Private key in per-user app data (0600 on macOS; user-only ACL on Windows). The hub binds the *current* public key to the stable ID, so key rotation doesn't change the ID. |
-| **Agent** | `agt_<ULID>`, e.g. `agt_01JDX4Q8Z6M3K9T2V7B5N1C0RA` | `ailink agent add`, which works offline | The node's `profiles.toml` and the hub registry (authoritative) |
+| **Machine** | `mch_<base32(sha256(first pubkey))[..16]>`, fixed at enrolment | `agentlan join`, which generates an X25519 static key pair | Private key in per-user app data (0600 on macOS; user-only ACL on Windows). The hub binds the *current* public key to the stable ID, so key rotation doesn't change the ID. |
+| **Agent** | `agt_<ULID>`, e.g. `agt_01JDX4Q8Z6M3K9T2V7B5N1C0RA` | `agentlan agent add`, which works offline | The node's `profiles.toml` and the hub registry (authoritative) |
 | **Session** | `ses_<ULID>` + `fence: u64` | Every attach. The hub issues the fence. | Hub `sessions` table |
 | **Message / thread** | `msg_<ULID>` / `thr_<ULID>` | The sending node | Hub and node stores |
 
@@ -161,7 +161,7 @@ Automatic failover between hubs stays in Phase 3.
 - **Agent IDs survive** restarts, hostname changes, IP changes and runner upgrades.
 - **Deleting an agent retires it.** The ID is never reused, and its history is kept.
 - **Handle:** `name@alias` (e.g. `backend@studio-mbp`), unique network-wide.
-  - The machine alias is chosen at `ailink join` and defaults to the hostname. The hub keeps aliases unique.
+  - The machine alias is chosen at `agentlan join` and defaults to the hostname. The hub keeps aliases unique.
   - Handles therefore don't break when two PCs share a hostname or one is renamed.
 
 ### 3.2 Machine record
@@ -179,7 +179,7 @@ The record has two parts with different owners:
     "os": "macos", "os_version": "15.3", "arch": "aarch64",
     "cpu": "Apple M3 Pro", "cpu_cores": 12, "ram_gb": 36,
     "addrs": [ { "iface": "en0", "ip": "192.168.1.23" } ],
-    "ailink_version": "0.1.0"
+    "agentlan_version": "0.1.0"
   },
   "labels": ["office", "xcode"],                  // admin-set on the hub
   "key_fp": "SHA256:Qm9v…",                       // hub-owned (current key)
@@ -231,7 +231,7 @@ The record has two parts with different owners:
 | Node `node.db` (SQLite, WAL) | Durable inbox per local agent, outbox, same-machine messages, cached snapshot at `seq` | Authority for **which local agents are attached now** and for local mail. Otherwise a cache. |
 
 - **One global sequence.** Every registry change (machine or agent joined, updated, left, lost or retired) is one row in `events` with a single global, monotonically increasing `seq`. Snapshots and deltas use that number (§9.3).
-- **History.** `ailink history agt_…` or `ailink history mch_…` shows first seen, sessions, role and project changes and how each session ended.
+- **History.** `agentlan history agt_…` or `agentlan history mch_…` shows first seen, sessions, role and project changes and how each session ended.
 
 ### 3.5 Sessions, fencing and duplicates
 
@@ -268,12 +268,12 @@ The record has two parts with different owners:
 ## 4. Discovery and connectivity
 
 **How a node finds the hub, in priority order:**
-1. **Hard static override.** `hub = "192.168.1.50:47820"` in `node.toml` is used exclusively. Such a node does **not** follow `HubMoving`. After a hub move, update the address with `ailink node set-hub <addr>` or remove the override.
+1. **Hard static override.** `hub = "192.168.1.50:47820"` in `node.toml` is used exclusively. Such a node does **not** follow `HubMoving`. After a hub move, update the address with `agentlan node set-hub <addr>` or remove the override.
 2. **Join code and last-known addresses.**
-   - `ailink hub invite` prints `AILINK1-…`. The code encodes every candidate hub address and port, the full hub public key, a one-time token and an expiry (15 minutes by default).
+   - `agentlan hub invite` prints `AGENTLAN1-…`. The code encodes every candidate hub address and port, the full hub public key, a one-time token and an expiry (15 minutes by default).
    - The node remembers the addresses that worked. If a candidate fails its connection or handshake, the next one is tried.
 3. **mDNS / DNS-SD.**
-   - The hub advertises `_ailink._tcp.local.` with TXT `v=1` and `net=<network name>`.
+   - The hub advertises `_agentlan._tcp.local.` with TXT `v=1` and `net=<network name>`.
    - An advertisement is only a *candidate*. The Noise handshake proves the hub key, so a copied TXT record cannot impersonate the hub. At worst it wastes a connection attempt, which is then skipped.
    - Agent and machine details never go into mDNS.
 
@@ -281,11 +281,11 @@ The record has two parts with different owners:
 - One policy governs both the TCP bind/advertise addresses and mDNS: primary Wi-Fi or Ethernet only. VPN, Hyper-V, WSL and Docker adapters are excluded, and `interface =` overrides the choice.
 - Bindings are refreshed on address changes, and IPv6 scope IDs are preserved.
 
-**`ailink doctor`** reports discovery, TCP reachability, handshake and auth, and OS permission as separate checks.
+**`agentlan doctor`** reports discovery, TCP reachability, handshake and auth, and OS permission as separate checks.
 
 **Same-machine IPC needs no network permissions.**
 - **macOS:** a Unix socket inside a private 0700 per-user directory.
-- **Windows:** the named pipe `\\.\pipe\ailink-<user-SID>`. It is created with an explicit DACL for the user SID and the `PIPE_REJECT_REMOTE_CLIENTS` flag, so it can't be reached over SMB.
+- **Windows:** the named pipe `\\.\pipe\agentlan-<user-SID>`. It is created with an explicit DACL for the user SID and the `PIPE_REJECT_REMOTE_CLIENTS` flag, so it can't be reached over SMB.
 
 **Platform items to validate in the Phase 0 spike (tested on the *installed* service, not just a dev build):**
 - **macOS 15 and later.** Local Network privacy applies to LaunchAgents and apps. Per Apple TN3179, tools run from Terminal or SSH and LaunchDaemons are exempt. Probe from the installed node. On failure, point to *System Settings → Privacy & Security → Local Network*.
@@ -338,7 +338,7 @@ TCP (hub :47820)
 | Messaging | `Submit{agent_id, fence, envelope, local_recipients[]}` → `Accepted{msg_id, recipients}` / `Rejected{code}` · hub→node: `Deliver{recipient, pair_seq, envelope}` · `Receipt{recipient, fence?, msg_id, state}` |
 | Journal | `Journal{envelope_meta, recipients[]}` → `JournalAck{msg_id}`. It records same-machine traffic as **metadata only**; bodies never leave the PC. It is idempotent by `msg_id`, and the node retains each entry until the hub acknowledges it, within a replay window of 7 days by default. |
 
-### 5.3 The standard message: AMF/1 (AILink Message Format)
+### 5.3 The standard message: AMF/1 (AgentLAN Message Format)
 
 AMF/1 is the **single** message format that every agent, adapter, node and hub uses. It is runner-neutral: no field in it is specific to Claude, Codex or anything else. Its `parts` use the **same shape as A2A 1.0 `Part`** (checked against a2a-protocol.org, 2026-11-26), so a future bridge to A2A agents can convert AMF messages without inventing anything.
 
@@ -356,7 +356,7 @@ AMF/1 is the **single** message format that every agent, adapter, node and hub u
   "parts": [
     { "text": "Please review the token refresh logic. Focus on expiry edge cases.", "mediaType": "text/markdown" },
     { "data": { "repo": "github.com/acme/shop-api", "branch": "feat/auth", "commit": "9f3c2ab" },
-      "mediaType": "application/vnd.ailink.git-ref+json" },
+      "mediaType": "application/vnd.agentlan.git-ref+json" },
     { "text": "@@ -40,7 +40,9 @@ fn refresh(…", "mediaType": "text/x-diff", "filename": "src/auth.rs" }
   ],
   "replyBy": "2026-11-26T12:10:00Z",
@@ -370,17 +370,17 @@ AMF/1 is the **single** message format that every agent, adapter, node and hub u
 - **Routing uses the stable `agent` ID.** `handle`, `role` and `origin` inside `from` are display metadata.
 - **`intent`** has a deliberately small vocabulary: `chat` · `ask` · `request` · `result` · `status` · `handoff` · `error` · `system`. `system` is reserved for broker events such as joined or left. Delivery acknowledgements belong to the transport (`Receipt`), not to a message intent.
   - Custom intents use `x-<name>`. A receiver that doesn't know one treats it as `chat`.
-- **`parts`** follow the A2A rule: each part has **exactly one** of `text` | `raw` (base64) | `url` | `data`, plus optional `mediaType`, `filename` and `metadata`. AILink defines a few well-known media types:
+- **`parts`** follow the A2A rule: each part has **exactly one** of `text` | `raw` (base64) | `url` | `data`, plus optional `mediaType`, `filename` and `metadata`. AgentLAN defines a few well-known media types:
 
   | Media type | Payload |
   |---|---|
   | `text/markdown` | The default for `text` |
   | `text/x-<lang>` | Code |
   | `text/x-diff` | A diff |
-  | `application/vnd.ailink.git-ref+json` | `{repo, branch, commit, pr?}` |
-  | `application/vnd.ailink.file-ref+json` | `{machine, path, lines?}`. Meaningful as-is only on the same machine. |
-  | `application/vnd.ailink.task+json` | `{title, acceptance[], branch?}` |
-  | `application/vnd.ailink.status+json` | `{state: working\|blocked\|done\|failed, progress?, note?}` |
+  | `application/vnd.agentlan.git-ref+json` | `{repo, branch, commit, pr?}` |
+  | `application/vnd.agentlan.file-ref+json` | `{machine, path, lines?}`. Meaningful as-is only on the same machine. |
+  | `application/vnd.agentlan.task+json` | `{title, acceptance[], branch?}` |
+  | `application/vnd.agentlan.status+json` | `{state: working\|blocked\|done\|failed, progress?, note?}` |
 
   Unknown media types are passed through untouched and rendered as `[attachment: <type> <filename> <size>]`.
 - **Trusted fields.** `from` (including `origin`: `agent` | `human` | `system`) is stamped by the first trusted hop: the node for local traffic, the hub for cross-machine traffic. Client-supplied values are ignored.
@@ -403,7 +403,7 @@ AMF/1 is the **single** message format that every agent, adapter, node and hub u
 | `taskId` | `taskId` |
 | `parts` | `parts` (identical shape) |
 | `from.origin` | `role`: `agent` → `ROLE_AGENT`, `human` → `ROLE_USER` |
-| `from`, `to`, `intent`, `subject`, `inReplyTo`, `replyBy` | carried in `metadata` under an `ailink/1` extension |
+| `from`, `to`, `intent`, `subject`, `inReplyTo`, `replyBy` | carried in `metadata` under an `agentlan/1` extension |
 
 ---
 
@@ -468,13 +468,13 @@ The reply target and thread are derived from the *stored* request, not from clie
 
 ```bash
 # Claude Code (local scope = this project only)
-claude mcp add -s local ailink -- ailink mcp --agent backend
+claude mcp add -s local agentlan -- agentlan mcp --agent backend
 # Codex CLI (MCP config is user-wide, so let the adapter pick the profile)
-codex mcp add ailink -- ailink mcp --agent auto --runner codex
+codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
 ```
 
 - `--agent auto` picks the profile whose `runner` matches and whose `project` matches the git remote of the working directory. It therefore only works for profiles with a fixed `--project`. Profiles that auto-detect their project need an explicit `--agent`.
-- If no profile matches, or more than one does, tools return an explicit error ("run `ailink agent add …`" or "ambiguous: pass --agent"). A profile is never created silently.
+- If no profile matches, or more than one does, tools return an explicit error ("run `agentlan agent add …`" or "ambiguous: pass --agent"). A profile is never created silently.
 - **The adapter initialises from local node state** and never blocks on the hub. While the hub is offline, tools still work for local peers and show `hub: offline`.
 - Phase 0 must confirm what working directory each runner gives stdio servers. MCP roots are optional, so the adapter can't rely on them.
 
@@ -500,10 +500,10 @@ codex mcp add ailink -- ailink mcp --agent auto --runner codex
 
 | Tier | Mechanism | Runner | Status and guarantees |
 |---|---|---|---|
-| **0. Pull (MVP, default)** | `inbox` / `wait_for_message`, the unread footer, `ailink watch` for humans | All | Plain MCP, works everywhere |
-| **1. Passive hooks** | **SessionStart:** inject whoami, roster and unread. **UserPromptSubmit:** inject unread. **PostToolUse** `additionalContext`: "📬 N new". Hooks call `ailink hook claude <event>`. | Claude Code | Documented hook features. They only *show* mail while the agent is already working; they never make it do extra work. They inject **pointers** (count, sender handle, intent, message ID), never bodies. |
-| **1+. Stop-hook continuation** | **Stop:** `{"decision":"block","reason":"<pointer>"}` when unread messages exist. The reason is the same locally generated pointer as the wake text (§7.4), never message bodies. | Claude Code | **This makes an agent work because a peer wrote**, so it is treated like tier 2: opt-in, with the §7.5 policy. It only *extends the current turn*. Claude's consecutive-block counter resets on tool calls, so AILink enforces its own continuation budget per session. |
-| **2a. Push** | **Claude Code Channels.** `ailink mcp` declares `claude/channel` and emits `notifications/claude/channel`, which the model sees as `<channel source="ailink" …>`. | Claude Code | **Research preview.** Needs `--dangerously-load-development-channels server:ailink`, an interactive session and claude.ai/Console auth. Channels are not registered when the server negotiates MCP revision 2026-07-28, so pin the legacy negotiation. Channel delivery has no processing acknowledgement, so messages stay pending until the agent calls `ack`. |
+| **0. Pull (MVP, default)** | `inbox` / `wait_for_message`, the unread footer, `agentlan watch` for humans | All | Plain MCP, works everywhere |
+| **1. Passive hooks** | **SessionStart:** inject whoami, roster and unread. **UserPromptSubmit:** inject unread. **PostToolUse** `additionalContext`: "📬 N new". Hooks call `agentlan hook claude <event>`. | Claude Code | Documented hook features. They only *show* mail while the agent is already working; they never make it do extra work. They inject **pointers** (count, sender handle, intent, message ID), never bodies. |
+| **1+. Stop-hook continuation** | **Stop:** `{"decision":"block","reason":"<pointer>"}` when unread messages exist. The reason is the same locally generated pointer as the wake text (§7.4), never message bodies. | Claude Code | **This makes an agent work because a peer wrote**, so it is treated like tier 2: opt-in, with the §7.5 policy. It only *extends the current turn*. Claude's consecutive-block counter resets on tool calls, so AgentLAN enforces its own continuation budget per session. |
+| **2a. Push** | **Claude Code Channels.** `agentlan mcp` declares `claude/channel` and emits `notifications/claude/channel`, which the model sees as `<channel source="agentlan" …>`. | Claude Code | **Research preview.** Needs `--dangerously-load-development-channels server:agentlan`, an interactive session and claude.ai/Console auth. Channels are not registered when the server negotiates MCP revision 2026-07-28, so pin the legacy negotiation. Channel delivery has no processing acknowledgement, so messages stay pending until the agent calls `ack`. |
 | **2b. Wake** | `codex queue --thread <id> --message <text> --resume` | Codex CLI | **Best effort.** Per Codex's review of the 0.172.0 source, it can report success even when the resume fails. The profile must be bound to a verified Codex thread ID. Track queued and processed separately; pull remains the fallback. |
 | **2c. Headless workers** | The node supervises a long-lived worker. Claude uses the Agent SDK streaming input (`SDKUserMessage` queue) or `claude -p --resume`. Codex uses `codex exec resume <id> "<msg>"`. | Both | For unattended service agents, e.g. a reviewer bot |
 
@@ -511,28 +511,28 @@ All work-starting options (1+ and tier 2) are opt-in per profile, rate-limited a
 
 ### 7.4 Translators: runner adapters at the edge
 
-Translation happens **only** in `ailink mcp`, in the CLI and in the node's wake adapters. The hub and the wire carry AMF unchanged.
+Translation happens **only** in `agentlan mcp`, in the CLI and in the node's wake adapters. The hub and the wire carry AMF unchanged.
 
 | Direction | What the adapter does |
 |---|---|
 | **Inbound (AMF → model)** | Every MCP tool result returns **both** forms: `structuredContent: {messages:[AMF…], nextCursor?, trust:"untrusted-peer"}` **and** a `content` text block. A runner that ignores structured content still gets complete text (the plain-text floor). |
 | **Outbound (model → AMF)** | The MCP tool schemas *are* the standard: `send({to, intent, subject?, text \| parts, inReplyTo?, replyBy?})`, with **exactly one** of `text` or `parts`. No free text is parsed. A plain `text` becomes `[{text}]`. The node stamps `id`, `from`, `createdAt` and `amf`, and returns `{id, threadId}`. Adapters only fill defaults, such as a git ref from the working directory when `attachGit: true`. |
-| **Wake text** | The text used by Stop hooks, Channels and `codex queue` is **generated locally and contains no peer-written words**, not even the subject. Example: `New ailink request msg_01JE… from reviewer@win-pc. Call ailink.inbox with messageId=msg_01JE….` The sender handle is stamped by the hub and the intent is an enum, so both are safe to include. The body is only ever read through the tool. The reason: `codex queue` submits *user* input, so a peer-written subject there would read as an instruction from the user. |
+| **Wake text** | The text used by Stop hooks, Channels and `codex queue` is **generated locally and contains no peer-written words**, not even the subject. Example: `New agentlan request msg_01JE… from reviewer@win-pc. Call agentlan.inbox with messageId=msg_01JE….` The sender handle is stamped by the hub and the intent is an enum, so both are safe to include. The body is only ever read through the tool. The reason: `codex queue` submits *user* input, so a peer-written subject there would read as an instruction from the user. |
 | **Viewer context** | A `file-ref` from another machine is rendered as "file on studio-mbp: src/auth.rs:40-120 (not on your machine; ask for the content or use the git ref)". Timestamps are shown in local time, and same-machine peers are flagged. |
 
 **Adapters in v1**
 
 | Adapter | Rendered inbound text |
 |---|---|
-| `claude-code` | Wrapped in `<ailink_message from="…" role="…" intent="…" same_machine="…" untrusted="true">…</ailink_message>`, with Markdown parts inside |
+| `claude-code` | Wrapped in `<agentlan_message from="…" role="…" intent="…" same_machine="…" untrusted="true">…</agentlan_message>`, with Markdown parts inside |
 | `codex` | **JSON, with no wrapper.** The `content` text is the same JSON as `structuredContent`. Codex's own guidance: Codex CLI 0.172.0 forwards `structuredContent` as JSON text when both are present. Beside the AMF objects (never inside them), `structuredContent` also carries `unread` (the summary that text adapters print as a footer) and `views[msgId]`, which holds per-viewer hints such as `sameMachine` and, for each file reference, whether it is on your machine. The `trust` field carries the untrusted status. |
 | `generic` | Markdown: a header block (from, role, intent, subject, thread), then each part, with code and diffs fenced |
 
 **Non-MCP agents and scripts** use the CLI with AMF JSON in and out:
-- `ailink send --json -` (AMF on stdin);
-- `ailink inbox --json`;
-- `ailink watch --json` (JSON lines);
-- `ailink agent attach <profile> --json`, which holds a session open while the script runs.
+- `agentlan send --json -` (AMF on stdin);
+- `agentlan inbox --json`;
+- `agentlan watch --json` (JSON lines);
+- `agentlan agent attach <profile> --json`, which holds a session open while the script runs.
 
 The local IPC protocol (JSON lines) is documented too.
 
@@ -558,7 +558,7 @@ trait RunnerAdapter {
 | **Usage and cost** | Each woken turn is a full model turn and counts toward that runner's usage like a typed prompt; Claude Code's own docs say this for its cross-session messages. Chains multiply: A wakes B, B replies and wakes A, and so on. | Wake only on `request`/`handoff` intents, never on `chat`/`status`. Turn budgets per profile per hour. The loop guard (§8). |
 | **It acts with *that* session's permissions on *that* PC** | A woken agent can run commands and edit files within whatever its permission mode allows. If that session auto-approves everything, a peer's message effectively becomes remote code execution on that PC. | **Never wake a session that auto-approves.** This mirrors Claude Code's own rule, which holds cross-session messages for approval when the receiver bypasses permissions. Woken turns run in a restricted permission mode. |
 | **Prompt injection spreads** | One misled agent can pass injected text to the next, and with wake there is no human in between. | Messages stay untrusted data. An allowlist controls who may wake whom. **Wake depth ≤ 2:** a turn that was itself woken can wake at most one further level. |
-| **It can hijack your session** | If you are using a Claude or Codex window, an injected message redirects it mid-task, or keeps it working on a peer's request after you thought it had finished. Its context fills with other agents' traffic. | By default, never wake a session a human is using. Wake requests for interactive sessions go to an approval prompt (`ailink watch` / desktop notification). |
+| **It can hijack your session** | If you are using a Claude or Codex window, an injected message redirects it mid-task, or keeps it working on a peer's request after you thought it had finished. Its context fills with other agents' traffic. | By default, never wake a session a human is using. Wake requests for interactive sessions go to an approval prompt (`agentlan watch` / desktop notification). |
 | **Edit conflicts** | Two agents in the same working tree or branch can overwrite each other's files and break builds. | One git worktree and branch per agent profile, and the `task` part carries the branch. Advisory path locks in Phase 3. |
 | **Reliability** | Claude Channels is a research preview and `codex queue --resume` is best effort, so wakes can fail silently or change behaviour after a runner upgrade. | Queued and processed states are tracked separately, pull remains the fallback, and Phase 0 tests each adapter. |
 | **Accountability** | It becomes hard to tell why an agent did something. | The journal links every woken turn to the message that caused it. |
@@ -575,9 +575,9 @@ trait RunnerAdapter {
 **Network trust.**
 - **Enrolment.** A one-time invite token runs over the authenticated Noise session. The hub consumes the token and binds the machine key in a single transaction, and retrying with the same key is idempotent. Unknown keys are rejected after that.
 - **Revocation and rotation.**
-  - `ailink hub revoke <machine>` closes live connections and denies new ones.
-  - `ailink node rotate-key` presents the new key over a session authenticated with the old one.
-- **Admin rights** live on the hub as a list of admin machines. Agent moves (`ailink agent move`) and retirement are hub transactions: they fence the old owner and either move its mailbox or expire it.
+  - `agentlan hub revoke <machine>` closes live connections and denies new ones.
+  - `agentlan node rotate-key` presents the new key over a session authenticated with the old one.
+- **Admin rights** live on the hub as a list of admin machines. Agent moves (`agentlan agent move`) and retirement are hub transactions: they fence the old owner and either move its mailbox or expire it.
 - **Replay.** Noise nonces protect within a session, and `msg_id` dedup protects across reconnects.
 
 **Local trust.**
@@ -586,7 +586,7 @@ trait RunnerAdapter {
 
 **Agent safety.** This matters more than crypto here.
 1. **Messages are untrusted data, never instructions.** Every adapter marks peer content as untrusted, with trusted metadata kept outside the body:
-   - the Claude Code adapter wraps it as `<ailink_message from="…" untrusted="true">…</ailink_message>`;
+   - the Claude Code adapter wraps it as `<agentlan_message from="…" untrusted="true">…</agentlan_message>`;
    - the Codex adapter sets `trust: "untrusted-peer"` beside the AMF objects in `structuredContent`;
    - the generic adapter prints an explicit untrusted header.
 
@@ -610,7 +610,7 @@ trait RunnerAdapter {
      - **Counting rules:** each logical send counts once per thread, and each committed pair once, using stable `msg_id`s across retries. A mixed send's `Submit` and `Journal` therefore never double-count.
      - **After an island period,** journals reconcile local usage on reconnect. A thread that went over budget offline is paused then.
      - **Pause state is persisted on the nodes** and restored *before* any queued sends are flushed.
-   - Resuming needs `ailink thread resume` with **interactive TTY confirmation** on a machine marked admin. CLI sends do *not* reset budgets, because an agent can run the CLI too.
+   - Resuming needs `agentlan thread resume` with **interactive TTY confirmation** on a machine marked admin. CLI sends do *not* reset budgets, because an agent can run the CLI too.
    - Agents run as the same OS user, so this is a cost and safety brake, not a hard security boundary.
 5. **Audit.** The hub journal always records metadata. For messages routed through the hub, bodies are recorded only with `audit.bodies = true`. Bodies of same-machine messages never leave the PC; the node keeps its own local log. Everything expires with the message TTL.
 
@@ -622,14 +622,14 @@ trait RunnerAdapter {
 
 ```
 SETUP (once)
-  [hub PC]  ailink hub init ──► ailink hub invite ──► JOIN CODE (addrs + hub key + one-time token)
-  [each PC] ailink join <code> ──► Noise handshake ──► hub pins machine key ──► MachineInfo recorded
-            ailink agent add <name> --role R [--project P] ──► agt_<ULID> recorded
-            ailink service install ──► node daemon runs at login
+  [hub PC]  agentlan hub init ──► agentlan hub invite ──► JOIN CODE (addrs + hub key + one-time token)
+  [each PC] agentlan join <code> ──► Noise handshake ──► hub pins machine key ──► MachineInfo recorded
+            agentlan agent add <name> --role R [--project P] ──► agt_<ULID> recorded
+            agentlan service install ──► node daemon runs at login
 
 RUNTIME
   ① node starts ──► connect hub ──► Resync ──► Snapshot(seq) of machines + agents ──► ordered Event stream
-  ② agent starts (Claude/Codex) ──► spawns `ailink mcp` ──► IPC Attach ──► node
+  ② agent starts (Claude/Codex) ──► spawns `agentlan mcp` ──► IPC Attach ──► node
         ├─► same-machine agents notified at once (no LAN)
         └─► hub: AgentUp ──► AgentUpAck(fence) ──► Event{agent joined} ──► every other PC
             newcomer gets roster: own project first, same-machine peers flagged, machine details attached
@@ -645,13 +645,13 @@ RUNTIME
 ```mermaid
 sequenceDiagram
     actor Admin
-    participant H as Hub PC (ailink hub)
-    participant N as New PC (ailink node)
-    Admin->>H: ailink hub init --name home-lab
+    participant H as Hub PC (agentlan hub)
+    participant N as New PC (agentlan node)
+    Admin->>H: agentlan hub init --name home-lab
     H->>H: hub static key, hub.db, listen :47820, advertise mDNS
-    Admin->>H: ailink hub invite
+    Admin->>H: agentlan hub invite
     H-->>Admin: join code (addrs, hub public key, one-time token, expiry)
-    Admin->>N: ailink join <code>
+    Admin->>N: agentlan join <code>
     N->>N: generate machine key pair
     N->>H: Noise XX msg1
     H-->>N: msg2 (hub static key)
@@ -661,17 +661,17 @@ sequenceDiagram
     H->>H: one txn: consume token + pin machine key
     H-->>N: Welcome + Enrolled{machine_id}
     N->>H: MachineInfo{host, os, arch, cpu, ram, addrs, labels}
-    Admin->>N: ailink agent add backend --role backend --runner claude-code
+    Admin->>N: agentlan agent add backend --role backend --runner claude-code
     N->>N: agt_<ULID> → profiles.toml (project auto-detected later from cwd)
-    Admin->>N: ailink service install (LaunchAgent / logon task)
+    Admin->>N: agentlan service install (LaunchAgent / logon task)
 ```
 
 ### 9.2 Node start-up and reconnect
 
 ```mermaid
 sequenceDiagram
-    participant N as ailink node
-    participant H as ailink hub
+    participant N as agentlan node
+    participant H as agentlan hub
     N->>N: load key, profiles, node.db; open IPC endpoint (local agents can talk now)
     N->>H: connect (static override │ last-known │ join-code addrs │ mDNS candidates)
     N->>H: Noise XX (verify hub key after msg2) + Hello
@@ -695,7 +695,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant A as Claude Code (new)
-    participant M as ailink mcp
+    participant M as agentlan mcp
     participant N1 as node PC-A
     participant L as other agent on PC-A
     participant H as hub
@@ -841,17 +841,17 @@ Recorded end reasons are distinct: `left` | `detached` | `lease_expired` | `take
 ### 10.1 Workspace
 
 ```
-ailink/
+agentlan/
 ├─ Cargo.toml                  # [workspace]
 ├─ crates/
-│  ├─ ailink-proto/            # IDs, MachineRecord, AgentRecord, Envelope, frames, errors (no I/O)
-│  ├─ ailink-policy/           # target resolution, rate limits, loop guard — shared by hub AND node router
-│  ├─ ailink-net/              # Noise handshake, chunked framing, bounded queues, mDNS, interface policy
-│  ├─ ailink-store/            # SQLite schemas/migrations, single-writer thread, queries
-│  ├─ ailink-hub/              # registry + events/seq, leases/fences, cross-machine routing, journal
-│  ├─ ailink-node/             # hub link, resync, local router, IPC server, machine info, wake adapters
-│  ├─ ailink-mcp/              # rmcp stdio server → IPC; optional claude/channel push
-│  └─ ailink/                  # single binary: clap CLI, TUI, service install, doctor, hooks
+│  ├─ agentlan-proto/            # IDs, MachineRecord, AgentRecord, Envelope, frames, errors (no I/O)
+│  ├─ agentlan-policy/           # target resolution, rate limits, loop guard — shared by hub AND node router
+│  ├─ agentlan-net/              # Noise handshake, chunked framing, bounded queues, mDNS, interface policy
+│  ├─ agentlan-store/            # SQLite schemas/migrations, single-writer thread, queries
+│  ├─ agentlan-hub/              # registry + events/seq, leases/fences, cross-machine routing, journal
+│  ├─ agentlan-node/             # hub link, resync, local router, IPC server, machine info, wake adapters
+│  ├─ agentlan-mcp/              # rmcp stdio server → IPC; optional claude/channel push
+│  └─ agentlan/                  # single binary: clap CLI, TUI, service install, doctor, hooks
 └─ tests/                      # in-process multi-node tests: hub + N nodes, partitions, reconnects
 ```
 
@@ -878,23 +878,23 @@ Phase 0 should check whether `interprocess` exposes the custom pipe DACL and `PI
 
 | | macOS | Windows |
 |---|---|---|
-| Node service | `~/Library/LaunchAgents/dev.ailink.node.plist` (per user) | Task Scheduler "at logon" task |
+| Node service | `~/Library/LaunchAgents/dev.agentlan.node.plist` (per user) | Task Scheduler "at logon" task |
 | Hub service | LaunchAgent, or a LaunchDaemon for a headless box | Windows Service or logon task |
-| IPC | Unix socket in a private 0700 dir | `\\.\pipe\ailink-<SID>`, SID DACL, reject remote clients |
+| IPC | Unix socket in a private 0700 dir | `\\.\pipe\agentlan-<SID>`, SID DACL, reject remote clients |
 | Keys / config | Per-user app data, 0600 | `%APPDATA%`, user-only ACL |
 | Packaging | Signed and notarised | Signed `.exe`, later MSI or winget |
 
 ### 10.4 CLI sketch
 
 ```bash
-ailink hub init --name home-lab && ailink service install --hub && ailink hub invite
-ailink join AILINK1-… && ailink service install
-ailink agent add backend  --role backend  --runner claude-code
-ailink agent add reviewer --role reviewer --runner codex --project github.com/acme/shop-api
-ailink machines                      # PCs with OS / CPU / RAM / labels / state
-ailink ls --project shop-api         # agents, roles, readiness, same-machine flag
-ailink send @reviewer@win-pc "PR 12 is ready"
-ailink watch | ailink tui | ailink doctor | ailink history agt_…
+agentlan hub init --name home-lab && agentlan service install --hub && agentlan hub invite
+agentlan join AGENTLAN1-… && agentlan service install
+agentlan agent add backend  --role backend  --runner claude-code
+agentlan agent add reviewer --role reviewer --runner codex --project github.com/acme/shop-api
+agentlan machines                      # PCs with OS / CPU / RAM / labels / state
+agentlan ls --project shop-api         # agents, roles, readiness, same-machine flag
+agentlan send @reviewer@win-pc "PR 12 is ready"
+agentlan watch | agentlan tui | agentlan doctor | agentlan history agt_…
 ```
 
 ---
@@ -904,7 +904,7 @@ ailink watch | ailink tui | ailink doctor | ailink history agt_…
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0. Spikes** | Exercised on the **installed** services:<br>• Noise over TCP between Mac and Windows<br>• Windows firewall (hub rule, no node rule, UDP 5353)<br>• macOS Local Network for a LaunchAgent and a signed binary<br>• `mdns-sd` on the real Wi-Fi<br>• named-pipe DACL and remote-reject<br>• the working directory runners give stdio servers<br>• the Codex tool timeout<br>• one Claude hook and a Channels prototype<br>• `codex queue --resume` on loaded and unloaded threads | A written go/no-go per item; the design is updated |
-| **1. Core MVP** | • Hub and node, join codes, static address<br>• machine and agent registry with `seq` snapshots and deltas<br>• fencing, resync, leases<br>• **same-machine router**<br>• cross-machine direct messages with an atomic commit, receipts and outbox<br>• **minimal `ailink mcp`**: `whoami`, `list_agents`, `list_machines`, `send`, `inbox`, `wait_for_message`, `ack`<br>• CLI | A Mac and a Windows agent exchange messages. Same-machine messages work with the hub down. **A plain shell script using only the CLI (AMF JSON) can attach, be announced, send and receive.** Clean recovery from restart, sleep and duplicate retries. |
+| **1. Core MVP** | • Hub and node, join codes, static address<br>• machine and agent registry with `seq` snapshots and deltas<br>• fencing, resync, leases<br>• **same-machine router**<br>• cross-machine direct messages with an atomic commit, receipts and outbox<br>• **minimal `agentlan mcp`**: `whoami`, `list_agents`, `list_machines`, `send`, `inbox`, `wait_for_message`, `ack`<br>• CLI | A Mac and a Windows agent exchange messages. Same-machine messages work with the hub down. **A plain shell script using only the CLI (AMF JSON) can attach, be announced, send and receive.** Clean recovery from restart, sleep and duplicate retries. |
 | **2. Agent loop** | • Role and project fan-out, `pick: one`<br>• request/reply<br>• rate limits and the causal loop guard<br>• mDNS<br>• Claude hooks (tier 1)<br>• Codex wake (tier 2b, opt-in)<br>• TUI | A Claude agent and a Codex agent on different PCs finish a review round trip with no human relay. Load test with 20 simulated nodes. |
 | **3. Hardening** | • Claude Channels (when stable)<br>• headless worker supervisor<br>• installers and signing<br>• standby hub<br>• sticky notices<br>• blob transfer<br>• web dashboard | Driven by real usage |
 
@@ -928,11 +928,11 @@ ailink watch | ailink tui | ailink doctor | ailink history agt_…
 
 | # | Topic | Decision (2026-11-26) |
 |---|---|---|
-| 1 | Hub placement | **Any PC you choose**, Mac or Windows. It can be moved later with `ailink hub move` / `import` without re-joining (§2.4). |
+| 1 | Hub placement | **Any PC you choose**, Mac or Windows. It can be moved later with `agentlan hub move` / `import` without re-joining (§2.4). |
 | 2 | Runners | **Agent-agnostic.** One standard message format, AMF/1, with an A2A-compatible part shape. Thin translators sit only at the edge: Claude Code, Codex and a generic CLI/JSON adapter (§5.3, §7.4). |
 | 3 | Auto-wake | **Decided:** off by default. Only dedicated **worker** profiles can be woken; they get their own worktree, restricted permissions and a turn budget. Interactive sessions get an **approval prompt** instead. The impact analysis is in §7.5. |
 | 4 | Machine details | **Shared by default** (recommendation adopted). OS and version, arch, CPU model and cores, RAM, LAN IPs and labels are broadcast because it is your own trusted LAN and they help agents choose peers. Turn it off per PC with `share_hardware = false` in `node.toml`. OS usernames, MAC addresses and serial numbers are never sent. |
-| 5 | Name | **`ailink` for now.** Candidates that were free on **crates.io** as of 2026-11-26: `agenthub`, `roundtable`, `crewlink`, `squadlink`, `agentwire`, `switchboard`, `talkback`, `agentyard`. Taken there: lanyard, crosstalk, intercom, huddle, parley, agentmesh, patchbay. GitHub, domains and trademarks were not checked. |
+| 5 | Name | **`agentlan`** (renamed from the working name "ailink" on 2026-11-26). Checks: free on crates.io and npm; `agentlan.dev` and `agentlan.io` unregistered; no trademark or product conflicts found in web search; direct USPTO search still to do. Rejected: **ailink** (crowded brand: AI-LINK, AI-Link, the AILinkX agent-messaging project); **squadlink** (USPTO 99442562 SQUADLINK, class 042 SaaS, Notice of Allowance 2026-09-08; `.com`/`.dev`/`.org` taken); **squadwire** (one letter from Squadware Inc. software marks); **patchcord**, **crosswire**, **agentyard**, **roundtable** (existing agent-messaging packages). |
 
 ---
 
@@ -960,15 +960,15 @@ ailink watch | ailink tui | ailink doctor | ailink history agt_…
 | Reconnect could hit `AGENT_BUSY` against its own lease | `Resync` with in-lease continuation; outbox flushed only after `ResyncAck`; distinct end reasons (§9.2, §9.8) |
 | No complete commit contract for `Accepted` | Message + frozen recipients + dedup committed atomically on every route; single writer; WAL with `synchronous=FULL` (§6) |
 | Receipt loss could break FIFO or hide mail | Deliver to the node even when detached; `pair_seq`; dedup by `(recipient, msg_id)`; `surfaced` ≠ hidden; terminal states (§6) |
-| Noise rationale conflated transport with key granularity | Verify the hub key after msg2; IK later; key rotation and revocation defined. **Noise is kept** for no-PKI operation and a smaller dependency surface. Per-machine mTLS is an equally valid swap inside `ailink-net`. |
+| Noise rationale conflated transport with key granularity | Verify the hub key after msg2; IK later; key rotation and revocation defined. **Noise is kept** for no-PKI operation and a smaller dependency surface. Per-machine mTLS is an equally valid swap inside `agentlan-net`. |
 | Framing underspecified (65,519-byte plaintext; 1 MiB body > 1 MiB frame) | Separate handshake and transport limits; the cap applies to serialized frames; 256 KiB body; bounded queues; paged snapshots; codec negotiation deferred (§5.1) |
 | Late replies were both rejected and promised | Three timers (`waitS`, `deliver_by`, retention); single-recipient requests; `PENDING`; target derived from the stored request (§6, §9.7) |
-| Loop guard bypassable (new chats; `ailink send` counted as human) | Causal `parent_id`, budgets per thread, pair and agent, TTY-confirmed admin resume (§8) |
+| Loop guard bypassable (new chats; `agentlan send` counted as human) | Causal `parent_id`, budgets per thread, pair and agent, TTY-confirmed admin resume (§8) |
 | IPC and admin authorization gaps | SID DACL and `PIPE_REJECT_REMOTE_CLIENTS`, private socket dir, hub-held admin list, move and retire transactions (§4, §8) |
 | Discovery could reach the wrong endpoint | Hard override vs last-known, all candidates tried, one interface policy for TCP and mDNS, IPv6 scope (§4) |
 | Platform checks must test the installed service | Phase 0 runs on installed services. macOS LaunchAgents need consent; Terminal/SSH tools and LaunchDaemons are exempt (TN3179). |
-| The pull MVP depended on MCP, which was planned for Phase 2 | A minimal `ailink mcp` moved to Phase 1. It initialises from local state, and waits stay ≤ 45 s, under Codex's tool timeout (60 s per Codex's review; validate in Phase 0). |
-| Hooks and Channels have different guarantees | AILink-owned Stop-hook budget per session; Channels pinned to legacy MCP negotiation; ack-until-handled (§7.3) |
+| The pull MVP depended on MCP, which was planned for Phase 2 | A minimal `agentlan mcp` moved to Phase 1. It initialises from local state, and waits stay ≤ 45 s, under Codex's tool timeout (60 s per Codex's review; validate in Phase 0). |
+| Hooks and Channels have different guarantees | AgentLAN-owned Stop-hook budget per session; Channels pinned to legacy MCP negotiation; ack-until-handled (§7.3) |
 | `codex queue --resume` is best effort | Bound to a verified thread; queued and processed tracked separately; pull fallback (§7.3) |
 
 **Round 3: Codex's review of the v0.2 additions (same-machine routing, machine registry), and what changed**
@@ -1007,7 +1007,7 @@ Where the code differs from this spec, and why:
 | JSON field naming was mixed in the examples | One rule everywhere: struct fields are **camelCase**, enum tags are **snake_case** (`{"t":"agent_up","sessionId":…}`) | One policy for AMF, frames and IPC |
 | `Resnapshot{from_seq}` frame | On a `seq` gap the node reconnects, and the resync sends a fresh snapshot | Simpler, and uses the same code path as a reconnect |
 | Events vs. snapshot during resync | The node ignores events until the resync `Snapshot` arrives, because the snapshot already includes them | Found in the smoke test: the server emits resync events before the snapshot |
-| Admin machines, `ailink thread resume`, loop-guard budgets | Not yet. There is a fan-out cap of 10. | Phase 2 |
+| Admin machines, `agentlan thread resume`, loop-guard budgets | Not yet. There is a fan-out cap of 10. | Phase 2 |
 | Windows named-pipe DACL | Not set yet. The pipe name comes from the home path. | Phase 0 item: `interprocess` exposes `security_descriptor` |
 
 **Milestone 1 hardening (Codex code review, 12 findings, all addressed):**

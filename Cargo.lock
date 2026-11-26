@@ -38,24 +38,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "aho-corasick"
-version = "1.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "ailink"
+name = "agentlan"
 version = "0.1.0"
 dependencies = [
- "ailink-hub",
- "ailink-mcp",
- "ailink-net",
- "ailink-node",
- "ailink-proto",
- "ailink-store",
+ "agentlan-hub",
+ "agentlan-mcp",
+ "agentlan-net",
+ "agentlan-node",
+ "agentlan-proto",
+ "agentlan-store",
  "anyhow",
  "clap",
  "directories",
@@ -67,12 +58,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ailink-hub"
+name = "agentlan-hub"
 version = "0.1.0"
 dependencies = [
- "ailink-net",
- "ailink-proto",
- "ailink-store",
+ "agentlan-net",
+ "agentlan-proto",
+ "agentlan-store",
  "anyhow",
  "chrono",
  "data-encoding",
@@ -85,11 +76,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ailink-mcp"
+name = "agentlan-mcp"
 version = "0.1.0"
 dependencies = [
- "ailink-node",
- "ailink-proto",
+ "agentlan-node",
+ "agentlan-proto",
  "anyhow",
  "interprocess",
  "rmcp",
@@ -99,10 +90,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ailink-net"
+name = "agentlan-net"
 version = "0.1.0"
 dependencies = [
- "ailink-proto",
+ "agentlan-proto",
  "anyhow",
  "bytes",
  "data-encoding",
@@ -115,12 +106,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ailink-node"
+name = "agentlan-node"
 version = "0.1.0"
 dependencies = [
- "ailink-net",
- "ailink-proto",
- "ailink-store",
+ "agentlan-net",
+ "agentlan-proto",
+ "agentlan-store",
  "anyhow",
  "chrono",
  "data-encoding",
@@ -135,7 +126,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ailink-proto"
+name = "agentlan-proto"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -147,11 +138,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "ailink-store"
+name = "agentlan-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+]
+
+[[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
