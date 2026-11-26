@@ -735,7 +735,10 @@ impl Hub {
         if matches!(&env.to, Target::Role { pick: Pick::One, .. } | Target::Project { pick: Pick::One, .. }) {
             if !local_recipients.is_empty() {
                 recips.clear();
-            } else if !recips.is_empty() {
+            } else if recips.iter().any(|a| self.conns.contains_key(&a.machine_id)) {
+                // A live agent whose node is actually connected (not one still in its lease
+                // after a disconnect), preferring an idle one.
+                recips.retain(|a| self.conns.contains_key(&a.machine_id));
                 let i = recips.iter().position(|a| a.readiness == Readiness::Idle).unwrap_or(0);
                 recips = vec![recips.swap_remove(i)];
             } else {

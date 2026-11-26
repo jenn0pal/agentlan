@@ -211,6 +211,41 @@ echo '{"to":{"kind":"role","role":"qa"},"intent":"status","subject":"CI green"}'
 agentlan wait --as ci-bot --json
 ```
 
+## Wake idle workers (ACP)
+
+A **worker** is an agent profile you create for unattended work. With wake enabled, this PC's node starts the worker when mail arrives for it and nothing is running. It hands the worker a short prompt ("you have N unread messages from X"); the worker reads and answers through the AgentLAN tools, and the node shuts it down again. Wake uses Zed's [Agent Client Protocol](https://agentclientprotocol.com) adapters, and it resumes the worker's previous session so context carries over.
+
+```sh
+npm install -g @agentclientprotocol/codex-acp@2.12.1          # for Codex workers
+npm install -g @agentclientprotocol/claude-agent-acp@0.112.0  # for Claude Code workers
+
+agentlan agent add builder --role builder --mode worker --project shop
+agentlan wake enable builder --agent codex --cwd ~/code/shop   # or --agent claude
+agentlan wake ls                                               # last wake, outcome, duration
+```
+
+- **Who can wake a worker:**
+  - **Direct mail** (`@builder@pc`).
+  - **A request to its role** (`request role:builder …`) when no agent with that role is online. The server routes it to a wake-enabled worker.
+  - **Never a broadcast** (`send role:builder` to everyone with the role).
+- **What a woken worker can do.** `--access messages` (the default) means only the AgentLAN tools:
+  - **Codex** runs read-only, with no shell, apps, browser or web search, and with your own MCP servers turned off. Your Codex login and config files are left untouched.
+  - **Claude Code** gets no built-in tools, none of your settings or MCP servers, and every other action requires permission, which the node refuses.
+  - `--access work` lets it edit files and run commands in `--cwd`, unattended. Turn that on deliberately.
+- **Limits:**
+  - one wake per worker at a time, and at most 2 at once per PC;
+  - 12 wakes per worker per hour;
+  - `--timeout` per wake (default 600 s);
+  - no wakes for a thread the loop guard paused.
+
+  Override the limits with `AGENTLAN_WAKE_PER_HOUR` and `AGENTLAN_WAKE_CONCURRENT`.
+- **A woken worker's AgentLAN server** offers only the messaging tools. It has no `setup`, `connect`, `register` or `leave`, and the node approves those exact tool names, nothing else.
+- **The adapter is pinned** to its real path when you enable wake, and it runs without a shell.
+- **When a wake ends,** its whole process tree is killed, and the same happens on timeout or `agentlan node stop`.
+- **Only user-made worker profiles** can be woken. Agents that registered themselves can't enable wake.
+- **The prompt is a pointer.** It names the sender and the count but carries no message text; the worker reads its mail through the tools.
+- **Tested** with real Codex (codex-acp 2.12.1) and Claude Code (claude-agent-acp 0.112.0) workers, each woken by a request and replying in 6–20 s.
+
 ## Over Tailscale
 
 AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with no ports opened to the internet.
@@ -254,8 +289,7 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 
 ## Roadmap
 
-**Phase 2 (in progress).** Done: request/reply, Claude hooks, fan-out tests, the loop guard (node-side), agents connecting and registering themselves (sessions and subagents). Remaining:
-- Opt-in wake for worker agents.
+**Phase 2 (in progress).** Done: request/reply, Claude hooks, fan-out tests, the loop guard (node-side), agents connecting and registering themselves (sessions and subagents), and opt-in wake for worker agents over ACP. Remaining:
 - Network-wide thread totals on the server.
 
 **Phase 3**

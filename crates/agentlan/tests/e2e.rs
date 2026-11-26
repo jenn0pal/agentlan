@@ -1198,6 +1198,20 @@ fn worker_wake_over_acp() {
         e.json("n2", &["wake", "ls", "--json"])["workers"][0]["config"]["last"]["outcome"].as_str().is_some_and(|o| o.starts_with("skipped: reached 4"))
     });
     assert_eq!(log_lines().matches("prompt ").count(), 4);
+    // A woken worker's MCP server offers only the messaging tools (no setup, connect,
+    // register or leave), and refuses the others even if called by name.
+    let cmd = e.cmd("n2", &["mcp", "--agent", "builder", "--worker"]);
+    let mut w = Mcp::spawn_cmd(&mut e, cmd);
+    w.init();
+    let tl = w.request("tools/list", serde_json::json!({}));
+    let mut names: Vec<String> = tl["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    names.sort();
+    assert_eq!(names, ["ack", "inbox", "list_agents", "list_machines", "reply", "request", "send", "wait_for_message", "whoami"], "{names:?}");
+    w.tool_err("setup", serde_json::json!({"notes": "x"}), "NOT_AVAILABLE");
+    drop(w);
+    wait_until("worker mcp detached", T, || {
+        e.json("n2", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "builder@pc-two" && a["state"] == "offline")
+    });
     // The worker never stays online after a wake.
     let b = e.json("n2", &["ls", "--json"])["agents"].as_array().unwrap().iter().find(|a| a["handle"] == "builder@pc-two").cloned().unwrap();
     assert_eq!(b["state"], "offline", "{b}");

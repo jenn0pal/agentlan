@@ -189,6 +189,8 @@ pub struct NodeState {
     wake_due: HashMap<String, Instant>,
     wake_inflight: HashMap<String, (Instant, tokio::task::AbortHandle)>,
     wake_again: HashSet<String>,
+    /// When each worker's last wake finished (its MCP session may close a moment later).
+    wake_finished: HashMap<String, Instant>,
     cmd_tx: mpsc::UnboundedSender<NCmd>,
     rt: tokio::runtime::Handle,
 }
@@ -278,6 +280,7 @@ impl NodeState {
             wake_due: HashMap::new(),
             wake_inflight: HashMap::new(),
             wake_again: HashSet::new(),
+            wake_finished: HashMap::new(),
             cmd_tx,
             rt,
         })
@@ -805,6 +808,9 @@ impl NodeState {
         let Some(s) = self.sessions.remove(agent_id) else {
             return;
         };
+        if let Err(e) = self.wake_followup(agent_id) {
+            warn!("wake: follow-up check failed: {e:#}");
+        }
         if let Some(c) = self.conns.get_mut(&s.conn) {
             c.attached = None;
         }
@@ -1389,27 +1395,31 @@ impl NodeState {
         if self.wake_enabled(agent).is_none() {
             return Ok(());
         }
-        if self.wake_inflight.contains_key(agent) {
+        // Never wake (now or as a follow-up) for a thread the loop guard paused.
+        let paused: Option<String> = self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![format!("thread:{}", env.thread_id)], |r| r.get(0)).optional()?;
+        if paused.is_some() {
+            return Ok(());
+        }
+        // A wake is running, or just finished and its session hasn't closed yet: this mail
+        // gets a follow-up wake once that session ends (unless it handles it first).
+        let recent = self.wake_finished.get(agent).is_some_and(|t| t.elapsed() < Duration::from_secs(15));
+        if self.wake_inflight.contains_key(agent) || (recent && self.sessions.contains_key(agent)) {
             self.wake_again.insert(agent.to_string());
             return Ok(());
         }
         if self.sessions.contains_key(agent) {
             return Ok(()); // a live session will handle it
         }
-        // Never wake for a thread the loop guard paused.
-        let paused: Option<String> = self.db.query_row("SELECT reason FROM paused WHERE key=?1", params![format!("thread:{}", env.thread_id)], |r| r.get(0)).optional()?;
-        if paused.is_some() {
-            return Ok(());
-        }
         let due = Instant::now() + WakeLimits::from_env().debounce;
         self.wake_due.entry(agent.to_string()).or_insert(due);
         Ok(())
     }
 
-    fn record_wake(&self, agent: &str, outcome: &str, seconds: f64, session: Option<Option<String>>) {
+    fn record_wake(&self, agent: &str, rev: Option<u64>, outcome: &str, seconds: f64, session: Option<Option<String>>) {
         let rec = crate::wake::WakeRecord { at: now().to_rfc3339(), outcome: outcome.to_string(), seconds };
         let r = crate::update_wake(&self.home, |wf| {
-            if let Some(c) = wf.workers.get_mut(agent) {
+            // Only into the configuration this wake ran with (not one re-enabled meanwhile).
+            if let Some(c) = wf.workers.get_mut(agent).filter(|c| rev.is_none_or(|r| c.rev == r)) {
                 c.last = Some(rec);
                 if let Some(sid) = session {
                     c.session_id = sid;
@@ -1448,7 +1458,7 @@ impl NodeState {
             let key = format!("wake:{agent}");
             if self.budget_used(&key, hour)? >= limits.per_hour {
                 warn!("wake: {} skipped: {} wakes this hour (AGENTLAN_WAKE_PER_HOUR)", self.handle_of(&p), limits.per_hour);
-                self.record_wake(&agent, &format!("skipped: reached {} wakes this hour", limits.per_hour), 0.0, None);
+                self.record_wake(&agent, None, &format!("skipped: reached {} wakes this hour", limits.per_hour), 0.0, None);
                 continue;
             }
             self.db.execute("INSERT INTO budget(key, window, count) VALUES(?1,?2,1) ON CONFLICT(key, window) DO UPDATE SET count=count+1", params![key, hour])?;
@@ -1487,10 +1497,20 @@ impl NodeState {
 
     fn wake_done(&mut self, agent: &str, result: crate::wake::WakeResult) -> Result<()> {
         self.wake_inflight.remove(agent);
-        self.record_wake(agent, &result.outcome, result.seconds, Some(result.session_id.clone()));
-        // Mail that arrived while it ran gets another wake (budget permitting); mail it
-        // left unread from before doesn't (no wake loops on a message it won't handle).
-        if self.wake_again.remove(agent) && self.unread_count(agent)? > 0 {
+        self.wake_finished.insert(agent.to_string(), Instant::now());
+        self.record_wake(agent, Some(result.rev), &result.outcome, result.seconds, Some(result.session_id.clone()));
+        // The wake's MCP session closes on its own schedule: if it's still open, the
+        // follow-up waits for end_session.
+        if !self.sessions.contains_key(agent) {
+            self.wake_followup(agent)?;
+        }
+        Ok(())
+    }
+
+    /// Mail that arrived while a wake ran gets another wake (budget permitting); mail it
+    /// left unread from before doesn't (no wake loops on a message it won't handle).
+    fn wake_followup(&mut self, agent: &str) -> Result<()> {
+        if !self.wake_inflight.contains_key(agent) && self.wake_again.remove(agent) && self.unread_count(agent)? > 0 {
             self.wake_due.insert(agent.to_string(), Instant::now() + WakeLimits::from_env().debounce);
         }
         Ok(())
@@ -1627,7 +1647,12 @@ impl NodeState {
                 Target::Project { project, .. } => p.project.as_deref() == Some(project.as_str()),
                 _ => false,
             };
-            let live_remote = self.base_agents.values().any(|a| a.machine_id != self.cfg.machine_id && a.state == PresenceState::Online && matches(&a.profile));
+            let live_remote = self.base_agents.values().any(|a| {
+                a.machine_id != self.cfg.machine_id
+                    && a.state == PresenceState::Online
+                    && matches(&a.profile)
+                    && self.pair_paused(&sender.agent_id, &a.profile.agent_id).ok().flatten().is_none()
+            });
             if !live_remote {
                 let mut cands: Vec<AgentProfile> =
                     self.profiles.iter().filter(|p| p.agent_id != sender.agent_id && matches(p) && self.wake_enabled(&p.agent_id).is_some()).cloned().collect();

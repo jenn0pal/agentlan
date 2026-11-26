@@ -172,9 +172,11 @@ pub fn enable_wake(home: &Path, name: &str, cfg: wake::WakeConfig) -> Result<Age
     let id = prof.agent_id.clone();
     update_wake(home, |wf| {
         let mut c = cfg;
-        // Keep the session to resume if only settings changed.
+        // A new revision: a wake still running for the old settings won't record into it.
+        // Keep the session to resume if only limits changed.
         if let Some(old) = wf.workers.get(&id) {
-            if old.command == c.command && old.cwd == c.cwd {
+            c.rev = old.rev + 1;
+            if old.argv == c.argv && old.cwd == c.cwd && old.preset == c.preset {
                 c.session_id = old.session_id.clone();
             }
         }

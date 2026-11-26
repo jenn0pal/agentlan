@@ -172,6 +172,9 @@ enum Cmd {
         /// claude-code | codex | generic — message format (default: detected from the MCP client).
         #[arg(long)]
         runner: Option<String>,
+        /// Messaging tools only, for the --agent identity (used for woken workers).
+        #[arg(long)]
+        worker: bool,
     },
     /// Run a runner hook (reads the hook JSON on stdin). Example: `hook claude post-tool-use --agent backend`.
     Hook {
@@ -682,8 +685,8 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             call(home, IpcOp::Ack { agent: Some(as_agent), message_id: message_id.clone() }).await?;
             println!("✓ acked {message_id}");
         }
-        Cmd::Mcp { agent, runner } => {
-            agentlan_mcp::serve(home.to_path_buf(), agent, runner.as_deref().map(agentlan_mcp::Runner::parse)).await?;
+        Cmd::Mcp { agent, runner, worker } => {
+            agentlan_mcp::serve(home.to_path_buf(), agent, runner.as_deref().map(agentlan_mcp::Runner::parse), worker).await?;
         }
         Cmd::Hook { runner, event, agent } => {
             if runner != "claude" && runner != "claude-code" {

@@ -26,17 +26,21 @@ pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd
         "custom" => (Preset::Custom, "", ""),
         a => bail!("unknown agent '{a}' (codex | claude | custom)"),
     };
-    // The adapter is resolved now and pinned as an absolute path: nothing is downloaded
-    // or looked up at wake time.
-    let command = match command {
-        Some(c) => c,
+    // The adapter is resolved now and pinned as a canonical absolute path: nothing is
+    // downloaded or looked up (no PATH, no shell) at wake time.
+    let mut argv = match command {
+        Some(c) => agentlan_node::wake::split_command(&c)?,
         None if preset == Preset::Custom => bail!("--agent custom needs --command '<ACP agent command>'"),
         None => {
             let p = which(default_bin).ok_or_else(|| anyhow!("`{default_bin}` (the ACP adapter) isn't on PATH. Install it with:\n  {install}\nor pass --command '<path to an ACP agent>'"))?;
-            let s = p.to_string_lossy().to_string();
-            if s.contains(' ') { format!("\"{s}\"") } else { s }
+            vec![p.to_string_lossy().to_string()]
         }
     };
+    let prog = PathBuf::from(&argv[0]);
+    let resolved = if prog.components().count() > 1 { Some(prog.clone()) } else { which(&argv[0]) };
+    let resolved = resolved.and_then(|p| std::fs::canonicalize(p).ok()).ok_or_else(|| anyhow!("can't find the program `{}`", argv[0]))?;
+    argv[0] = resolved.to_string_lossy().to_string();
+    let command = argv.join(" ");
     let access = match access {
         "messages" => Access::Messages,
         "work" => Access::Work,
@@ -46,7 +50,7 @@ pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd
         Some(c) => std::fs::canonicalize(&c).map_err(|e| anyhow!("--cwd {}: {e}", c.display()))?,
         None => std::env::current_dir()?,
     };
-    let cfg = WakeConfig { name: name.to_string(), preset, command: command.clone(), cwd: cwd.clone(), access, timeout_s, session_id: None, last: None };
+    let cfg = WakeConfig { name: name.to_string(), preset, argv, cwd: cwd.clone(), access, timeout_s, rev: 1, session_id: None, last: None };
     agentlan_node::enable_wake(home, name, cfg)?;
     println!("✓ wake enabled for '{name}': {command}");
     println!("  working directory {}", cwd.display());
@@ -92,7 +96,8 @@ pub async fn ls(home: &Path, json_out: bool) -> Result<()> {
             if w["running"] == true { " · WAKING NOW" } else { "" },
             if w["online"] == true { " · online" } else { "" },
         );
-        println!("    {}  (in {})", c["command"].as_str().unwrap_or(""), c["cwd"].as_str().unwrap_or(""));
+        let argv: Vec<&str> = c["argv"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        println!("    {}  (in {})", argv.join(" "), c["cwd"].as_str().unwrap_or(""));
         if let Some(l) = c.get("last").filter(|l| !l.is_null()) {
             println!("    last wake {}: {} ({}s)", l["at"].as_str().unwrap_or("?"), l["outcome"].as_str().unwrap_or("?"), l["seconds"]);
         }

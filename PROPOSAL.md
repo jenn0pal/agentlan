@@ -1092,3 +1092,32 @@ Where the code differs from this spec, and why:
   - `setup` wrote `CLAUDE.md` in the project directory.
   - **Quirk:** hooks fire for subagent tool calls too, so the subagent saw the session's unread pointer.
 
+**Worker wake over ACP (2026-11-26, user approved; Zed's Agent Client Protocol, not IBM's).**
+- **Why ACP:**
+  - It drives agent sessions the same way for Codex (`codex-acp`) and Claude Code (`claude-agent-acp`), with `session/resume` and no history replay.
+  - It reused the user's existing logins.
+  - It accepts client-provided MCP servers.
+  - IBM's ACP is agent-to-agent messaging, and it has merged into A2A.
+- **Spike findings that shaped the design:**
+  - **Defaults are unsafe.** By default both adapters load all of the user's MCP servers. Both also ran shell commands and wrote files with no permission request reaching the client (Codex runs in "agent" mode, Claude in "auto").
+  - **Lockdown that works for messages-only:**
+    - Codex: `CODEX_CONFIG` with `sandbox_mode = read-only`; shell, apps, browser, web search and subagents off; the user's MCP servers disabled by name.
+    - Claude: `_meta.claudeCode.options` with `settingSources: []`, `strictMcpConfig` and `tools: []`, plus `session/set_mode` to "default".
+  - **Don't use a separate `CODEX_HOME`.** It would duplicate the rotating refresh token.
+  - **`code_mode_host = false` breaks all Codex tool calls,** including MCP ones.
+  - **Reject with the agent's `reject_once` option.** Answering "cancelled" ends the turn.
+  - **Codex's MCP approvals don't name the tool** (`_meta.is_mcp_tool_approval`). The node matches them to the title in the preceding `session/update`. In a messages-only Codex wake, AgentLAN is the only MCP server.
+- **Role-addressed mail used to reach live agents only.** Single-recipient requests now fall back to a wake-enabled worker (node for the same PC, hub across PCs). Broadcasts never wake.
+- **Codex review of the wake branch: 10 findings, all fixed.**
+  1. A worker's MCP server could call `setup`. It now runs in `--worker` mode, with messaging tools only.
+  2. MCP approvals were granted on Codex's generic flag. They now require exact tool names on a dedicated server, `agentlan_worker`, and Codex config layers are parsed as real TOML.
+  3. A custom intent was copied into the prompt. Sender and intent are now sanitized.
+  4. The adapter command was interpreted by a shell. It's now a canonical argv, run directly.
+  5. Processes could outlive a wake. The tree is killed by stored PID, including from Drop when a wake task is aborted.
+  6. The timeout didn't cover startup or pipe writes. One overall deadline now covers all I/O.
+  7. A finished wake and its closing session raced. Follow-ups now fire after the wake's session ends.
+  8. Paused threads now never trigger a follow-up.
+  9. The fallback now treats paused peers as unavailable, and the hub only picks agents whose node is connected.
+  10. Each config change bumps a revision, so a stale wake can't overwrite it.
+- **Real wakes after the fixes:** Codex in 23.5 s and Claude in 10.4 s, both through the node and both with only exact AgentLAN tools approved.
+
