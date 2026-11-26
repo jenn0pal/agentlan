@@ -14,10 +14,19 @@ use tokio::sync::{Mutex, oneshot};
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, IpcError>>>>>;
 
+#[derive(Clone)]
 struct Live {
     stream: Arc<Stream>,
     pending: Pending,
     alive: Arc<AtomicBool>,
+    /// Serialises line writes so concurrent calls can't interleave bytes.
+    wlock: Arc<Mutex<()>>,
+}
+
+async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io::Result<()> {
+    let _g = wlock.lock().await;
+    let mut w = stream;
+    w.write_all(line).await
 }
 
 pub struct NodeClient {
@@ -52,8 +61,9 @@ impl NodeClient {
         let stream = Arc::new(Stream::connect(name).await.map_err(|e| anyhow!("NODE_DOWN: the agentlan node is not running ({e})"))?);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let wlock = Arc::new(Mutex::new(()));
         {
-            let (stream, pending, alive, ended) = (stream.clone(), pending.clone(), alive.clone(), self.ended.clone());
+            let (stream, pending, alive, ended, wlock) = (stream.clone(), pending.clone(), alive.clone(), self.ended.clone(), wlock.clone());
             tokio::spawn(async move {
                 let mut rd = BufReader::new(&*stream);
                 let mut line = String::new();
@@ -71,7 +81,17 @@ impl NodeClient {
                                 } else {
                                     Err(r.error.unwrap_or(IpcError { code: "ERROR".into(), msg: "unknown".into() }))
                                 };
-                                let _ = tx.send(res);
+                                // The caller gave up (e.g. the MCP request was cancelled) but a
+                                // message was already handed over: put it back as unseen.
+                                if let Err(Ok(v)) = tx.send(res) {
+                                    if let Some(mid) = v["message"]["id"].as_str() {
+                                        let op = IpcRequest { id: 0, op: IpcOp::Unsurface { agent: None, message_id: mid.to_string() } };
+                                        if let Ok(mut line) = serde_json::to_vec(&op) {
+                                            line.push(b'\n');
+                                            let _ = write_line(&stream, &wlock, &line).await;
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(IpcOut::Push(p)) if p.event == "session" => {
@@ -89,7 +109,7 @@ impl NodeClient {
                 }
             });
         }
-        let live = Live { stream, pending, alive };
+        let live = Live { stream, pending, alive, wlock };
         let attached = self
             .raw(&live, IpcOp::Attach { agent: self.agent.clone(), runner: Some(self.runner.clone()), pid: Some(std::process::id()), takeover: false })
             .await
@@ -103,8 +123,7 @@ impl NodeClient {
         live.pending.lock().await.insert(id, tx);
         let mut line = serde_json::to_vec(&IpcRequest { id, op }).map_err(|e| IpcError { code: "INTERNAL".into(), msg: e.to_string() })?;
         line.push(b'\n');
-        let mut w = &*live.stream;
-        if let Err(e) = w.write_all(&line).await {
+        if let Err(e) = write_line(&live.stream, &live.wlock, &line).await {
             live.pending.lock().await.remove(&id);
             return Err(IpcError { code: "NODE_DOWN".into(), msg: e.to_string() });
         }
@@ -123,18 +142,21 @@ impl NodeClient {
         if let Some(why) = self.ended.lock().await.clone() {
             return Err(CallError { code: "SESSION_ENDED".into(), msg: why });
         }
-        let mut guard = self.live.lock().await;
-        if guard.as_ref().is_none_or(|l| !l.alive.load(Ordering::SeqCst)) {
-            match self.open().await {
-                Ok((l, _)) => *guard = Some(l),
-                Err(e) => {
-                    let s = e.to_string();
-                    let (code, msg) = s.split_once(": ").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or(("NODE_DOWN".into(), s));
-                    return Err(CallError { code, msg });
+        // Hold the lock only to (re)connect; long waits must not block other calls.
+        let live = {
+            let mut guard = self.live.lock().await;
+            if guard.as_ref().is_none_or(|l| !l.alive.load(Ordering::SeqCst)) {
+                match self.open().await {
+                    Ok((l, _)) => *guard = Some(l),
+                    Err(e) => {
+                        let s = e.to_string();
+                        let (code, msg) = s.split_once(": ").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or(("NODE_DOWN".into(), s));
+                        return Err(CallError { code, msg });
+                    }
                 }
             }
-        }
-        let live = guard.as_ref().unwrap();
-        self.raw(live, op).await.map_err(|e| CallError { code: e.code, msg: e.msg })
+            guard.as_ref().unwrap().clone()
+        };
+        self.raw(&live, op).await.map_err(|e| CallError { code: e.code, msg: e.msg })
     }
 }

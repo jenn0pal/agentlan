@@ -48,6 +48,7 @@ dependencies = [
  "agentlan-proto",
  "agentlan-store",
  "anyhow",
+ "chrono",
  "clap",
  "directories",
  "interprocess",
@@ -82,10 +83,12 @@ dependencies = [
  "agentlan-node",
  "agentlan-proto",
  "anyhow",
+ "chrono",
  "interprocess",
  "rmcp",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

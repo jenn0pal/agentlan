@@ -87,6 +87,8 @@ struct Waiter {
     req: u64,
     agent: String,
     deadline: Instant,
+    /// Only a reply to this message satisfies the waiter (request/reply).
+    in_reply_to: Option<String>,
 }
 
 struct PendingSend {
@@ -728,7 +730,13 @@ impl NodeState {
 
     /// New mail for a local agent: satisfy one waiter, then push to watchers.
     fn notify(&mut self, agent: &str, env: &Amf) -> Result<()> {
-        if let Some(i) = self.waiters.iter().position(|w| w.agent == agent) {
+        let reply_to = env.in_reply_to.as_deref();
+        let pick = self
+            .waiters
+            .iter()
+            .position(|w| w.agent == agent && w.in_reply_to.is_some() && w.in_reply_to.as_deref() == reply_to)
+            .or_else(|| self.waiters.iter().position(|w| w.agent == agent && w.in_reply_to.is_none()));
+        if let Some(i) = pick {
             let w = self.waiters.remove(i);
             self.mark(agent, &env.id, DeliveryState::Surfaced)?;
             self.reply(w.conn, ok(w.req, json!({"message": env, "unread": self.unread_count(agent)?})));
@@ -860,24 +868,56 @@ impl NodeState {
                 self.pump()?;
                 Ok(Some(json!({"acked": message_id})))
             }
-            IpcOp::Wait { agent, timeout_ms } => {
+            IpcOp::Wait { agent, timeout_ms, in_reply_to } => {
                 let p = self.agent_for(conn, agent.as_deref())?;
-                let next: Option<(String, String)> = self
-                    .db
-                    .query_row(
-                        "SELECT i.msg_id, m.envelope FROM inbox i JOIN messages m USING(msg_id) WHERE i.agent_id=?1 AND i.state='stored' ORDER BY i.rowid LIMIT 1",
-                        params![p.agent_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
+                // A reply-waiter takes the reply even if it was already seen; a plain wait
+                // takes only unseen mail and never a reply someone is waiting for.
+                let next: Option<(String, String)> = match &in_reply_to {
+                    Some(rt) => self
+                        .db
+                        .query_row(
+                            "SELECT i.msg_id, m.envelope FROM inbox i JOIN messages m USING(msg_id)
+                             WHERE i.agent_id=?1 AND i.state!='acked' AND json_extract(m.envelope,'$.inReplyTo')=?2 ORDER BY i.rowid LIMIT 1",
+                            params![p.agent_id, rt],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?,
+                    None => {
+                        let pending: Vec<String> = self.waiters.iter().filter_map(|w| w.in_reply_to.clone()).collect();
+                        let mut st = self.db.prepare(
+                            "SELECT i.msg_id, m.envelope, json_extract(m.envelope,'$.inReplyTo') FROM inbox i JOIN messages m USING(msg_id)
+                             WHERE i.agent_id=?1 AND i.state='stored' ORDER BY i.rowid",
+                        )?;
+                        let rows: Vec<(String, String, Option<String>)> =
+                            st.query_map(params![p.agent_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+                        drop(st);
+                        rows.into_iter().find(|(_, _, rt)| rt.as_ref().is_none_or(|x| !pending.contains(x))).map(|(m, e, _)| (m, e))
+                    }
+                };
                 if let Some((mid, env)) = next {
                     self.mark(&p.agent_id, &mid, DeliveryState::Surfaced)?;
                     self.pump()?;
                     return Ok(Some(json!({"message": serde_json::from_str::<Value>(&env)?, "unread": self.unread_count(&p.agent_id)?})));
                 }
                 let t = timeout_ms.min(300_000);
-                self.waiters.push(Waiter { conn, req: req.id, agent: p.agent_id, deadline: Instant::now() + Duration::from_millis(t) });
+                self.waiters.push(Waiter { conn, req: req.id, agent: p.agent_id, deadline: Instant::now() + Duration::from_millis(t), in_reply_to });
                 Ok(None)
+            }
+            IpcOp::CancelWait => {
+                let (gone, keep): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.conn == conn);
+                self.waiters = keep;
+                for w in &gone {
+                    self.reply(w.conn, fail(w.req, "CANCELLED", "wait cancelled"));
+                }
+                Ok(Some(json!({"cancelled": gone.len()})))
+            }
+            IpcOp::Unsurface { agent, message_id } => {
+                let p = self.agent_for(conn, agent.as_deref())?;
+                let n = self.db.execute(
+                    "UPDATE inbox SET state='stored' WHERE agent_id=?1 AND msg_id=?2 AND state='surfaced'",
+                    params![p.agent_id, message_id],
+                )?;
+                Ok(Some(json!({"unsurfaced": n})))
             }
             IpcOp::Watch { agent } => {
                 let filter = match agent {

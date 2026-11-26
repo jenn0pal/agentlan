@@ -409,6 +409,19 @@ impl Mcp {
         r
     }
 
+    /// Fire a request without waiting for its response; returns the JSON-RPC id.
+    fn start(&mut self, method: &str, params: Value) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.write(serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        id
+    }
+
+    fn finish(&mut self, id: u64) -> Value {
+        let r = expect(&self.rx, &format!("response {id}"), Duration::from_secs(30), |v| v["id"] == id);
+        r["result"].clone()
+    }
+
     fn tool(&mut self, name: &str, args: Value) -> Value {
         let r = self.request("tools/call", serde_json::json!({"name": name, "arguments": args}));
         assert_ne!(r["isError"], true, "{name} returned an error: {r}");
@@ -563,4 +576,84 @@ fn fanout_role_project_machine_and_pick_one() {
     assert_eq!(q, vec!["pick-local", "proj", "role-qa"]);
     assert_eq!(inbox_subjects(&e, "n1", "backend"), vec!["pick-remote"], "sender excluded from its own broadcasts");
     assert!(inbox_subjects(&e, "n1", "devops").is_empty(), "other project excluded");
+}
+
+
+/// Request/reply over the CLI: a reply-waiter returns only the reply to its own request,
+/// and unrelated mail that arrives meanwhile is left unseen for normal waits.
+#[test]
+fn request_reply_ignores_unrelated_mail() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend"]);
+    e.run("n2", &["agent", "add", "reviewer", "--role", "reviewer"]);
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+
+    // A role target needs an online agent; nobody is attached yet, so it is refused.
+    let none = e.cmd("n1", &["request", "--as", "backend", "role:reviewer", "anyone?", "--wait", "1"]).output().unwrap();
+    assert!(!none.status.success() && String::from_utf8_lossy(&none.stderr).contains("NOT_DELIVERED"));
+
+    // Direct mail reaches the reviewer even while it is offline.
+    let req = e.cmd("n1", &["request", "--as", "backend", "@reviewer@pc-two", "is SKEW=30s right?", "--wait", "20", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let q = e.json("n2", &["wait", "--as", "reviewer", "--timeout", "10", "--json"]);
+    let qid = q["message"]["id"].as_str().expect("reviewer received the request").to_string();
+    assert_eq!(q["message"]["intent"], "request");
+    assert!(q["message"]["replyBy"].is_string());
+
+    // Unrelated mail first, then the actual reply.
+    e.run("n2", &["send", "--as", "reviewer", "@backend@pc-one", "unrelated note", "--subject", "noise"]);
+    std::thread::sleep(Duration::from_millis(300));
+    e.run("n2", &["send", "--as", "reviewer", "@backend@pc-one", "yes, 30s covers clock drift", "--reply-to", &qid]);
+
+    let out = req.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["status"], "replied", "{r}");
+    assert_eq!(r["reply"]["inReplyTo"], qid.as_str());
+    assert_eq!(r["reply"]["parts"][0]["text"], "yes, 30s covers clock drift");
+
+    // The unrelated message was not consumed by the request.
+    let w = e.json("n1", &["wait", "--as", "backend", "--timeout", "3", "--json"]);
+    assert_eq!(w["message"]["subject"], "noise", "{w}");
+}
+
+/// MCP `request` round trip, and a cancelled `wait_for_message` does not lose the
+/// message that arrives afterwards.
+#[test]
+fn mcp_request_tool_and_cancelled_wait() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code"]);
+    e.run("n2", &["agent", "add", "reviewer", "--role", "reviewer", "--runner", "codex"]);
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+    let mut back = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    back.init();
+    let mut rev = Mcp::spawn(&mut e, "n2", "reviewer", "codex");
+    rev.init();
+    wait_until("reviewer online on n1", T, || {
+        e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "reviewer@pc-two" && a["state"] == "online")
+    });
+
+    // backend asks (blocking tool call in flight)…
+    let rid = back.start("tools/call", serde_json::json!({"name": "request", "arguments": {"to": "role:reviewer", "text": "approve PR 12?", "waitS": 20}}));
+    // …reviewer receives it and replies.
+    let got = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 15}));
+    let qid = got["structuredContent"]["messages"][0]["id"].as_str().unwrap().to_string();
+    rev.tool("reply", serde_json::json!({"messageId": qid, "text": "approved"}));
+    let res = back.finish(rid);
+    assert_eq!(res["structuredContent"]["status"], "replied", "{res}");
+    assert_eq!(res["structuredContent"]["reply"]["parts"][0]["text"], "approved");
+
+    // Cancel a pending wait, then deliver: the next wait must still get the message.
+    let wid = rev.start("tools/call", serde_json::json!({"name": "wait_for_message", "arguments": {"timeoutS": 30}}));
+    std::thread::sleep(Duration::from_millis(300));
+    rev.write(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": wid, "reason": "test"}}));
+    std::thread::sleep(Duration::from_millis(500));
+    back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "subject": "after-cancel", "text": "still there?"}));
+    let again = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 10}));
+    assert_eq!(again["structuredContent"]["messages"][0]["subject"], "after-cancel", "{again}");
 }

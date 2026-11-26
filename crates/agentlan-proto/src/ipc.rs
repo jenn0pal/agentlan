@@ -56,11 +56,22 @@ pub enum IpcOp {
         agent: Option<String>,
         message_id: String,
     },
-    /// Long-poll: resolves with the next un-acked message (or times out).
+    /// Long-poll: resolves with the next unseen message (or times out). With
+    /// `inReplyTo`, resolves only with a reply to that message and leaves other mail alone.
     Wait {
         #[serde(default)]
         agent: Option<String>,
         timeout_ms: u64,
+        #[serde(default)]
+        in_reply_to: Option<String>,
+    },
+    /// Drop this connection's pending waits (the caller gave up).
+    CancelWait,
+    /// Put a message back to "unseen" (a wait result that never reached its caller).
+    Unsurface {
+        #[serde(default)]
+        agent: Option<String>,
+        message_id: String,
     },
     /// Subscribe this connection to pushed events (messages + roster changes).
     Watch {

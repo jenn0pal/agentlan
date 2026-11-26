@@ -9,7 +9,7 @@ mod render;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentlan_proto::amf::{Part, SendDraft, Target};
+use agentlan_proto::amf::{Part, Pick, SendDraft, Target};
 use agentlan_proto::ipc::IpcOp;
 use anyhow::{Result, bail};
 use rmcp::model::{
@@ -19,6 +19,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 pub use client::NodeClient;
 pub use render::Runner;
@@ -93,6 +94,7 @@ fn tools() -> Vec<Tool> {
                 "whoami" | "list_agents" | "list_machines" => hints(true, true, false),
                 "inbox" | "ack" => hints(false, true, false),
                 "wait_for_message" => hints(false, false, false),
+                "request" => hints(false, false, true),
                 _ => hints(false, false, true), // send, reply
             };
             t.annotate(a)
@@ -126,6 +128,22 @@ fn tool_list() -> Vec<Tool> {
                     "id":{"type":"string","description":"Optional retry key: resending with the same key is deduplicated."}
                 },
                 "required":["to"]
+            })),
+        ),
+        Tool::new(
+            "request",
+            "Ask one agent something and wait for its reply (up to 45 s). Targets: \"@name@machine\", \"agt_…\", or \"role:R\" / \"project:P\" (one agent is picked, preferring this machine). If no reply arrives in time you get status \"pending\"; the reply will still land in your inbox.",
+            schema(json!({
+                "type":"object",
+                "properties":{
+                    "to":{"type":"string"},
+                    "text":{"type":"string"},
+                    "subject":{"type":"string"},
+                    "intent":{"type":"string","enum":["ask","request","handoff"],"default":"request"},
+                    "waitS":{"type":"integer","minimum":1,"maximum":MAX_WAIT_S,"default":30},
+                    "replyWithinS":{"type":"integer","minimum":10,"default":600,"description":"How long the recipient has to answer (sets replyBy)."}
+                },
+                "required":["to","text"]
             })),
         ),
         Tool::new(
@@ -173,7 +191,18 @@ impl Adapter {
         r
     }
 
-    async fn dispatch(&self, name: &str, args: Map<String, Value>) -> CallToolResult {
+    /// Run an IPC call that may block; if the MCP request is cancelled, cancel the node-side wait.
+    async fn cancellable(&self, op: IpcOp, ct: &CancellationToken) -> std::result::Result<Value, client::CallError> {
+        tokio::select! {
+            r = self.client.call(op) => r,
+            _ = ct.cancelled() => {
+                let _ = self.client.call(IpcOp::CancelWait).await;
+                Err(client::CallError { code: "CANCELLED".into(), msg: "the caller cancelled this wait".into() })
+            }
+        }
+    }
+
+    async fn dispatch(&self, name: &str, args: Map<String, Value>, ct: &CancellationToken) -> CallToolResult {
         macro_rules! call {
             ($op:expr) => {
                 match self.client.call($op).await {
@@ -237,6 +266,57 @@ impl Adapter {
                 let unread = self.footer().await;
                 self.result(render::sent(&v), json!({"sent": v, "unread": unread}), &unread)
             }
+            "request" => {
+                let to = match args.get("to") {
+                    Some(Value::String(s)) => Target::parse(s),
+                    Some(o @ Value::Object(_)) => serde_json::from_value::<Target>(o.clone()).map_err(|e| e.to_string()),
+                    _ => Err("missing 'to'".to_string()),
+                };
+                let to = match to {
+                    Ok(Target::Role { role, project, .. }) => Target::Role { role, project, pick: Pick::One },
+                    Ok(Target::Project { project, .. }) => Target::Project { project, pick: Pick::One },
+                    Ok(t @ (Target::Agent { .. } | Target::Handle { .. })) => t,
+                    Ok(_) => return self.error("INVALID", "request needs a single recipient: @name@machine, agt_…, role:R or project:P"),
+                    Err(e) => return self.error("INVALID", &e),
+                };
+                let Some(text) = arg(&args, "text") else { return self.error("INVALID", "text is required") };
+                let within = args.get("replyWithinS").and_then(|v| v.as_i64()).unwrap_or(600).max(10);
+                let draft = SendDraft {
+                    to: Some(to),
+                    intent: Some(arg(&args, "intent").unwrap_or("request").to_string()),
+                    subject: arg(&args, "subject").map(String::from),
+                    text: Some(text.to_string()),
+                    reply_by: Some(agentlan_proto::now() + chrono::Duration::seconds(within)),
+                    ..Default::default()
+                };
+                let sent = call!(IpcOp::Send { as_agent: None, draft });
+                let delivered = sent["local"].as_u64().unwrap_or(0) > 0 || matches!(sent["remote"]["status"].as_str(), Some("accepted" | "queued"));
+                if !delivered {
+                    return self.error("NOT_DELIVERED", &render::sent(&sent));
+                }
+                let id = sent["id"].as_str().unwrap_or_default().to_string();
+                let t = args.get("waitS").and_then(|v| v.as_u64()).unwrap_or(30).clamp(1, MAX_WAIT_S);
+                let v = match self.cancellable(IpcOp::Wait { agent: None, timeout_ms: t * 1000, in_reply_to: Some(id.clone()) }, ct).await {
+                    Ok(v) => v,
+                    Err(e) => return self.error(&e.code, &e.msg),
+                };
+                let me = self.client.call(IpcOp::Whoami).await.ok();
+                let unread = me.as_ref().map(|w| json!({"count": w["unread"], "latest": w["unreadLatest"]})).unwrap_or(json!({"count": null}));
+                let my_machine = me.as_ref().and_then(|w| w["machineId"].as_str().map(String::from)).unwrap_or_default();
+                match v["message"].as_object() {
+                    Some(_) => {
+                        let msgs = vec![v["message"].clone()];
+                        let text = format!("Reply to {id}:\n\n{}", render::messages(&msgs, self.runner, &my_machine));
+                        let views = render::views(&msgs, &my_machine);
+                        self.result(text, json!({"status": "replied", "sent": sent, "reply": v["message"], "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                    }
+                    None => self.result(
+                        format!("Sent {id}; no reply within {t}s. The reply will land in your inbox (call wait_for_message or inbox later)."),
+                        json!({"status": "pending", "sent": sent, "reply": null, "unread": unread}),
+                        &unread,
+                    ),
+                }
+            }
             "reply" => {
                 let Some(mid) = arg(&args, "messageId") else { return self.error("INVALID", "messageId is required") };
                 let Some(text) = arg(&args, "text") else { return self.error("INVALID", "text is required") };
@@ -271,7 +351,10 @@ impl Adapter {
             }
             "wait_for_message" => {
                 let t = args.get("timeoutS").and_then(|v| v.as_u64()).unwrap_or(30).clamp(1, MAX_WAIT_S);
-                let v = call!(IpcOp::Wait { agent: None, timeout_ms: t * 1000 });
+                let v = match self.cancellable(IpcOp::Wait { agent: None, timeout_ms: t * 1000, in_reply_to: None }, ct).await {
+                    Ok(v) => v,
+                    Err(e) => return self.error(&e.code, &e.msg),
+                };
                 let me = self.client.call(IpcOp::Whoami).await.ok();
                 let unread = me.as_ref().map(|w| json!({"count": w["unread"], "latest": w["unreadLatest"]})).unwrap_or(json!({"count": null}));
                 let my_machine = me.as_ref().and_then(|w| w["machineId"].as_str().map(String::from)).unwrap_or_default();
@@ -311,8 +394,8 @@ impl ServerHandler for Adapter {
         tools().into_iter().find(|t| t.name == name)
     }
 
-    async fn call_tool(&self, request: CallToolRequestParams, _context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+    async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let args = request.arguments.unwrap_or_default();
-        Ok(self.dispatch(&request.name, args).await.into())
+        Ok(self.dispatch(&request.name, args, &context.ct).await.into())
     }
 }

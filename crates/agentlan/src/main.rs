@@ -103,6 +103,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Ask one agent and wait for its reply. TARGET: @name@machine | agt_… | role:R | project:P (one is picked).
+    Request {
+        #[arg(long = "as")]
+        as_agent: String,
+        target: String,
+        text: String,
+        #[arg(long)]
+        subject: Option<String>,
+        /// Seconds to wait for the reply.
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show un-acked messages.
     Inbox {
         #[arg(long = "as")]
@@ -355,6 +369,35 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 format!("✓ {}  local: {} delivered · {}{}", v["id"].as_str().unwrap_or("?"), v["local"], r, if v["duplicate"] == true { "  (duplicate)" } else { "" })
             });
         }
+        Cmd::Request { as_agent, target, text, subject, wait, json } => {
+            use agentlan_proto::amf::Pick;
+            let to = match Target::parse(&target).map_err(|e| anyhow!(e))? {
+                Target::Role { role, project, .. } => Target::Role { role, project, pick: Pick::One },
+                Target::Project { project, .. } => Target::Project { project, pick: Pick::One },
+                t @ (Target::Agent { .. } | Target::Handle { .. }) => t,
+                _ => bail!("request needs a single recipient: @name@machine, agt_…, role:R or project:P"),
+            };
+            let draft = SendDraft {
+                to: Some(to),
+                intent: Some("request".into()),
+                subject,
+                text: Some(text),
+                reply_by: Some(agentlan_proto::now() + chrono::Duration::seconds(600)),
+                ..Default::default()
+            };
+            let sent = call(home, IpcOp::Send { as_agent: Some(as_agent.clone()), draft }).await?;
+            let delivered = sent["local"].as_u64().unwrap_or(0) > 0 || matches!(sent["remote"]["status"].as_str(), Some("queued")) || sent["remote"]["count"].as_u64().unwrap_or(0) > 0;
+            if !delivered {
+                bail!("NOT_DELIVERED: no recipient matched {target} (role/project targets need an online agent)");
+            }
+            let id = sent["id"].as_str().unwrap_or_default().to_string();
+            let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: wait * 1000, in_reply_to: Some(id.clone()) }).await?;
+            let out = json!({"status": if v["message"].is_object() { "replied" } else { "pending" }, "sent": sent, "reply": v["message"]});
+            print_value(&out, json, |o| match o["reply"].as_object() {
+                Some(m) => format!("↩ reply from {}: {}", m["from"]["handle"].as_str().unwrap_or("?"), m["parts"][0]["text"].as_str().or(m["subject"].as_str()).unwrap_or("")),
+                None => format!("sent {id}; no reply within {wait}s (it will land in the inbox)"),
+            });
+        }
         Cmd::Inbox { as_agent, limit, json } => {
             let v = call(home, IpcOp::Inbox { agent: Some(as_agent), limit, message_id: None }).await?;
             print_value(&v, json, |v| {
@@ -383,7 +426,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             agentlan_mcp::serve(home.to_path_buf(), agent, r).await?;
         }
         Cmd::Wait { as_agent, timeout, json } => {
-            let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000 }).await?;
+            let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
             print_value(&v, json, |v| match v["message"].as_object() {
                 Some(m) => format!("{} from {}: {}", m["id"].as_str().unwrap_or("?"), m["from"]["handle"].as_str().unwrap_or("?"), m["subject"].as_str().unwrap_or("")),
                 None => "(timed out)".into(),
