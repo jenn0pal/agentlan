@@ -8,6 +8,17 @@ use agentlan_proto::ipc::IpcOp;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
+/// `canonicalize`, minus Windows' `\\?\` verbatim prefix for ordinary drive paths
+/// (cmd.exe can't start a shim or use a working directory written that way).
+fn canonical(p: &Path) -> std::io::Result<PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    let s = c.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => Ok(PathBuf::from(rest)),
+        _ => Ok(c),
+    }
+}
+
 /// Find an executable on PATH (absolute path), like `which`.
 fn which(name: &str) -> Option<PathBuf> {
     let exts: Vec<String> = if cfg!(windows) {
@@ -38,16 +49,17 @@ pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd
     };
     let prog = PathBuf::from(&argv[0]);
     let resolved = if prog.components().count() > 1 { Some(prog.clone()) } else { which(&argv[0]) };
-    let resolved = resolved.and_then(|p| std::fs::canonicalize(p).ok()).ok_or_else(|| anyhow!("can't find the program `{}`", argv[0]))?;
+    let resolved = resolved.and_then(|p| canonical(&p).ok()).ok_or_else(|| anyhow!("can't find the program `{}`", argv[0]))?;
     argv[0] = resolved.to_string_lossy().to_string();
     let command = argv.join(" ");
     let access = match access {
         "messages" => Access::Messages,
         "work" => Access::Work,
-        a => bail!("unknown access '{a}' (messages | work)"),
+        "full" => Access::Full,
+        a => bail!("unknown access '{a}' (messages | work | full)"),
     };
     let cwd = match cwd {
-        Some(c) => std::fs::canonicalize(&c).map_err(|e| anyhow!("--cwd {}: {e}", c.display()))?,
+        Some(c) => canonical(&c).map_err(|e| anyhow!("--cwd {}: {e}", c.display()))?,
         None => std::env::current_dir()?,
     };
     let cfg = WakeConfig { name: name.to_string(), preset, argv, cwd: cwd.clone(), access, timeout_s, rev: 1, session_id: None, last: None };
@@ -56,7 +68,8 @@ pub fn enable(home: &Path, name: &str, agent: &str, command: Option<String>, cwd
     println!("  working directory {}", cwd.display());
     match access {
         Access::Messages => println!("  access: messages only (AgentLAN tools; no shell, file edits or other MCP servers)"),
-        Access::Work => println!("  access: WORK — it can edit files and run commands in that directory, unattended"),
+        Access::Work => println!("  access: work — reads and edits inside that directory (path-checked); Codex runs commands in its sandbox, Claude's are refused"),
+        Access::Full => println!("  access: FULL — every action it asks for is approved, unattended (only the adapter's own limits apply)"),
     }
     println!("  When mail arrives and '{name}' isn't running, this PC's node starts it (≤ {timeout_s}s per wake).");
     Ok(())

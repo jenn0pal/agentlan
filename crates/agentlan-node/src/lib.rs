@@ -176,7 +176,8 @@ pub fn enable_wake(home: &Path, name: &str, cfg: wake::WakeConfig) -> Result<Age
         // Keep the session to resume if only limits changed.
         if let Some(old) = wf.workers.get(&id) {
             c.rev = old.rev + 1;
-            if old.argv == c.argv && old.cwd == c.cwd && old.preset == c.preset {
+            // A session started with other permissions (e.g. `work`) is never resumed.
+            if old.argv == c.argv && old.cwd == c.cwd && old.preset == c.preset && old.access == c.access {
                 c.session_id = old.session_id.clone();
             }
         }

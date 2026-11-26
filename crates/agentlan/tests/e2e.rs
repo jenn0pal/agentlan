@@ -1176,6 +1176,12 @@ fn worker_wake_over_acp() {
     wait_until("second reply", Duration::from_secs(20), || lead_replies(&e).iter().any(|t| t == "fake reply: and test it"));
     assert!(log_lines().contains(&format!("session/resume {sid}")), "{}", log_lines());
 
+    // Changing a worker's access never resumes a session started with other permissions.
+    let wdir = work.to_str().unwrap();
+    e.run("n2", &["wake", "enable", "builder", "--agent", "custom", "--command", &fake, "--cwd", wdir, "--timeout", "60", "--access", "work"]);
+    assert!(e.json("n2", &["wake", "ls", "--json"])["workers"][0]["config"]["sessionId"].is_null(), "access change keeps no session");
+    e.run("n2", &["wake", "enable", "builder", "--agent", "custom", "--command", &fake, "--cwd", wdir, "--timeout", "60"]);
+
     // 3. A request to the role from another PC, nobody online: the hub picks the
     //    wake-enabled worker, and the reply comes back to the waiting request.
     let r = e.json("n1", &["request", "--as", "lead", "role:builder", "ship it?", "--wait", "25", "--json"]);

@@ -1120,4 +1120,15 @@ Where the code differs from this spec, and why:
   9. The fallback now treats paused peers as unavailable, and the hub only picks agents whose node is connected.
   10. Each config change bumps a revision, so a stale wake can't overwrite it.
 - **Real wakes after the fixes:** Codex in 23.5 s and Claude in 10.4 s, both through the node and both with only exact AgentLAN tools approved.
+- **Real-adapter checks through the node (after the review fixes):**
+  - **messages:** Claude listed exactly the 9 messaging tools and had no shell, file tools or `setup`. Codex attempted nothing. Neither created a file.
+  - **work, first version:** it was not confined. Codex's workspace-write sandbox also allows temp dirs, and the node approved Claude's write outside `--cwd`.
+  - **work, now:** reads and edits are approved only inside `--cwd` (path-checked, symlinks resolved) and other tools are refused. Codex runs with `approval_policy = never`, because its only "no" to an escalation cancels the turn and the worker would never reply.
+  - **full:** approves everything.
+  - **Re-test:** both wrote `inside.txt`, neither wrote outside, and both replied.
+- **Not built from the original wake policy:**
+  - a sender allowlist;
+  - a depth limit of 2.
+
+  Worker-to-worker loops are bounded by the loop guard (per pair, per thread and per agent), the wake budget (12 per hour per worker) and concurrency (2 per PC).
 

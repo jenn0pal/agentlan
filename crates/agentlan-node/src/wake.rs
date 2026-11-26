@@ -12,8 +12,11 @@
 //!   shell, apps, browser, web search and the user's own MCP servers turned off; Claude Code
 //!   gets no built-in tools and no user settings. The node approves exactly the AgentLAN
 //!   messaging tools and rejects every other permission request.
-//! - `work` (explicit opt-in): the agent can edit files and run commands in its working
-//!   directory, and the node approves its permission requests.
+//! - `work` (opt-in): file reads and edits are approved only inside the working directory
+//!   (checked by path); Codex runs commands inside its workspace-write sandbox (which also
+//!   allows temp dirs); Claude Code's shell commands are refused.
+//! - `full` (explicit opt-in): every permission request is approved. Unattended, with only
+//!   the adapter's own limits.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -48,6 +51,7 @@ pub enum Preset {
 pub enum Access {
     Messages,
     Work,
+    Full,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -235,6 +239,11 @@ fn codex_config(access: Access, cwd: &Path) -> Value {
         features["unified_exec"] = json!(false);
         features["view_image"] = json!(false);
         cfg["sandbox_mode"] = json!("read-only");
+    }
+    // Except with `full`, never ask to escalate out of the sandbox: Codex's only "no" to an
+    // escalation cancels the whole turn (the worker would never reply). A blocked command
+    // just fails inside the sandbox and the agent carries on.
+    if access != Access::Full {
         cfg["approval_policy"] = json!("never");
     }
     cfg["features"] = features;
@@ -253,6 +262,56 @@ fn claude_meta(access: Access) -> Value {
     json!({"claudeCode": {"options": o}})
 }
 
+/// `p` resolved against `cwd`, with `.`/`..` removed and the deepest existing ancestor's
+/// symlinks resolved (so /tmp vs /private/tmp and `../` tricks compare correctly).
+fn resolve_path(cwd: &Path, p: &str) -> PathBuf {
+    let raw = if Path::new(p).is_absolute() { PathBuf::from(p) } else { cwd.join(p) };
+    let mut norm = PathBuf::new();
+    for c in raw.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    let mut base = norm.clone();
+    let mut rest = vec![];
+    while !base.exists() {
+        match base.file_name() {
+            Some(n) => rest.push(n.to_os_string()),
+            None => break,
+        }
+        if !base.pop() {
+            break;
+        }
+    }
+    let mut out = std::fs::canonicalize(&base).unwrap_or(base);
+    for n in rest.into_iter().rev() {
+        out.push(n);
+    }
+    out
+}
+
+/// In `work` access: a read/edit whose every path is inside the working directory.
+fn inside_cwd(tc: &Value, cwd: &Path) -> bool {
+    if !matches!(tc["kind"].as_str(), Some("read" | "edit" | "delete" | "move")) {
+        return false; // commands, fetches, unknown tools: not path-confined
+    }
+    let mut paths: Vec<String> = tc["locations"].as_array().map(|a| a.iter().filter_map(|l| l["path"].as_str().map(String::from)).collect()).unwrap_or_default();
+    for k in ["file_path", "path", "notebook_path"] {
+        if let Some(p) = tc["rawInput"][k].as_str() {
+            paths.push(p.to_string());
+        }
+    }
+    if paths.is_empty() {
+        return false;
+    }
+    let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    paths.iter().all(|p| resolve_path(&root, p).starts_with(&root))
+}
+
 /// Is this (name or title) exactly one of the worker's AgentLAN messaging tools?
 fn is_worker_tool(label: &str) -> bool {
     let l = label.trim();
@@ -262,6 +321,7 @@ fn is_worker_tool(label: &str) -> bool {
 }
 
 struct Acp {
+    cwd: PathBuf,
     child: Child,
     /// Kept after the child is reaped: the process group (Unix) / tree root (Windows).
     pid: Option<u32>,
@@ -327,7 +387,12 @@ impl Acp {
             let tc = &m["params"]["toolCall"];
             let seen = tc["toolCallId"].as_str().and_then(|i| self.titles.get(i)).cloned();
             let label = [tc["name"].as_str(), tc["title"].as_str(), seen.as_deref()].into_iter().flatten().find(|l| is_worker_tool(l)).map(String::from);
-            let allow = self.access == Access::Work || label.is_some();
+            let allow = label.is_some()
+                || match self.access {
+                    Access::Messages => false,
+                    Access::Work => inside_cwd(tc, &self.cwd),
+                    Access::Full => true,
+                };
             let shown = label.or(seen).or_else(|| tc["title"].as_str().map(String::from)).unwrap_or_else(|| format!("unnamed {} tool", tc["kind"].as_str().unwrap_or("?")));
             let want = if allow { ["allow_once", "allow_always"] } else { ["reject_once", "reject_always"] };
             let opts = m["params"]["options"].as_array().cloned().unwrap_or_default();
@@ -431,7 +496,7 @@ fn spawn(job: &WakeJob, deadline: Instant) -> Result<Acp> {
             }
         }
     });
-    Ok(Acp { child, pid, stdin, rx, next: 0, access: cfg.access, titles: Default::default(), log: vec![], deadline })
+    Ok(Acp { cwd: cfg.cwd.clone(), child, pid, stdin, rx, next: 0, access: cfg.access, titles: Default::default(), log: vec![], deadline })
 }
 
 /// Perform one wake within the configured timeout (startup, prompt and all I/O). Never
@@ -521,7 +586,10 @@ async fn drive(acp: &mut Acp, job: &WakeJob, exe: &Path) -> Result<(String, Stri
     };
     if cfg.preset == Preset::Claude {
         // Every non-AgentLAN action must come to us for permission.
-        let mode = if cfg.access == Access::Messages { "default" } else { "acceptEdits" };
+        let mode = match cfg.access {
+            Access::Messages => "default",
+            Access::Work | Access::Full => "acceptEdits",
+        };
         if let Err(e) = acp.call("session/set_mode", json!({"sessionId": sid, "modeId": mode}), Duration::from_secs(30)).await {
             bail!("could not set the {mode} permission mode ({e:#}); not prompting an agent with broader permissions");
         }
@@ -552,6 +620,21 @@ mod tests {
         assert!(!is_worker_tool("mcp.agentlan.reply"), "another server named agentlan");
         assert!(!is_worker_tool("mcp.agentlan_worker.reply; rm -rf"));
         assert!(!is_worker_tool("Edit files"));
+    }
+
+    #[test]
+    fn work_access_is_confined_to_the_working_directory() {
+        let root = std::env::temp_dir().join(format!("agl-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let ok = |tc: Value| inside_cwd(&tc, &root);
+        assert!(ok(json!({"kind": "edit", "locations": [{"path": root.join("src/a.rs").to_string_lossy()}]})));
+        assert!(ok(json!({"kind": "edit", "rawInput": {"file_path": "src/new/b.rs"}})), "relative, not yet existing");
+        assert!(!ok(json!({"kind": "edit", "rawInput": {"file_path": "../escape.txt"}})));
+        assert!(!ok(json!({"kind": "edit", "rawInput": {"file_path": "/etc/passwd"}})));
+        assert!(!ok(json!({"kind": "read", "locations": [{"path": "src/a.rs"}, {"path": "/Users/x/.ssh/id_rsa"}]})), "every path must be inside");
+        assert!(!ok(json!({"kind": "execute", "rawInput": {"command": "ls"}})), "commands aren't path-confined");
+        assert!(!ok(json!({"kind": "edit"})), "an edit with no path");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

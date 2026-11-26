@@ -231,7 +231,11 @@ agentlan wake ls                                               # last wake, outc
 - **What a woken worker can do.** `--access messages` (the default) means only the AgentLAN tools:
   - **Codex** runs read-only, with no shell, apps, browser or web search, and with your own MCP servers turned off. Your Codex login and config files are left untouched.
   - **Claude Code** gets no built-in tools, none of your settings or MCP servers, and every other action requires permission, which the node refuses.
-  - `--access work` lets it edit files and run commands in `--cwd`, unattended. Turn that on deliberately.
+  - **`--access work`:**
+    - **Claude Code** reads and edits files only inside `--cwd`. The node checks each path, and its shell commands are refused.
+    - **Codex** works in its own sandbox: it can write to `--cwd` and temp folders, and can't escalate.
+    - Tested: both wrote inside `--cwd`, and neither wrote outside it.
+  - **`--access full`** approves everything the agent asks for, unattended. Turn it on only deliberately.
 - **Limits:**
   - one wake per worker at a time, and at most 2 at once per PC;
   - 12 wakes per worker per hour;

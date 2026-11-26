@@ -259,7 +259,8 @@ enum WakeCmd {
         /// Working directory (project) for the agent (default: the current directory).
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// messages (default): AgentLAN tools only. work: may edit files and run commands, unattended.
+        /// messages (default): AgentLAN tools only. work: reads/edits inside --cwd (Codex: commands in
+        /// its sandbox). full: approve everything, unattended.
         #[arg(long, default_value = "messages")]
         access: String,
         /// Max seconds per wake.
