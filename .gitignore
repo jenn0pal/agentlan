@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.playwright-mcp/
+.DS_Store
+# local test homes / runtime data
+/.ailink-dev/
+*.db
+*.db-wal
+*.db-shm
