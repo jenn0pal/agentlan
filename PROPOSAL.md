@@ -1047,3 +1047,48 @@ Where the code differs from this spec, and why:
 - **Encryption.** Noise and join tokens still apply on top of WireGuard.
 - **Still to verify:** the Windows firewall rule must also allow 100.64.0.0/10, and a test across two tailnet devices is pending.
 
+**Real-runner check: Codex CLI against `agentlan mcp` (2026-11-26).**
+1. **Instructions are not shown before any tool use.** They surface once Codex discovers the tools, and that surfaced text included the handle and peers. → Keep the roster in `whoami` and `list_agents` results too.
+2. **The adapter starts in the session's working directory**, so `--agent auto` works.
+3. **Approvals in `codex exec` (policy "never"):**
+   - without annotations, every tool was blocked;
+   - with honest MCP annotations, the read-only and local tools run;
+   - `send`/`reply` (open-world) still need approval, a good default;
+   - `default_tools_approval_mode = "approve"` (per server) enables unattended workers. Verified end to end.
+4. **A 40 s `wait_for_message`** completed when a message arrived about 25 s in. Codex read it from structured content.
+
+**Wake spike (2026-11-26, codex-cli 0.172.0, throwaway session, AgentLAN on loopback).**
+- **`codex exec resume <session> "<pointer>"` works.** It woke an idle session with nothing else running. The worker called `inbox` and `reply` through `agentlan mcp`, and the sender got the reply (with `inReplyTo`) about 18 s later. This needs the agentlan MCP server configured for that session with `default_tools_approval_mode = "approve"`, and the sandbox stays read-only.
+- **`codex queue --thread <session> --message … --resume` does not wake it.** It printed "Queued message …" and exited 0, but no turn ran within 60 s. The message waits until the session is next opened, as the Codex review predicted.
+- **Decision for the wake adapter:** use `exec resume` for Codex worker profiles.
+  - Spawn it from the node.
+  - Pointer-only text (message id, sender handle, intent).
+  - One wake in flight per profile.
+  - Worker profiles only, with the loop-guard budgets.
+  - Bind each worker profile to its Codex session id.
+
+**Self-registration (2026-11-26, user request).**
+- **What the user asked for:**
+  - Installing the MCP tool takes no agent or role.
+  - Agents connect with the server's code and assign themselves a role after seeing the registry.
+  - Every session and every subagent gets its own identity.
+  - A `setup` tool writes project instructions.
+- **What was built:**
+  - Tools `connect`, `register`, `leave` and `setup`, and an `as` parameter.
+  - The node's `IpcOp::Register` and `Shutdown` ops.
+  - Background node start.
+  - Host-pid identity lookup for hooks.
+- **Limits:**
+  - **Worker mode stays user-only.** `register` always creates interactive profiles and can't claim `--mode worker` or `script` profiles, so Stop-hook continuation and wake remain opt-in by the user.
+  - **Live sessions can't be claimed.** `register` won't take a name a live session is using.
+  - **A joined PC can't be moved.** `connect` won't move it to another server.
+  - **`setup` writes only `CLAUDE.md` or `AGENTS.md`,** in the git root, inside markers. It neutralises marker text in model input and never writes join codes.
+- **Join code:** unchanged. About 260 characters, one PC, 15 minutes. A real `codex exec` session passed it through intact. A short id can't carry the server's public key, so a shorter code would need discovery, such as mDNS (Phase 3), plus a fingerprint check.
+- **Subagents share their host's adapter process.** MCP calls don't say which agent made them, so identities are chosen explicitly with `as`. With more than one registered, calls without `as` are refused rather than guessed.
+- **Live Claude Code check (headless `claude -p` 2.1.332, Sonnet; the subagent ran on Haiku via the Agent tool).**
+  - The session connected with the code and registered itself as `lead-dev`.
+  - The subagent registered `qa-sub`, sent with `as` and then called `leave`.
+  - The PostToolUse hook found the session's identity through the process tree and pointed at a new message.
+  - `setup` wrote `CLAUDE.md` in the project directory.
+  - **Quirk:** hooks fire for subagent tool calls too, so the subagent saw the session's unread pointer.
+

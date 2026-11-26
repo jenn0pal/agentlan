@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use interprocess::local_socket::Name;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tracing::info;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +84,21 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read-modify-write profiles.json under an exclusive lock (the CLI and the running
+/// node both write it), replacing the file atomically so pollers never see a partial write.
+pub fn update_profiles<T>(home: &Path, f: impl FnOnce(&mut ProfilesFile) -> Result<T>) -> Result<T> {
+    ensure_private_dir(&node_dir(home))?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(node_dir(home).join("profiles.lock"))?;
+    lock.lock()?;
+    let mut pf = load_profiles(home)?;
+    let out = f(&mut pf)?;
+    let path = profiles_path(home);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&pf)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(out)
+}
+
 /// Register a new agent profile on this PC (works offline). The permanent id is
 /// minted here and recorded by the hub on the next resync or attach.
 pub fn add_agent(home: &Path, name: &str, role: &str, project: Option<String>, runner: &str, mode: AgentMode) -> Result<AgentProfile> {
@@ -91,28 +107,110 @@ pub fn add_agent(home: &Path, name: &str, role: &str, project: Option<String>, r
     if name.is_empty() || role.is_empty() {
         bail!("name and role must contain letters or digits");
     }
-    ensure_private_dir(&node_dir(home))?;
-    let mut pf = load_profiles(home)?;
-    if pf.agents.iter().any(|a| a.name == name) {
-        bail!("an agent named '{name}' already exists on this PC");
+    update_profiles(home, |pf| {
+        if pf.agents.iter().any(|a| a.name == name) {
+            bail!("an agent named '{name}' already exists on this PC");
+        }
+        let prof = AgentProfile {
+            agent_id: agentlan_proto::ids::agent_id(),
+            name,
+            role,
+            project,
+            runner: runner.to_string(),
+            mode,
+            capabilities: vec![],
+            description: None,
+        };
+        pf.agents.push(prof.clone());
+        Ok(prof)
+    })
+}
+
+/// Is a node serving this home's IPC endpoint right now?
+pub async fn is_running(home: &Path) -> bool {
+    use interprocess::local_socket::tokio::{Stream, prelude::*};
+    match ipc_name(home) {
+        Ok(n) => Stream::connect(n).await.is_ok(),
+        Err(_) => false,
     }
-    let prof = AgentProfile {
-        agent_id: agentlan_proto::ids::agent_id(),
-        name,
-        role,
-        project,
-        runner: runner.to_string(),
-        mode,
-        capabilities: vec![],
-        description: None,
+}
+
+/// Start `agentlan node run` for this home as a background process that outlives the
+/// caller (e.g. an MCP adapter whose host session ends), logging to node/node.log.
+/// Returns once the node answers on IPC (another starter winning the race is fine), with
+/// whether it will outlive the caller's host (false only on Windows when the host's job
+/// object doesn't allow breakaway: then the node stops when the host exits).
+pub async fn ensure_running(home: &Path) -> Result<bool> {
+    if is_running(home).await {
+        return Ok(true);
+    }
+    #[allow(unused_mut)]
+    let mut persistent = true;
+    load_config(home)?; // must have joined first
+    let dir = node_dir(home);
+    ensure_private_dir(&dir)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("node.log"))?;
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--home").arg(home).args(["node", "run"]);
+    cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // not killed by signals sent to the host's process group
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_err() {
+            // The host's job object doesn't allow breakaway: the node still runs, but
+            // only as long as the host does.
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+            cmd.spawn()?;
+            persistent = false;
+        }
+    }
+    #[cfg(not(windows))]
+    cmd.spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if is_running(home).await {
+            return Ok(persistent);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("the agentlan node did not start (see {})", dir.join("node.log").display())
+}
+
+/// Parent process id of this process (the host that launched it).
+pub fn parent_pid() -> Option<u32> {
+    ancestor_pids(1).into_iter().next()
+}
+
+/// This process's ancestors, nearest first (up to `max`).
+pub fn ancestor_pids(max: usize) -> Vec<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let Ok(mut sys) = System::new() else {
+        return vec![];
     };
-    pf.agents.push(prof.clone());
-    // Atomic replace: a running node polling this file never reads a partial write.
-    let path = profiles_path(home);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&pf)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(prof)
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut out = vec![];
+    let mut cur = Pid::from_u32(std::process::id());
+    while out.len() < max {
+        let Some(parent) = sys.process(cur).and_then(|p| p.parent()) else {
+            break;
+        };
+        if parent.as_u32() <= 1 {
+            break;
+        }
+        out.push(parent.as_u32());
+        cur = parent;
+    }
+    out
 }
 
 /// Local IPC endpoint for this home: a Unix socket file, or a named pipe on Windows.
@@ -137,11 +235,21 @@ pub fn ipc_name(home: &Path) -> std::io::Result<Name<'static>> {
 
 /// `agentlan join <code>`: create this PC's key, enrol with the hub and record it.
 pub async fn join(home: &Path, code: &JoinCode, alias: &str) -> Result<(String, String)> {
+    let dir = node_dir(home);
+    ensure_private_dir(&dir)?;
+    // One join at a time per home (two agent sessions may `connect` at once): check and
+    // create the key + config under a lock, so the saved config matches the enrolled key.
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("join.lock"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lock.try_lock().is_err() {
+        if std::time::Instant::now() > deadline {
+            bail!("another join for this PC is still in progress");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if config_path(home).exists() {
         bail!("this PC already joined a network ({}); remove it first to re-join", config_path(home).display());
     }
-    let dir = node_dir(home);
-    ensure_private_dir(&dir)?;
     let key = StaticKey::load_or_create(&dir.join("node.key"))?;
     let hub_key = keys::from_b32(&code.hub_key)?;
     let mut last_err = None;
@@ -239,13 +347,14 @@ pub async fn run(home: &Path) -> Result<()> {
     })
     .await?;
     let st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx)?;
-    std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx))?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx, stop_tx))?;
 
     // Local IPC first: same-machine messaging works even if the hub never answers.
     let listener = ipc::listen(home)?;
     println!("agentlan node '{}' ready (machine {}); IPC up", cfg.alias, cfg.machine_id);
     let ticker = cmd_tx.clone();
-    tokio::spawn(async move {
+    let tick = tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_millis(100));
         loop {
             iv.tick().await;
@@ -254,6 +363,17 @@ pub async fn run(home: &Path) -> Result<()> {
             }
         }
     });
-    tokio::spawn(link::run(cfg, key, cmd_tx.clone(), ctl_rx, env_ms("AGENTLAN_BACKOFF_MAX_MS", 30_000)));
-    ipc::serve(listener, cmd_tx).await
+    let link = tokio::spawn(link::run(cfg, key, cmd_tx.clone(), ctl_rx, env_ms("AGENTLAN_BACKOFF_MAX_MS", 30_000)));
+    // `agentlan node stop` ends only the node: when it shares a process with the server
+    // (`agentlan up`), the server keeps running.
+    let r = tokio::select! {
+        r = ipc::serve(listener, cmd_tx) => r,
+        _ = stop_rx => {
+            info!("node: stopped");
+            Ok(())
+        }
+    };
+    tick.abort();
+    link.abort();
+    r
 }

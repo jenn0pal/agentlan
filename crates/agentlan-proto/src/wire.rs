@@ -60,7 +60,16 @@ pub enum NodeToHub {
     AgentUp { session_id: String, profile: AgentProfile },
     AgentDown { agent_id: String, session_id: String, fence: u64, reason: EndReason },
     /// `fence: None` = durable replay from the outbox (node-authenticated).
-    Submit { agent_id: String, session_id: Option<String>, fence: Option<u64>, envelope: Amf, local_recipients: Vec<String> },
+    Submit {
+        agent_id: String,
+        session_id: Option<String>,
+        fence: Option<u64>,
+        envelope: Amf,
+        local_recipients: Vec<String>,
+        /// Agents the sender's node has paused (loop guard): never deliver to these.
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
     Receipt { msg_id: String, recipient: String, state: DeliveryState },
     Journal { entry: JournalEntry },
     Ping { n: u64 },
@@ -113,7 +122,14 @@ pub enum HubToNode {
     AgentUpAck { agent_id: String, session_id: String, fence: u64 },
     Snapshot { seq: u64, machines: Vec<MachineRecord>, agents: Vec<AgentRecord>, more: bool },
     Event { event: RegistryEvent },
-    Accepted { msg_id: String, remote: u32 },
+    Accepted {
+        msg_id: String,
+        remote: u32,
+        /// The remote recipients the hub committed (agent ids), so the node can validate replies
+        /// and account pair budgets for group sends.
+        #[serde(default)]
+        recipients: Vec<String>,
+    },
     Rejected { msg_id: String, code: String, msg: String },
     Deliver { recipient: String, pair_seq: u64, envelope: Amf },
     JournalAck { msg_id: String },

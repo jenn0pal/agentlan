@@ -26,7 +26,33 @@ pub enum IpcOp {
         pid: Option<u32>,
         #[serde(default)]
         takeover: bool,
+        /// The process hosting the adapter (e.g. the Claude Code session), so hooks
+        /// running in that session can find this identity.
+        #[serde(default)]
+        host_pid: Option<u32>,
     },
+    /// An agent assigns itself an identity: create (or reuse, by name) a local profile
+    /// with the role it chose, and attach this connection to it. On an already attached
+    /// connection it updates that agent's role/project/description instead. Never grants
+    /// worker mode and never takes over a live session or a user-created worker profile.
+    Register {
+        /// Defaults to the role (with -2, -3… if that name is in use).
+        #[serde(default)]
+        name: Option<String>,
+        role: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        runner: Option<String>,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        host_pid: Option<u32>,
+    },
+    /// Stop the node daemon (local clients only; the IPC endpoint is private to this user).
+    Shutdown,
     Detach,
     Whoami,
     Status,
@@ -56,11 +82,47 @@ pub enum IpcOp {
         agent: Option<String>,
         message_id: String,
     },
-    /// Long-poll: resolves with the next un-acked message (or times out).
+    /// Long-poll: resolves with the next unseen message (or times out). With
+    /// `inReplyTo`, resolves only with a reply to that message and leaves other mail alone.
     Wait {
         #[serde(default)]
         agent: Option<String>,
         timeout_ms: u64,
+        #[serde(default)]
+        in_reply_to: Option<String>,
+    },
+    /// Identity, peers and an unread summary for an agent, without attaching or
+    /// surfacing anything (used by hooks).
+    /// With `hostPids` instead of `agent`: the identity registered by the nearest of
+    /// those processes (the hook's ancestors), i.e. the agent of this host session.
+    Peek {
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        host_pids: Vec<u32>,
+    },
+    /// Lift a loop-guard pause on a thread (the CLI only sends this after a human
+    /// confirmed on an interactive terminal).
+    ResumeThread { thread_id: String },
+    /// Drop a pending wait on this connection (the caller gave up): the one with IPC
+    /// request id `reqId`, or all of them if omitted.
+    CancelWait {
+        #[serde(default)]
+        req_id: Option<u64>,
+    },
+    /// Send and wait for a reply in one step (no gap in which the reply could be
+    /// taken by another waiter). Only the actual recipient's reply satisfies it.
+    Request {
+        #[serde(default, rename = "as")]
+        as_agent: Option<String>,
+        draft: SendDraft,
+        timeout_ms: u64,
+    },
+    /// Put a message back to "unseen" (a wait result that never reached its caller).
+    Unsurface {
+        #[serde(default)]
+        agent: Option<String>,
+        message_id: String,
     },
     /// Subscribe this connection to pushed events (messages + roster changes).
     Watch {

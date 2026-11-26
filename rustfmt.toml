@@ -1,0 +1,4 @@
+# Matches the existing code style (long lines). `cargo fmt` with the default 100
+# columns would rewrap most of the workspace.
+max_width = 160
+use_small_heuristics = "Max"

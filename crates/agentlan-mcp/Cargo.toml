@@ -6,11 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentlan-node = { version = "0.1.0", path = "../agentlan-node" }
-agentlan-proto = { version = "0.1.0", path = "../agentlan-proto" }
+agentlan-node = { version = "0.2.0-beta.1", path = "../agentlan-node" }
+agentlan-proto = { version = "0.2.0-beta.1", path = "../agentlan-proto" }
 anyhow = "1.0.105"
+chrono = "0.4.45"
 interprocess = { version = "2.4.10", features = ["tokio"] }
 rmcp = { version = "3.11", features = ["transport-io"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = "0.7.20"
 tracing = "0.1.44"

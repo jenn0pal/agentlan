@@ -4,7 +4,7 @@
 
 **A LAN intercom for AI coding agents.** AgentLAN links Claude Code, Codex and your own scripts running on different Mac and Windows PCs, so they can find each other and talk. Every agent has a recorded identity, a role and a project, and the network announces it when the agent connects. Agents on the same PC talk directly through a local daemon, without touching the network.
 
-> **Status: alpha (v0.1).**
+> **Status: alpha (v0.2 beta).**
 > - **Built and tested on macOS:** the core system and the MCP adapter.
 > - **Windows:** CI builds it and runs the test suite there, including the single-machine end-to-end tests, and the release ships a Windows binary.
 > - **Not yet tested across two physical machines.** End-to-end tests run every process on one machine over loopback.
@@ -18,10 +18,15 @@
    curl -fsSL https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.sh | sh
    ```
    On Windows: `irm https://raw.githubusercontent.com/jenn0pal/agentlan/main/install.ps1 | iex`
-2. Run `agentlan up` on the PC you pick as the server.
-3. Run the `agentlan connect …` line it prints on every other PC.
+2. Run `agentlan up` on the PC you pick as the server. It prints a join code.
+3. Add the MCP tool to your agents, once per PC. You don't pass a name or role:
+   ```sh
+   claude mcp add -s user agentlan -- agentlan mcp      # Claude Code
+   codex mcp add agentlan -- agentlan mcp               # Codex
+   ```
+4. In a session, tell the agent: *"Connect to AgentLAN with code AGENTLAN1-… and register as reviewer."* Only the first session on each PC needs the code. After that, sessions and subagents just register.
 
-Details are in [Install](#install-one-line) and [Run it](#run-it-one-command-per-pc).
+Details are in [Install](#install-one-line), [Run it](#run-it-one-command-per-pc) and [Connect your AI agents](#connect-your-ai-agents-mcp).
 
 ## Features
 
@@ -100,18 +105,18 @@ It sets everything up the first time, starts the server and this PC's node, and 
   agentlan connect AGENTLAN1-eyJuZXQiOi…
 ```
 
-**2. On every other PC**, paste that line:
+**2. On every other PC**, either give the code to an agent there (its `connect` tool joins the PC and starts the node in the background), or paste the line in a terminal:
 ```sh
 agentlan connect AGENTLAN1-eyJuZXQiOi…
 ```
-After the first time, plain `agentlan connect` starts the node again. Over Tailscale, use `agentlan up --tailscale` to advertise the server's MagicDNS name.
+Each code works for **one PC** and expires after 15 minutes. `agentlan hub invite` on the server makes more. After the first time, a PC needs no code: plain `agentlan connect` (or an agent's `connect`) starts the node again, and `agentlan node stop` stops it. Over Tailscale, use `agentlan up --tailscale` to advertise the server's MagicDNS name.
 
-**3. Add an agent and talk:**
+**3. Agents register themselves.** Each agent session picks its own name and role through the MCP tools (see [below](#connect-your-ai-agents-mcp)). Scripts can still use the CLI:
 ```sh
-agentlan agent add backend --role backend --runner claude-code    # on any PC; picked up live
-agentlan ls                                                       # who's online: roles, projects, machines
-agentlan send --as backend @reviewer@win-pc "PR 12 is ready"
-agentlan inbox --as reviewer
+agentlan agent add ci-bot --role ci --runner generic    # a pre-made profile, e.g. for a script
+agentlan ls                                             # who's online: roles, projects, machines
+agentlan send --as ci-bot @reviewer@win-pc "PR 12 is ready"
+agentlan inbox --as ci-bot
 ```
 
 **Keep it running.** Leave `agentlan up` / `agentlan connect` running in a terminal. On macOS and Linux you can also background it with `nohup agentlan up > ~/agentlan.log 2>&1 &`. Installing it as a login service comes in Phase 3.
@@ -139,14 +144,63 @@ cargo test --workspace     # unit tests + end-to-end tests (real processes on 12
 
 ## Connect your AI agents (MCP)
 
+Install the MCP tool once per PC. It takes no agent name or role:
+
 ```sh
-# Claude Code (per project)
-claude mcp add -s local agentlan -- agentlan mcp --agent backend --runner claude-code
-# Codex CLI (picks the profile from runner + git remote)
-codex mcp add agentlan -- agentlan mcp --agent auto --runner codex
+claude mcp add -s user agentlan -- agentlan mcp      # Claude Code (all projects)
+codex mcp add agentlan -- agentlan mcp               # Codex CLI
 ```
 
-**Tools:** `whoami`, `list_agents`, `list_machines`, `send`, `reply`, `inbox`, `wait_for_message`, `ack`.
+The agent handles the rest from inside its session:
+
+1. **`connect`** joins the network. On the first session on a PC, pass the server's join code. This also starts the PC's node in the background, and the node keeps running after the session ends. It returns the registry: who is online, with what role, on which project and machine.
+2. **`register`** gives the agent its identity: a name, the role it takes, a project (default: the repository) and a one-line description. Other agents see it immediately. Reusing a name later keeps the same recorded `agt_…` id. Call `register` again with `as` to change role mid-session.
+3. **Several sessions on one PC** each register their own identity. If two pick the same role, the second becomes `backend-2`.
+4. **Subagents** register too. A Claude or Codex subagent calls `register` with its own name, then passes `as: "<name>"` on every call. Once a session has more than one identity, calls without `as` are refused rather than guessed. **`leave`** ends a subagent's identity.
+5. **`setup`** writes "how to connect and use AgentLAN" into the project's `CLAUDE.md` or `AGENTS.md`, optionally with the project's roles. New sessions then know to connect and register. Running it again replaces only its own marked block. Join codes are never written.
+
+Agents can't grant themselves worker mode, take a name another live session is using, claim a worker profile you created, or move a joined PC to another server.
+
+**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply`, `inbox`, `wait_for_message`, `ack`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
+
+**Pre-made profiles still work.** `agentlan agent add backend --role backend --runner claude-code`, then `agentlan mcp --agent backend`, starts a session as that profile. Use this for worker profiles (`--mode worker`), which agents can't create themselves.
+
+**Annotations.** Tools carry MCP hints:
+- read-only: `whoami`, `list_agents`, `list_machines`;
+- local only: `register`, `leave`, `setup`, `inbox`, `wait_for_message`, `ack`;
+- reaches the network or other agents: `connect`, `send`, `request`, `reply`.
+
+**Codex** (tested with codex-cli 0.172.0 in non-interactive `codex exec`):
+- **Local tools** run without prompting.
+- **`connect`, `send`, `request` and `reply` are held for approval** because they reach the network. Under `codex exec` (approval policy "never") they were refused. In an interactive session Codex should prompt you instead; that part has not been tested.
+- **Unattended worker sessions** can opt in per server in `~/.codex/config.toml`:
+
+  ```toml
+  [mcp_servers.agentlan]
+  command = "agentlan"
+  args = ["mcp"]
+  tool_timeout_sec = 90                       # wait_for_message blocks up to 45 s
+  # default_tools_approval_mode = "approve"   # worker sessions only: no approval prompts
+  ```
+
+- **Tested end to end:** a `codex exec` session given only a join code called `connect`, `register`, `list_agents`, `send` and `setup`. It named itself `codex-reviewer`, and the server PC saw its role and description.
+- **AgentLAN's server instructions** reach Codex when it discovers the tools.
+
+**Claude Code hooks** (optional) make Claude notice mail without polling:
+
+```sh
+agentlan hooks print claude   # prints a snippet for .claude/settings.local.json (writes nothing)
+```
+
+- **What each hook does:**
+  - SessionStart gives Claude its identity and peer list before the first prompt;
+  - UserPromptSubmit and PostToolUse add a one-line "N unread from …" pointer.
+- **Pointer only:** sender handles, intents and ids; never subjects or bodies.
+- **The Stop hook is only for `--mode worker` profiles.** It keeps the agent working on new mail, at most 3 times in a row.
+- **They find the session's identity themselves.** The hook looks up the identity this Claude session registered, by walking its process tree to the agentlan adapter's host. Pass `--agent <name>` to pin a pre-made profile instead.
+- **Safe by default:** hooks stay silent if the node isn't running or the session hasn't registered.
+- **Verified in a live Claude Code session** (headless `claude -p`, v2.1.332). The session registered itself, and a subagent registered its own identity and sent mail. PostToolUse then told the session about a new message.
+- **Subagents see the session's notices too.** Hooks also fire for a subagent's tool calls, and they point at the session's main identity. It's a pointer only, with no message text.
 
 **Scripts and other agents** use the CLI:
 
@@ -169,6 +223,14 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 - **Network membership.** PCs join with a one-time code that contains the server's full public key, so a fake server is rejected during the handshake. The server then pins each PC's key.
 - **Peer messages are untrusted data.** They are never instructions. The protocol has no "execute" verb. Adapters mark peer content as untrusted, and a peer cannot close Claude's wrapper early.
 - **Auto-wake is off by default.** Agents can't start work in another agent's session unless that profile is a dedicated worker. See §7.5 of the proposal for the impact analysis.
+- **Loop guard.** The node refuses a send that would exceed:
+  - 120 messages an hour per agent;
+  - 40 an hour per sender→recipient pair;
+  - 30 automated messages per thread.
+
+  The budgets are saved with each send, so a restart doesn't reset them.
+
+  A thread or a sender→recipient pair that hits its budget is **paused** until a human runs `agentlan thread resume <key>` at an interactive terminal. The pair budget catches a ping-pong even when every message starts a new thread, and it counts the same recipient as one pair however it's addressed. `agentlan thread ls` lists paused keys. It's a cost and safety brake, not a security boundary. Limits are tunable with `AGENTLAN_LIMIT_AGENT_HOUR`, `AGENTLAN_LIMIT_PAIR_HOUR` and `AGENTLAN_LIMIT_THREAD`.
 - **Same OS user.** On macOS and Linux, the local IPC socket lives in a private (0700) directory, so only your user can reach it. On Windows, restricting the named pipe to the current user is still to do. Any process running as your user can act as your agents.
 
 ## Configuration
@@ -192,12 +254,9 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 
 ## Roadmap
 
-**Phase 2 (in progress)**
-- Request/reply that waits for the answer.
-- Claude Code hooks.
+**Phase 2 (in progress).** Done: request/reply, Claude hooks, fan-out tests, the loop guard (node-side), agents connecting and registering themselves (sessions and subagents). Remaining:
 - Opt-in wake for worker agents.
-- Loop-guard budgets.
-- Tests for role and project broadcasts.
+- Network-wide thread totals on the server.
 
 **Phase 3**
 - Background services: macOS LaunchAgent and Windows startup task.
@@ -206,7 +265,7 @@ AgentLAN works across a tailnet: the same PCs, or PCs at different sites, with n
 - `doctor` command and a terminal dashboard.
 - Installers and code signing.
 
-**Still to verify:** Windows builds, and a real test across two machines (LAN and Tailscale).
+**Still to verify:** a real test across two machines (LAN and Tailscale).
 
 ## License
 
