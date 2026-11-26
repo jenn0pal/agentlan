@@ -231,8 +231,14 @@ fn single_instance_locks_and_size_limits() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(e.status("n1")["hub"], "ready", "the running hub/node must be unaffected");
 
-    let big = "x".repeat(300 * 1024);
-    let out = e.cmd("n1", &["send", "--as", "backend", "@qa@pc-one", &big]).output().unwrap();
+    // Via stdin: Linux caps a single argv entry at 128 KiB.
+    let big = serde_json::json!({"to": {"kind": "handle", "handle": "qa@pc-one"}, "text": "x".repeat(300 * 1024)}).to_string();
+    let mut child = e.cmd("n1", &["send", "--as", "backend", "--stdin"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(big.as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("TOO_LARGE"), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(e.status("n1")["outbox"], 0);
