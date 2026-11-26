@@ -303,9 +303,22 @@ impl NodeState {
     /// Live (non-durable) frames: presence and heartbeats. Durable frames use the outbox.
     fn send_live(&self, f: NodeToHub) -> bool {
         match (&self.hub_tx, self.hub) {
-            (Some(tx), HubStatus::Ready | HubStatus::Resyncing) => tx.try_send(f).is_ok(),
+            (Some(tx), HubStatus::Ready | HubStatus::Resyncing) => {
+                let ok = tx.try_send(f).is_ok();
+                if !ok {
+                    // A presence frame could not be queued: a resync reconciles everything.
+                    warn!("node: hub link congested; forcing a resync");
+                    let _ = self.link.send(LinkCtl::Reconnect);
+                }
+                ok
+            }
             _ => false,
         }
+    }
+
+    /// Hub view is complete only after resync *and* the full snapshot.
+    fn hub_label(&self) -> &'static str {
+        if self.hub == HubStatus::Ready && !self.have_snapshot { "resyncing" } else { self.hub.as_str() }
     }
 
     fn local_record(&self, p: &AgentProfile) -> AgentRecord {
@@ -323,7 +336,7 @@ impl NodeState {
     }
 
     fn roster(&self, project: Option<&str>, role: Option<&str>) -> Vec<RosterEntry> {
-        let stale = self.hub != HubStatus::Ready;
+        let stale = self.hub != HubStatus::Ready || !self.have_snapshot;
         let mut out: Vec<RosterEntry> = self.profiles.iter().map(|p| RosterEntry { agent: self.local_record(p), same_machine: true, stale: false }).collect();
         let mut remote: Vec<&AgentRecord> = self.base_agents.values().filter(|a| a.machine_id != self.cfg.machine_id).collect();
         remote.sort_by(|a, b| a.handle.cmp(&b.handle));
@@ -490,7 +503,6 @@ impl NodeState {
                     }
                 }
                 self.pump()?;
-                self.push_all("hub", json!({"status": "ready"}));
             }
             HubToNode::Snapshot { seq, machines, agents, more } => {
                 let stage = self.snap_stage.get_or_insert_with(|| (seq, vec![], vec![]));
@@ -502,6 +514,7 @@ impl NodeState {
                     self.have_snapshot = true;
                     self.base_machines = machines.into_iter().map(|m| (m.machine_id.clone(), m)).collect();
                     self.base_agents = agents.into_iter().map(|a| (a.profile.agent_id.clone(), a)).collect();
+                    self.push_all("hub", json!({"status": "ready"}));
                 }
             }
             HubToNode::Event { event } => {
@@ -761,7 +774,7 @@ impl NodeState {
                 info!("node: {} attached (runner {:?}, pid {:?})", self.handle_of(&p), runner, pid);
                 Ok(Some(json!({
                     "agent": rec, "sessionId": sid, "provisional": true,
-                    "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub.as_str(),
+                    "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
                     "roster": self.roster(None, None),
                     "unread": self.unread_count(&p.agent_id)?,
                 })))
@@ -774,9 +787,21 @@ impl NodeState {
             IpcOp::Whoami => {
                 let p = self.agent_for(conn, None)?;
                 let s = self.sessions.get(&p.agent_id);
+                // Unread summary without surfacing anything (for adapters' footers).
+                let mut st = self.db.prepare(
+                    "SELECT m.envelope FROM inbox i JOIN messages m USING(msg_id) WHERE i.agent_id=?1 AND i.state='stored' ORDER BY i.rowid LIMIT 3",
+                )?;
+                let latest: Vec<Value> = st
+                    .query_map(params![p.agent_id], |r| r.get::<_, String>(0))?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| serde_json::from_str::<Amf>(&e).ok())
+                    .map(|m| json!({"id": m.id, "from": m.from.handle, "intent": m.intent, "sameMachine": self.profiles.iter().any(|x| x.agent_id == m.from.agent)}))
+                    .collect();
+                drop(st);
                 Ok(Some(json!({
                     "agent": self.local_record(&p), "provisional": s.is_none_or(|s| s.fence.is_none()),
-                    "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub.as_str(),
+                    "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
+                    "unread": self.unread_count(&p.agent_id)?, "unreadLatest": latest,
                 })))
             }
             IpcOp::Status => {
@@ -784,13 +809,13 @@ impl NodeState {
                 let sessions: Vec<Value> = self.sessions.iter().map(|(a, s)| json!({"agentId": a, "sessionId": s.session_id, "fenced": s.fence.is_some()})).collect();
                 Ok(Some(json!({
                     "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "net": self.cfg.net,
-                    "hub": self.hub.as_str(), "seq": self.base_seq, "outbox": outbox,
+                    "hub": self.hub_label(), "seq": self.base_seq, "outbox": outbox,
                     "profiles": self.profiles.len(), "sessions": sessions,
                 })))
             }
             IpcOp::ListAgents { project, role } => {
                 self.reload_profiles();
-                Ok(Some(json!({"agents": self.roster(project.as_deref(), role.as_deref()), "hub": self.hub.as_str()})))
+                Ok(Some(json!({"agents": self.roster(project.as_deref(), role.as_deref()), "hub": self.hub_label()})))
             }
             IpcOp::ListMachines => {
                 let mut ms: Vec<MachineRecord> = self.base_machines.values().cloned().collect();
@@ -802,7 +827,7 @@ impl NodeState {
                     };
                 }
                 ms.sort_by(|a, b| a.alias.cmp(&b.alias));
-                Ok(Some(json!({"machines": ms, "self": {"machineId": self.cfg.machine_id, "alias": self.cfg.alias, "reported": self.reported}, "hub": self.hub.as_str()})))
+                Ok(Some(json!({"machines": ms, "self": {"machineId": self.cfg.machine_id, "alias": self.cfg.alias, "reported": self.reported}, "hub": self.hub_label()})))
             }
             IpcOp::Send { as_agent, draft } => self.send(conn, req.id, as_agent.as_deref(), draft),
             IpcOp::Inbox { agent, limit, message_id } => {
@@ -862,7 +887,7 @@ impl NodeState {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.watch = Some(filter);
                 }
-                Ok(Some(json!({"watching": true, "hub": self.hub.as_str()})))
+                Ok(Some(json!({"watching": true, "hub": self.hub_label()})))
             }
         }
     }
@@ -939,7 +964,12 @@ impl NodeState {
                 "INSERT INTO messages(msg_id, envelope, created_at) VALUES(?1,?2,?3)",
                 params![env.id, serde_json::to_string(&env)?, env.created_at.to_rfc3339()],
             )
-            .map_err(|_| IpcErr("ID_CONFLICT", format!("message id {} already exists", env.id)))?;
+            .map_err(|e| match &e {
+                ailink_store::rusqlite::Error::SqliteFailure(f, _) if f.code == ailink_store::rusqlite::ErrorCode::ConstraintViolation => {
+                    IpcErr("ID_CONFLICT", format!("message id {} already exists", env.id))
+                }
+                _ => IpcErr("STORAGE", e.to_string()),
+            })?;
             for id in &local_ids {
                 tx.execute(
                     "INSERT OR IGNORE INTO inbox(agent_id, msg_id, state, remote, received_at) VALUES(?1,?2,'stored',0,?3)",

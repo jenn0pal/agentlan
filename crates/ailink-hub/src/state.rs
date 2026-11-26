@@ -187,7 +187,19 @@ impl Hub {
                 let _ = reply.send(r.map_err(|e| e.to_string()));
             }
             Cmd::Tick => {
-                let _ = self.in_txn(|h| h.expire_leases());
+                let now_i = Instant::now();
+                let expired: Vec<String> = self.deadlines.iter().filter(|(_, d)| **d <= now_i).map(|(k, _)| k.clone()).collect();
+                if !expired.is_empty() && self.in_txn(|h| h.expire_leases(&expired)).is_ok() {
+                    // Only forget the deadlines once the expiry is durable.
+                    for mid in expired {
+                        self.deadlines.remove(&mid);
+                        if let Some(mut c) = self.conns.remove(&mid) {
+                            if let Some(k) = c.kill.take() {
+                                let _ = k.send(());
+                            }
+                        }
+                    }
+                }
             }
             Cmd::Frame { machine_id, cgen, frame } => {
                 if !self.conns.get(&machine_id).is_some_and(|c| c.cgen == cgen) {
@@ -300,10 +312,16 @@ impl Hub {
                 continue;
             }
             let envelope: Amf = serde_json::from_str(&env)?;
-            if let Some(c) = self.conns.get_mut(mid) {
-                c.inflight.insert(key);
+            match self.conns.get_mut(mid) {
+                Some(c) => {
+                    c.inflight.insert(key);
+                }
+                None => break, // link dropped: nothing later may overtake this delivery
             }
             self.deliver_now(mid, HubToNode::Deliver { recipient, pair_seq: seq as u64, envelope });
+            if !self.conns.contains_key(mid) {
+                break;
+            }
             sent += 1;
         }
         Ok(())
@@ -427,11 +445,9 @@ impl Hub {
         self.emit(kind, rec, None)
     }
 
-    fn expire_leases(&mut self) -> Result<()> {
-        let now_i = Instant::now();
-        let expired: Vec<String> = self.deadlines.iter().filter(|(_, d)| **d <= now_i).map(|(k, _)| k.clone()).collect();
+    fn expire_leases(&mut self, expired: &[String]) -> Result<()> {
         for mid in expired {
-            self.deadlines.remove(&mid);
+            let mid = mid.clone();
             info!("hub: lease expired for {mid}");
             let online = self.agent_records("WHERE a.machine_id=?1 AND a.state='online'", Some(&mid))?;
             self.db.execute(
@@ -444,11 +460,6 @@ impl Hub {
             }
             let m = self.machine_records(Some(&mid))?.into_iter().next();
             self.emit(EventKind::MachineLost, None, m)?;
-            if let Some(mut c) = self.conns.remove(&mid) {
-                if let Some(k) = c.kill.take() {
-                    let _ = k.send(());
-                }
-            }
         }
         Ok(())
     }
@@ -553,7 +564,7 @@ impl Hub {
         let mut outcomes = Vec::new();
         for prof in &profiles {
             match self.upsert_profile(mid, prof) {
-                Ok(true) if !attached.iter().any(|a| a.agent_id == prof.agent_id) => self.emit_agent(EventKind::Updated, &prof.agent_id)?,
+                Ok(true) => self.emit_agent(EventKind::Updated, &prof.agent_id)?,
                 Ok(_) => {}
                 Err(e) => outcomes.push(SessionOutcome {
                     agent_id: prof.agent_id.clone(),
