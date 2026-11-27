@@ -269,6 +269,168 @@ pub async fn ensure_running(home: &Path) -> Result<bool> {
     bail!("the agentlan node did not start (see {})", dir.join("node.log").display())
 }
 
+/// The version this node reports in `Status`. `AGENTLAN_DEV_NODE_VERSION` overrides it
+/// (tests only: lets a test node pose as an older or newer release).
+pub fn node_version() -> String {
+    std::env::var("AGENTLAN_DEV_NODE_VERSION").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Is version `a` older than `b`? Semver order, pre-release aware: `0.2.0-beta.4` <
+/// `0.2.0-beta.10` < `0.2.0`. Anything unparsable is never "older" (no action on it).
+pub fn version_older(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<([u64; 3], Option<Vec<String>>)> {
+        let v = v.trim().trim_start_matches('v');
+        let v = v.split('+').next()?; // build metadata doesn't order
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, Some(p.split('.').map(String::from).collect())),
+            None => (v, None),
+        };
+        let mut n = core.split('.').map(|x| x.parse::<u64>().ok());
+        let out = [n.next()??, n.next()??, n.next()??];
+        if n.next().is_some() {
+            return None;
+        }
+        Some((out, pre))
+    }
+    let (Some((ca, pa)), Some((cb, pb))) = (parse(a), parse(b)) else { return false };
+    if ca != cb {
+        return ca < cb;
+    }
+    match (pa, pb) {
+        (None, _) => false,          // a release is never older than its own pre-releases
+        (Some(_), None) => true,     // a pre-release is older than its release
+        (Some(pa), Some(pb)) => {
+            for (x, y) in pa.iter().zip(pb.iter()) {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less, // numeric < alphanumeric
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord == std::cmp::Ordering::Less;
+                }
+            }
+            pa.len() < pb.len()
+        }
+    }
+}
+
+/// What [`refresh_outdated`] found about the running node.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeCheck {
+    /// No node running, or it's this version or newer: nothing to do.
+    Current,
+    /// It was older and idle, and was restarted on this binary.
+    Restarted { from: String },
+    /// It's older (`running`: its version, if it reports one) but left alone.
+    Outdated { running: Option<String>, with_hub: bool },
+}
+
+impl NodeCheck {
+    /// A line for the user, if there's anything to say.
+    pub fn note(&self) -> Option<String> {
+        let me = env!("CARGO_PKG_VERSION");
+        match self {
+            NodeCheck::Current => None,
+            NodeCheck::Restarted { from } => Some(format!("Updated this PC's AgentLAN node to {me} (it was still running {from} after an upgrade).")),
+            NodeCheck::Outdated { running: Some(v), with_hub: true } => Some(format!(
+                "This PC's AgentLAN node is still running {v} (this is {me}). It runs inside `agentlan up`, so restart `agentlan up` to update it."
+            )),
+            NodeCheck::Outdated { running: Some(v), with_hub: false } => Some(format!(
+                "This PC's AgentLAN node is still running {v} (this is {me}) and other sessions are using it, so it wasn't restarted. Once they're closed, run `agentlan node stop`; it starts again on the next connect."
+            )),
+            NodeCheck::Outdated { running: None, .. } => Some(format!(
+                "This PC's AgentLAN node is an older version than this {me} (from before nodes reported their version). Once other AgentLAN sessions are closed, run `agentlan node stop` (and restart `agentlan up` if this PC is the server)."
+            )),
+        }
+    }
+}
+
+/// After an upgrade, a node that was already running keeps the old version until it
+/// restarts. If the running node is older than this binary and nothing depends on it (it
+/// runs on its own, with no attached sessions and no wake in progress), stop it and start
+/// it again on this binary; otherwise report it. A node too old to report its version is
+/// only reported. Status and Shutdown go over one connection, so a client that raced
+/// another one here can only stop the old node, never the freshly started one.
+pub async fn refresh_outdated(home: &Path) -> NodeCheck {
+    use interprocess::local_socket::tokio::{Stream, prelude::*};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    async fn ask(rd: &mut BufReader<&Stream>, s: &Stream, id: u64, op: agentlan_proto::ipc::IpcOp) -> Option<serde_json::Value> {
+        let mut line = serde_json::to_vec(&agentlan_proto::ipc::IpcRequest { id, op }).ok()?;
+        line.push(b'\n');
+        let mut w = s;
+        w.write_all(&line).await.ok()?;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            if rd.read_line(&mut buf).await.ok()? == 0 {
+                return None;
+            }
+            if let Ok(agentlan_proto::ipc::IpcOut::Response(r)) = serde_json::from_str(buf.trim())
+                && r.id == id
+            {
+                return r.ok.then(|| r.result.unwrap_or(serde_json::Value::Null));
+            }
+        }
+    }
+    let t = Duration::from_secs(3);
+    let Ok(name) = ipc_name(home) else { return NodeCheck::Current };
+    let Ok(Ok(s)) = tokio::time::timeout(t, Stream::connect(name)).await else { return NodeCheck::Current };
+    let mut rd = BufReader::new(&s);
+    let Ok(Some(st)) = tokio::time::timeout(t, ask(&mut rd, &s, 1, agentlan_proto::ipc::IpcOp::Status)).await else { return NodeCheck::Current };
+    let me = env!("CARGO_PKG_VERSION");
+    let Some(running) = st["version"].as_str().map(String::from) else {
+        return NodeCheck::Outdated { running: None, with_hub: false };
+    };
+    if !version_older(&running, me) {
+        return NodeCheck::Current;
+    }
+    let with_hub = st["withHub"] == true;
+    let busy = st["sessions"].as_array().is_none_or(|a| !a.is_empty()) || st["wakesRunning"].as_u64().is_none_or(|n| n > 0);
+    if with_hub || busy {
+        return NodeCheck::Outdated { running: Some(running), with_hub };
+    }
+    if !matches!(tokio::time::timeout(t, ask(&mut rd, &s, 2, agentlan_proto::ipc::IpcOp::Shutdown)).await, Ok(Some(_))) {
+        return NodeCheck::Outdated { running: Some(running), with_hub };
+    }
+    drop(rd);
+    drop(s);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while is_running(home).await && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    match ensure_running(home).await {
+        Ok(_) => {
+            info!("node: restarted on {me} (was {running})");
+            NodeCheck::Restarted { from: running }
+        }
+        Err(e) => {
+            tracing::warn!("node: stopped the outdated node ({running}) but couldn't start it again: {e:#}");
+            NodeCheck::Outdated { running: Some(running), with_hub }
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn versions_order_like_semver() {
+        assert!(version_older("0.2.0-beta.4", "0.2.0-beta.5"));
+        assert!(version_older("0.2.0-beta.9", "0.2.0-beta.10"), "numeric, not lexical");
+        assert!(version_older("0.2.0-beta.5", "0.2.0"));
+        assert!(version_older("0.1.0", "0.2.0-beta.1"));
+        assert!(version_older("v0.2.0-alpha.1", "0.2.0-beta.1"));
+        assert!(!version_older("0.2.0", "0.2.0-beta.5"));
+        assert!(!version_older("0.2.0-beta.5", "0.2.0-beta.5"));
+        assert!(!version_older("0.3.0", "0.2.9"));
+        assert!(!version_older("garbage", "0.2.0"), "unparsable: no action");
+        assert!(!version_older("0.2.0", "garbage"));
+    }
+}
+
 /// Parent process id of this process (the host that launched it).
 pub fn parent_pid() -> Option<u32> {
     ancestor_pids(1).into_iter().next()
@@ -415,6 +577,17 @@ fn env_ms(name: &str, default: u64) -> u64 {
 
 /// Run the node daemon until stopped.
 pub async fn run(home: &Path) -> Result<()> {
+    run_opts(home, RunOpts::default()).await
+}
+
+/// How a node runs: on its own (`agentlan node run`, `agentlan connect`) or inside the
+/// server process (`agentlan up`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunOpts {
+    pub with_hub: bool,
+}
+
+pub async fn run_opts(home: &Path, opts: RunOpts) -> Result<()> {
     let cfg = load_config(home)?;
     let dir = node_dir(home);
     ensure_private_dir(&dir)?;
@@ -429,7 +602,8 @@ pub async fn run(home: &Path) -> Result<()> {
         move || machine_info(share)
     })
     .await?;
-    let st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx, cmd_tx.clone(), tokio::runtime::Handle::current())?;
+    let mut st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx, cmd_tx.clone(), tokio::runtime::Handle::current())?;
+    st.with_hub = opts.with_hub;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx, stop_tx))?;
 

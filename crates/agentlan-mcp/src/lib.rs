@@ -1048,6 +1048,16 @@ impl ServerHandler for Adapter {
         if self.worker && !WORKER_TOOLS.contains(&request.name.as_ref()) {
             return Ok(self.error("NOT_AVAILABLE", &format!("'{}' isn't available to a woken worker", request.name)).into());
         }
-        Ok(self.dispatch(&request.name, args, &context.ct).await.into())
+        let mut r = self.dispatch(&request.name, args, &context.ct).await;
+        // Say so where an agent looks at its connection: the PC's node outlived an upgrade.
+        if matches!(request.name.as_ref(), "whoami" | "connect" | "register")
+            && let Some(note) = client::node_note()
+        {
+            r.content.push(ContentBlock::text(note.clone()));
+            if let Some(Value::Object(m)) = r.structured_content.as_mut() {
+                m.insert("nodeNote".into(), Value::String(note));
+            }
+        }
+        Ok(r.into())
     }
 }

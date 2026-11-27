@@ -143,7 +143,10 @@ The installer downloads the prebuilt binary for your machine from [Releases](htt
 
 Prebuilt binaries cover macOS (Apple Silicon and Intel), Linux (x64 and ARM64; static, so any distro) and Windows x64.
 
-**Upgrading:** run the same line again; AgentLAN can keep running while you do. Copies that are already running keep the old version until they restart, so afterwards run `agentlan node stop`, restart your agent sessions, and restart `agentlan up` on the server PC.
+**Upgrading:** run the same line again; AgentLAN can keep running while you do. Copies that are already running keep the old version until they restart:
+- **The background node** is restarted on the new version by the next agent session or `agentlan connect`, as long as no other session is using it. From 0.2.0-beta.5 on, nodes report their version. Otherwise `whoami`, `connect`, `register` and `agentlan status` tell you it's outdated and what to run (`agentlan node stop` once the other sessions are closed). Older nodes don't report a version, so they're only reported, never restarted.
+- **A node inside `agentlan up`** is never restarted automatically; restart `agentlan up`.
+- **Agent sessions** keep their old MCP server until you restart them.
 
 **Options:**
 - **Pin a version:** `AGENTLAN_VERSION=v0.1.0`

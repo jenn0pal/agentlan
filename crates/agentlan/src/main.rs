@@ -473,11 +473,14 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             println!("\nOn each other PC, run (code valid 15 min; `agentlan hub invite` makes more):\n\n  agentlan connect {}\n", code.encode());
             println!("Agents connect from their session through the agentlan MCP tools (`connect`, then `register`).");
             if node_up {
-                println!("(this PC's node was already running and keeps running)");
+                match agentlan_node::refresh_outdated(home).await.note() {
+                    Some(n) => println!("(this PC's node was already running) {n}"),
+                    None => println!("(this PC's node was already running and keeps running)"),
+                }
                 hub_task.await??;
             } else {
                 let node_home = home.to_path_buf();
-                let node_task = tokio::spawn(async move { agentlan_node::run(&node_home).await });
+                let node_task = tokio::spawn(async move { agentlan_node::run_opts(&node_home, agentlan_node::RunOpts { with_hub: true }).await });
                 tokio::select! {
                     r = &mut hub_task => r??,
                     r = node_task => {
@@ -492,7 +495,11 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         Cmd::Connect { code, alias } => {
             if node_running(home).await {
                 let cfg = agentlan_node::load_config(home)?;
-                println!("✓ this PC's node is already running (network '{}' as {})", cfg.net, cfg.alias);
+                let check = agentlan_node::refresh_outdated(home).await;
+                match check.note() {
+                    Some(n) => println!("✓ this PC's node is running (network '{}' as {})\n{n}", cfg.net, cfg.alias),
+                    None => println!("✓ this PC's node is already running (network '{}' as {})", cfg.net, cfg.alias),
+                }
                 return Ok(());
             }
             match agentlan_node::load_config(home) {
@@ -564,16 +571,26 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         Cmd::Status { json } => {
             let v = call(home, IpcOp::Status).await?;
             print_value(&v, json, |v| {
-                format!(
-                    "machine {} ({})  net {}\nserver: {}  seq {}  outbox {}  sessions {}",
+                let mut s = format!(
+                    "machine {} ({})  net {}\nserver: {}  seq {}  outbox {}  sessions {}\nnode {}",
                     v["alias"].as_str().unwrap_or("?"),
                     v["machineId"].as_str().unwrap_or("?"),
                     v["net"].as_str().unwrap_or("?"),
                     v["hub"].as_str().unwrap_or("?"),
                     v["seq"],
                     v["outbox"],
-                    v["sessions"].as_array().map(|a| a.len()).unwrap_or(0)
-                )
+                    v["sessions"].as_array().map(|a| a.len()).unwrap_or(0),
+                    v["version"].as_str().unwrap_or("(older; doesn't report its version)"),
+                );
+                // Report only: `status` never restarts anything.
+                let running = v["version"].as_str().map(String::from);
+                if running.as_deref().is_none_or(|r| agentlan_node::version_older(r, env!("CARGO_PKG_VERSION"))) {
+                    let check = agentlan_node::NodeCheck::Outdated { running, with_hub: v["withHub"] == true };
+                    if let Some(n) = check.note() {
+                        s.push_str(&format!("\n{n}"));
+                    }
+                }
+                s
             });
         }
         Cmd::Ls { project, role, json } => {

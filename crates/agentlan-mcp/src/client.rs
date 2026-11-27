@@ -66,6 +66,15 @@ async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io:
     w.write_all(line).await
 }
 
+static NODE_CHECKED: AtomicBool = AtomicBool::new(false);
+static NODE_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// What this adapter found about the PC's node version when it first connected: that it
+/// updated an outdated node, or that one is still running and how to update it.
+pub fn node_note() -> Option<String> {
+    NODE_NOTE.lock().unwrap().clone()
+}
+
 /// Where new-mail pushes for an identity go (the adapter's live delivery): (name, data).
 pub type PushSink = tokio::sync::mpsc::UnboundedSender<(String, Value)>;
 
@@ -108,6 +117,15 @@ impl NodeClient {
     }
 
     async fn open(&self) -> Result<(Live, Value)> {
+        // Once per adapter process: a node left running on an older version by an upgrade
+        // is restarted on this binary if nothing uses it, or reported (see `node_note`).
+        if !NODE_CHECKED.swap(true, Ordering::SeqCst) && agentlan_node::is_running(&self.home).await {
+            let check = agentlan_node::refresh_outdated(&self.home).await;
+            if let Some(n) = check.note() {
+                tracing::info!("{n}");
+                *NODE_NOTE.lock().unwrap() = Some(n);
+            }
+        }
         // A PC that has joined gets its node started on demand (it keeps running after
         // this session ends); one that hasn't must `connect` with a join code first.
         if !agentlan_node::is_running(&self.home).await {

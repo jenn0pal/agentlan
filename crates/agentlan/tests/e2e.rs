@@ -108,7 +108,18 @@ impl Env {
     }
 
     fn start_node(&mut self, home: &str) -> usize {
-        let idx = self.spawn(home, &["node", "run"]);
+        self.start_node_with(home, &[])
+    }
+
+    /// `node run` with extra environment for that process only.
+    fn start_node_with(&mut self, home: &str, env: &[(&str, &str)]) -> usize {
+        let log = std::fs::File::create(self.root.join(format!("{home}-{}.log", self.kids.len()))).unwrap();
+        let mut cmd = self.cmd(home, &["node", "run"]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        self.kids.push(cmd.stdout(Stdio::null()).stderr(log).spawn().unwrap());
+        let idx = self.kids.len() - 1;
         let h = self.home(home);
         wait_until("node IPC up", Duration::from_secs(10), || self.cmd_ok(&h));
         idx
@@ -1326,4 +1337,84 @@ fn live_delivery_pushes_a_channel_pointer() {
     assert!(content.contains("1 new message for lead") && content.contains("peer@pc-one") && content.contains("intent request"), "{content}");
     assert!(!content.contains("SECRET BODY"), "pointer only: {content}");
     assert_eq!(n["params"]["meta"]["from"], "peer@pc-one", "{n}");
+}
+
+/// After an upgrade the old node keeps running. A newer adapter restarts it on the new
+/// binary when nothing uses it, only reports it when a session does, and leaves a newer
+/// node alone.
+#[test]
+fn outdated_node_is_restarted_only_when_idle() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code"]);
+    e.run("n1", &["agent", "add", "ci-bot", "--role", "ci", "--runner", "script"]);
+    let me = env!("CARGO_PKG_VERSION");
+    let note = |w: &Value| w["structuredContent"]["nodeNote"].as_str().unwrap_or("").to_string();
+
+    // 1. Older and idle: restarted on this binary.
+    let old = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "0.0.1")]);
+    assert_eq!(e.status("n1")["version"], "0.0.1");
+    let ai = e.kids.len();
+    let mut a = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    a.init();
+    let w = a.tool("whoami", serde_json::json!({}));
+    assert!(note(&w).contains("Updated this PC's AgentLAN node") && note(&w).contains("0.0.1"), "{w}");
+    assert_eq!(e.status("n1")["version"], me, "the node now runs this binary");
+    assert!(e.kids[old].try_wait().unwrap().is_some(), "the old node process exited");
+    e.kill(ai);
+    e.run("n1", &["node", "stop"]); // the restarted node isn't one of the harness's children
+
+    // 2. Older, but a session is attached: left running and reported.
+    let old2 = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "0.0.1")]);
+    let _bot = e.stream("n1", &["attach", "ci-bot", "--json"]);
+    wait_until("ci-bot attached", T, || e.status("n1")["sessions"].as_array().is_some_and(|a| a.len() == 1));
+    let bi = e.kids.len();
+    let mut b = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    b.init();
+    let w = b.tool("whoami", serde_json::json!({}));
+    assert!(note(&w).contains("still running 0.0.1") && note(&w).contains("agentlan node stop"), "{w}");
+    assert_eq!(e.status("n1")["version"], "0.0.1", "not restarted under a session");
+    let txt = String::from_utf8(e.run("n1", &["status"]).stdout).unwrap();
+    assert!(txt.contains("node 0.0.1") && txt.contains("still running 0.0.1"), "{txt}");
+    e.kill(bi);
+    e.kill(bi - 1); // the attach stream
+    e.kill(old2);
+
+    // 3. Newer than this binary: left alone, nothing to report.
+    let newer = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "99.0.0")]);
+    let ci = e.kids.len();
+    let mut c = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    c.init();
+    let w = c.tool("whoami", serde_json::json!({}));
+    assert_eq!(note(&w), "", "{w}");
+    assert_eq!(e.status("n1")["version"], "99.0.0");
+    e.kill(ci);
+    e.kill(newer);
+}
+
+/// A node inside `agentlan up` is never stopped by a newer adapter (that would leave a new
+/// node next to an old server): it's reported, with the restart to do.
+#[test]
+fn outdated_node_inside_up_is_only_reported() {
+    let mut e = Env::new();
+    let addr = e.addr();
+    let up = e
+        .cmd("srv", &["up", "--name", "e2e", "--listen", &addr, "--advertise", &addr, "--alias", "pc-srv"])
+        .env("AGENTLAN_DEV_NODE_VERSION", "0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    e.kids.push(up);
+    let srv = e.home("srv");
+    wait_until("server node up", T, || e.cmd_ok(&srv));
+    let st = e.status("srv");
+    assert_eq!((st["version"].as_str(), st["withHub"].as_bool()), (Some("0.0.1"), Some(true)), "{st}");
+    e.run("srv", &["agent", "add", "lead", "--role", "lead", "--runner", "claude-code"]);
+    let mut a = Mcp::spawn(&mut e, "srv", "lead", "claude-code");
+    a.init();
+    let w = a.tool("whoami", serde_json::json!({}));
+    let note = w["structuredContent"]["nodeNote"].as_str().unwrap_or("");
+    assert!(note.contains("restart `agentlan up`"), "{w}");
+    assert_eq!(e.status("srv")["version"], "0.0.1", "left running");
 }
