@@ -145,7 +145,8 @@ enum Cmd {
     /// timeline, conversations, and (on the server PC) the network view. Reachable only
     /// from this PC, through the link it prints.
     Dashboard {
-        /// Port on 127.0.0.1 (default: any free port).
+        /// Port on 127.0.0.1 (default: a new free port each time, which is safer: with a fixed
+        /// port, a browser tab left open from an earlier run shares the new run's origin).
         #[arg(long, default_value_t = 0)]
         port: u16,
     },

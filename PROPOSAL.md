@@ -1232,6 +1232,15 @@ Where the code differs from this spec, and why:
   - **Expired messages:** their text isn't shown.
   - **Read-only:** the reader no longer falls back to a read-write open.
   - **Not a bug:** that same-PC deliveries aren't recorded as received. The `sent` row lists the local recipients.
+- **Codex security review of the dashboard:** 8 findings. Seven are fixed; one is documented.
+  - **Connection flooding:** at most 32 connections at once, a 5 s header deadline, and the server keeps running after a failed accept.
+  - **Memory:** network reads take only the fields shown from each message, via `json_extract`. The full envelope is read only for message text, which is capped at 20,000 characters; subjects are capped at 300.
+  - **Network cursor:** follows the hub's order (message rowid, delivery update time, event seq) instead of the sender's `createdAt`, and the thread filter runs in SQL.
+  - **Local follow:** reads forward from the cursor with no `MAX(seq)` shortcut, and `incremental` is its own flag, so cursor 0 works.
+  - **Page:** one poll at a time; replies from an older view or filter, or for another conversation, are dropped; peer ids are kept in a `Map`.
+  - **Ids:** message, thread, reply and task ids are capped at 256 bytes (`MAX_ID_LEN`).
+  - **Parsing:** strict request line, a repeated `Host` or `Authorization` is refused, the size is checked at the end of the headers, and leftover input is drained before a 431 so Windows doesn't reset the connection.
+  - **Documented, not fixed:** a fixed `--port` shares one browser origin across runs, so a tab left open from an earlier run could read the new link. The default random port avoids this.
 - **Found while testing the dashboard:** `send --reply-to` started a new thread. The node now continues the original's thread when the caller didn't choose one; the MCP `reply` tool always did.
 
 **v0.2.0-beta.5 (2026-11-27), fixes from the real test:**

@@ -178,6 +178,9 @@ impl std::fmt::Display for AmfError {
 }
 impl std::error::Error for AmfError {}
 
+/// Longest message, thread, reply or task id accepted.
+pub const MAX_ID_LEN: usize = 256;
+
 pub fn intent_ok(i: &str) -> bool {
     INTENTS.contains(&i) || (i.starts_with("x-") && i.len() > 2)
 }
@@ -227,6 +230,13 @@ impl Amf {
         }
         if !intent_ok(&self.intent) {
             return bad(format!("unknown intent '{}' (custom intents use x-<name>)", self.intent));
+        }
+        // Ids are references, not content: bounded, so a reply can always carry them and
+        // viewers can put them in a URL.
+        for (what, v) in [("id", Some(&self.id)), ("threadId", Some(&self.thread_id)), ("inReplyTo", self.in_reply_to.as_ref()), ("taskId", self.task_id.as_ref())] {
+            if v.is_some_and(|v| v.len() > MAX_ID_LEN) {
+                return bad(format!("{what} is longer than {MAX_ID_LEN} bytes"));
+            }
         }
         for p in &self.parts {
             p.validate().map_err(AmfError::Invalid)?;
@@ -360,6 +370,10 @@ mod tests {
         assert!(bad_part.validate().is_err());
         let bad_intent = SendDraft { to: Some(Target::All), text: Some("a".into()), intent: Some("ack".into()), ..Default::default() };
         assert!(bad_intent.into_amf(from(), 24).is_err(), "ack is transport-level, not an intent");
+        let long_thread = SendDraft { to: Some(Target::All), text: Some("a".into()), thread_id: Some("t".repeat(MAX_ID_LEN + 1)), ..Default::default() };
+        assert!(long_thread.into_amf(from(), 24).is_err(), "ids are bounded");
+        let ok_thread = SendDraft { to: Some(Target::All), text: Some("a".into()), thread_id: Some("t".repeat(MAX_ID_LEN)), ..Default::default() };
+        assert!(ok_thread.into_amf(from(), 24).is_ok());
         assert!(Target::parse("@qa@studio").unwrap().is_direct());
     }
 }

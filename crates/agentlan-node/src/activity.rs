@@ -32,8 +32,13 @@ pub struct ActivityRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct LogFilter {
-    /// Only rows after this sequence number (for following).
+    /// Read forward from `after_seq` (this PC) or `net_after` (network) instead of the
+    /// newest rows.
+    pub incremental: bool,
+    /// This PC: only rows after this sequence number (with `incremental`).
     pub after_seq: i64,
+    /// The network view: the cursor from the previous page (with `incremental`).
+    pub net_after: Option<String>,
     /// Only rows at or after this time (RFC 3339).
     pub since: Option<String>,
     /// Only rows about this agent: a name, `name@machine` or `agt_…`.
@@ -52,9 +57,19 @@ pub struct Page {
     pub rows: Vec<ActivityRow>,
     /// This PC's log: the highest sequence number covered (pass as `after_seq`).
     pub cursor: i64,
-    /// The network view: the newest time covered (pass as `since`; rows at exactly this
-    /// time can come again, so dedupe them).
-    pub cursor_ts: String,
+    /// The network view: where to continue (pass as `net_after`). Delivery updates at the
+    /// boundary time can come again, so dedupe them.
+    pub net_cursor: String,
+    /// The page was full: read again from the cursor before waiting.
+    pub more: bool,
+}
+
+/// Longest subject and message text a reader returns.
+pub(crate) const MAX_SUBJECT: usize = 300;
+const MAX_TEXT: usize = 20_000;
+
+pub(crate) fn cap(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
 }
 
 /// Open a database read-only (no migration, no writes). A WAL database needs its shared
@@ -99,7 +114,7 @@ fn envelope_text(env: &str) -> Option<String> {
         .iter()
         .filter_map(|p| p["text"].as_str().map(String::from).or_else(|| p["url"].as_str().map(|u| format!("<{u}>"))).or_else(|| p.get("data").map(|d| d.to_string())))
         .collect();
-    (!t.is_empty()).then(|| t.join("\n"))
+    (!t.is_empty()).then(|| cap(&t.join("\n"), MAX_TEXT))
 }
 
 fn local_row(r: &agentlan_store::rusqlite::Row) -> agentlan_store::rusqlite::Result<ActivityRow> {
@@ -129,18 +144,16 @@ pub fn read_local(home: &Path, f: &LogFilter) -> Result<Page> {
     let limit = f.limit.max(1);
     let keep = |r: &ActivityRow| f.agent.as_deref().is_none_or(|who| mentions(r, who));
     let mut page = Page::default();
-    if f.after_seq > 0 {
+    if f.incremental {
+        // Rows are committed in sequence order by the node (one writer), so reading
+        // forward from the cursor never skips one.
         let mut st = c.prepare(
             "SELECT seq, ts, kind, agent, msg_id, thread_id, body FROM activity
              WHERE seq > ?1 AND ts >= ?2 AND (?3 IS NULL OR thread_id = ?3) ORDER BY seq ASC LIMIT ?4",
         )?;
         let rows: Vec<ActivityRow> = st.query_map(params![f.after_seq, since, f.thread, limit as i64], local_row)?.collect::<Result<_, _>>()?;
+        page.more = rows.len() == limit;
         page.cursor = rows.last().map(|r| r.seq).unwrap_or(f.after_seq);
-        // Rows the time/thread filter skipped still move the cursor.
-        if rows.len() < limit {
-            let max: Option<i64> = c.query_row("SELECT MAX(seq) FROM activity", [], |r| r.get(0))?;
-            page.cursor = page.cursor.max(max.unwrap_or(0));
-        }
         page.rows = rows.into_iter().filter(keep).collect();
     } else {
         let top: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM activity", [], |r| r.get(0))?;
@@ -176,9 +189,13 @@ pub fn read_local(home: &Path, f: &LogFilter) -> Result<Page> {
 
 /// The server's view of traffic between PCs (on the server PC only): messages the hub
 /// relayed, each recipient's latest delivery state (stored, seen, handled, expired; the
-/// hub keeps only the latest), and who came online or went offline. Everything since
-/// `since`, newest `limit` rows, oldest first. Sequence numbers are only an order within
-/// this page; follow by `cursor_ts`.
+/// hub keeps only the latest), and who came online or went offline.
+///
+/// Without `incremental`: the newest `limit` rows since `since`, oldest first. With it:
+/// what came after `net_after`. The cursor follows the hub's own order (insertion order
+/// of messages, the hub's delivery-update times, event sequence numbers), never a
+/// sender-supplied time. Only the fields shown are read from each message; the text only
+/// with `with_text`.
 pub fn read_network(home: &Path, f: &LogFilter) -> Result<Page> {
     let path = home.join("hub").join("hub.db");
     if !path.exists() {
@@ -193,41 +210,74 @@ pub fn read_network(home: &Path, f: &LogFilter) -> Result<Page> {
         st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<_, _>>()?
     };
     let name = |id: &str| names.get(id).cloned().unwrap_or_else(|| id.to_string());
-    let thread_ok = |v: &Value| f.thread.is_none() || v["threadId"].as_str() == f.thread.as_deref();
+    // Cursor: (last message rowid, last delivery update time, last event seq).
+    let (mut m_cur, mut d_cur, mut e_cur): (i64, String, i64) = match (&f.net_after, f.incremental) {
+        (Some(cur), true) => {
+            let mut it = cur.splitn(3, '|');
+            (it.next().and_then(|x| x.parse().ok()).unwrap_or(0), it.next().unwrap_or("").to_string(), it.next().and_then(|x| x.parse().ok()).unwrap_or(0))
+        }
+        _ => (
+            c.query_row("SELECT COALESCE(MAX(rowid), 0) FROM messages", [], |r| r.get(0))?,
+            c.query_row("SELECT COALESCE(MAX(updated), '') FROM deliveries", [], |r| r.get(0))?,
+            c.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?,
+        ),
+    };
+    let (m_top, d_top, e_top) = (m_cur, d_cur.clone(), e_cur);
+    let inc = f.incremental;
     let mut rows = vec![];
+    let mut full = false;
+    let msg_cols = "json_extract(m.envelope,'$.from.handle'), json_extract(m.envelope,'$.from.agent'), json_extract(m.envelope,'$.intent'),
+         substr(json_extract(m.envelope,'$.subject'), 1, 301), json_extract(m.envelope,'$.threadId'), json(json_extract(m.envelope,'$.to')),
+         json_extract(m.envelope,'$.inReplyTo')";
+    let thread_sql = "(?3 IS NULL OR json_extract(m.envelope,'$.threadId') = ?3)";
+    type MsgCols = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+    let msg_cols_of = |r: &agentlan_store::rusqlite::Row, i: usize| -> agentlan_store::rusqlite::Result<MsgCols> {
+        Ok((r.get(i)?, r.get(i + 1)?, r.get(i + 2)?, r.get(i + 3)?, r.get(i + 4)?, r.get(i + 5)?, r.get(i + 6)?))
+    };
     {
-        let mut st = c.prepare("SELECT msg_id, envelope, created_at FROM messages WHERE created_at >= ?1 ORDER BY created_at DESC LIMIT ?2")?;
-        let msgs: Vec<(String, String, String)> = st.query_map(params![since, lim], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        let sql = if inc {
+            format!("SELECT m.rowid, m.msg_id, m.created_at, {msg_cols}, CASE WHEN ?4 THEN m.envelope END FROM messages m WHERE m.rowid > ?1 AND m.created_at >= ?2 AND {thread_sql} ORDER BY m.rowid ASC LIMIT ?5")
+        } else {
+            format!("SELECT m.rowid, m.msg_id, m.created_at, {msg_cols}, CASE WHEN ?4 THEN m.envelope END FROM messages m WHERE m.rowid <= ?1 AND m.created_at >= ?2 AND {thread_sql} ORDER BY m.rowid DESC LIMIT ?5")
+        };
+        let mut st = c.prepare(&sql)?;
+        let found: Vec<(i64, String, String, MsgCols, Option<String>)> = st
+            .query_map(params![m_cur, since, f.thread, f.with_text, lim], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, msg_cols_of(r, 3)?, r.get(10)?)))?
+            .collect::<Result<_, _>>()?;
+        full |= found.len() as i64 == lim;
         let mut rc = c.prepare("SELECT recipient FROM deliveries WHERE msg_id=?1")?;
-        for (id, env, at) in msgs {
-            let v: Value = serde_json::from_str(&env).unwrap_or(Value::Null);
-            if !thread_ok(&v) {
-                continue;
+        for (rowid, id, at, (from, from_agent, intent, subject, thread, to, in_reply), env) in found {
+            if inc {
+                m_cur = m_cur.max(rowid);
             }
             let recipients: Vec<String> = rc.query_map(params![id], |r| r.get::<_, String>(0))?.filter_map(|x| x.ok()).map(|x| name(&x)).collect();
+            let to: Value = to.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null);
             rows.push(ActivityRow {
                 seq: 0,
                 ts: at,
                 kind: "message".into(),
-                agent: v["from"]["agent"].as_str().map(String::from),
+                agent: from_agent,
                 msg_id: Some(id),
-                thread_id: v["threadId"].as_str().map(String::from),
-                body: json!({"from": v["from"]["handle"], "to": v["to"], "intent": v["intent"], "subject": v["subject"], "inReplyTo": v["inReplyTo"], "recipients": recipients}),
-                text: if f.with_text { envelope_text(&env) } else { None },
+                thread_id: thread,
+                body: json!({"from": from, "to": to, "intent": intent, "subject": subject, "inReplyTo": in_reply, "recipients": recipients}),
+                text: env.as_deref().and_then(envelope_text),
             });
         }
     }
     {
-        let mut st = c.prepare(
-            "SELECT d.msg_id, d.recipient, d.state, d.updated, m.envelope FROM deliveries d LEFT JOIN messages m USING(msg_id)
-             WHERE d.updated >= ?1 ORDER BY d.updated DESC LIMIT ?2",
-        )?;
-        let dels: Vec<(String, String, String, String, Option<String>)> =
-            st.query_map(params![since, lim], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
-        for (id, rcpt, state, updated, env) in dels {
-            let v: Value = env.as_deref().and_then(|e| serde_json::from_str(e).ok()).unwrap_or(Value::Null);
-            if !thread_ok(&v) {
-                continue;
+        let sql = if inc {
+            format!("SELECT d.msg_id, d.recipient, d.state, d.updated, {msg_cols} FROM deliveries d LEFT JOIN messages m USING(msg_id) WHERE d.updated >= ?1 AND d.updated >= ?2 AND {thread_sql} AND ?4 = ?4 ORDER BY d.updated ASC LIMIT ?5")
+        } else {
+            format!("SELECT d.msg_id, d.recipient, d.state, d.updated, {msg_cols} FROM deliveries d LEFT JOIN messages m USING(msg_id) WHERE d.updated <= ?1 AND d.updated >= ?2 AND {thread_sql} AND ?4 = ?4 ORDER BY d.updated DESC LIMIT ?5")
+        };
+        let mut st = c.prepare(&sql)?;
+        let found: Vec<(String, String, String, String, MsgCols)> = st
+            .query_map(params![d_cur, since, f.thread, true, lim], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, msg_cols_of(r, 4)?)))?
+            .collect::<Result<_, _>>()?;
+        full |= found.len() as i64 == lim;
+        for (id, rcpt, state, updated, (from, _, intent, subject, thread, _, _)) in found {
+            if inc && updated > d_cur {
+                d_cur = updated.clone();
             }
             rows.push(ActivityRow {
                 seq: 0,
@@ -235,16 +285,25 @@ pub fn read_network(home: &Path, f: &LogFilter) -> Result<Page> {
                 kind: "delivery".into(),
                 agent: Some(rcpt.clone()),
                 msg_id: Some(id),
-                thread_id: v["threadId"].as_str().map(String::from),
-                body: json!({"handle": name(&rcpt), "state": state, "from": v["from"]["handle"], "subject": v["subject"], "intent": v["intent"]}),
+                thread_id: thread,
+                body: json!({"handle": name(&rcpt), "state": state, "from": from, "subject": subject, "intent": intent}),
                 text: None,
             });
         }
     }
     if f.thread.is_none() {
-        let mut st = c.prepare("SELECT ts, body FROM events WHERE ts >= ?1 ORDER BY seq DESC LIMIT ?2")?;
-        let evs: Vec<(String, String)> = st.query_map(params![since, lim], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-        for (ts, body) in evs {
+        let sql = if inc {
+            "SELECT seq, ts, body FROM events WHERE seq > ?1 AND ts >= ?2 ORDER BY seq ASC LIMIT ?3"
+        } else {
+            "SELECT seq, ts, body FROM events WHERE seq <= ?1 AND ts >= ?2 ORDER BY seq DESC LIMIT ?3"
+        };
+        let mut st = c.prepare(sql)?;
+        let evs: Vec<(i64, String, String)> = st.query_map(params![e_cur, since, lim], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        full |= evs.len() as i64 == lim;
+        for (seq, ts, body) in evs {
+            if inc {
+                e_cur = e_cur.max(seq);
+            }
             let mut b: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             // Profile and hardware refreshes on every reconnect are noise here.
             if matches!(b["kind"].as_str(), Some("updated" | "machine_updated")) {
@@ -256,16 +315,18 @@ pub fn read_network(home: &Path, f: &LogFilter) -> Result<Page> {
             rows.push(ActivityRow { seq: 0, ts, kind: "roster".into(), agent: None, msg_id: None, thread_id: None, body: b, text: None });
         }
     }
-    let cursor_ts = rows.iter().map(|r| r.ts.clone()).max().unwrap_or_else(|| since.clone());
-    // Time order; a message before its own delivery states.
+    // Time order for display; a message before its own delivery states.
     rows.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| (a.kind != "message").cmp(&(b.kind != "message"))));
     if let Some(who) = &f.agent {
         rows.retain(|r| mentions(r, who));
     }
-    let skip = rows.len().saturating_sub(lim as usize);
-    let mut rows = rows.split_off(skip);
+    if !inc {
+        let skip = rows.len().saturating_sub(lim as usize);
+        rows = rows.split_off(skip);
+        (m_cur, d_cur, e_cur) = (m_top, d_top, e_top);
+    }
     for (i, r) in rows.iter_mut().enumerate() {
         r.seq = i as i64 + 1;
     }
-    Ok(Page { rows, cursor: 0, cursor_ts })
+    Ok(Page { rows, cursor: 0, net_cursor: format!("{m_cur}|{d_cur}|{e_cur}"), more: inc && full })
 }

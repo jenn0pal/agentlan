@@ -1457,6 +1457,35 @@ fn log_shows_the_timeline() {
     let _ = f.kill();
     let _ = f.wait();
     assert!(found, "--follow printed the new send");
+
+    // The network view: a thread filter, and following new traffic by the hub's order.
+    let net = log_rows(&e, "hub", &["--network", "--json", "--thread", &thread]);
+    assert!(!net.is_empty() && net.iter().all(|r| r["threadId"] == thread.as_str()), "{net:?}");
+    let mut nf = e.cmd("hub", &["log", "--network", "--follow", "--json", "-n", "1"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let out = nf.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    let first = rx.recv_timeout(T).expect("the newest network row");
+    std::thread::sleep(Duration::from_millis(700));
+    back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "subject": "network-followed", "text": "hi"}));
+    let t0 = Instant::now();
+    let (mut msg, mut extra) = (false, 0);
+    while t0.elapsed() < T && !msg {
+        if let Ok(v) = rx.recv_timeout(Duration::from_millis(500)) {
+            msg |= v["kind"] == "message" && v["body"]["subject"] == "network-followed";
+            extra += usize::from(v["ts"].as_str() < first["ts"].as_str());
+        }
+    }
+    let _ = nf.kill();
+    let _ = nf.wait();
+    assert!(msg, "--network --follow printed the new message");
+    assert_eq!(extra, 0, "following doesn't replay older history");
 }
 
 /// After an upgrade the old node keeps running. A newer adapter restarts it on the new
@@ -1612,6 +1641,10 @@ fn dashboard_serves_only_this_pc() {
     assert!(get("/api/activity", &format!("evil.example:{port}"), Some(key)).0.contains("403"), "foreign Host");
     let (st, _, _) = http(port, &format!("POST /api/activity HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Length: 0\r\n\r\n"));
     assert!(st.contains("405"), "{st}");
+    let (st, _, _) = http(port, &format!("GET /api/activity HTTP/1.1\r\nHost: {addr}\r\nHost: evil.example\r\nAuthorization: Bearer {key}\r\n\r\n"));
+    assert!(st.contains("400"), "a repeated Host is refused: {st}");
+    let (st, _, _) = http(port, &format!("GET / HTTP/1.1\r\nHost: {addr}\r\nX-Pad: {}\r\n\r\n", "a".repeat(20_000)));
+    assert!(st.contains("431"), "oversized headers: {st}");
     let mut b = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
     b.init();
     let (st, _, body) = get("/api/activity?limit=50", addr, Some(key));

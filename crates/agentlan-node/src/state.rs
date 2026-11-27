@@ -860,7 +860,7 @@ impl NodeState {
             o.entry("from").or_insert_with(|| json!(m.from.handle.clone().unwrap_or_else(|| m.from.agent.clone())));
             o.entry("intent").or_insert_with(|| json!(m.intent));
             if let Some(sub) = &m.subject {
-                o.entry("subject").or_insert_with(|| json!(sub));
+                o.entry("subject").or_insert_with(|| json!(crate::activity::cap(sub, crate::activity::MAX_SUBJECT)));
             }
             if let Some(r) = &m.in_reply_to {
                 o.entry("inReplyTo").or_insert_with(|| json!(r));

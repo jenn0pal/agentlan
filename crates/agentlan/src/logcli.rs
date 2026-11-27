@@ -179,12 +179,12 @@ pub fn render(r: &ActivityRow) -> String {
 
 pub async fn run(home: &Path, a: LogArgs) -> Result<()> {
     let mut f = LogFilter {
-        after_seq: 0,
         since: a.since.as_deref().map(parse_since).transpose()?,
         agent: a.agent.clone(),
         thread: a.thread.clone(),
         limit: a.limit,
         with_text: a.body,
+        ..Default::default()
     };
     let read = |f: &LogFilter| if a.network { activity::read_network(home, f) } else { activity::read_local(home, f) };
     let print = |r: &ActivityRow| {
@@ -198,44 +198,38 @@ pub async fn run(home: &Path, a: LogArgs) -> Result<()> {
     if page.rows.is_empty() && !a.follow && !a.json {
         println!("(nothing recorded{})", if f.since.is_some() || f.agent.is_some() || f.thread.is_some() { " that matches" } else { " yet" });
     }
-    // The network view: a delivery's state changes in place, so follow it by time and drop
-    // repeats at the boundary. Intermediate states between two polls aren't kept by the hub.
-    let key = |r: &ActivityRow| format!("{}|{}|{}|{}|{}", r.kind, r.ts, r.msg_id.as_deref().unwrap_or(""), r.agent.as_deref().unwrap_or(""), r.body["state"]);
-    let mut seen: HashSet<String> = page.rows.iter().map(key).collect();
     for r in &page.rows {
         print(r);
     }
     if !a.follow {
         return Ok(());
     }
-    let (mut cursor, mut cursor_ts) = (page.cursor, page.cursor_ts);
+    // Continue from the cursors of that same read, a page at a time (nothing skipped).
+    // The network view can repeat delivery updates at the boundary time: drop repeats.
+    let key = |r: &ActivityRow| format!("{}|{}|{}|{}|{}", r.kind, r.ts, r.msg_id.as_deref().unwrap_or(""), r.agent.as_deref().unwrap_or(""), r.body["state"]);
+    let mut seen: HashSet<String> = HashSet::new();
+    f.incremental = true;
     f.limit = 1000;
+    f.after_seq = page.cursor;
+    f.net_after = Some(page.net_cursor);
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if a.network {
-            f.since = Some(cursor_ts.clone());
-            let Ok(p) = read(&f) else { continue };
+        loop {
+            let Ok(p) = read(&f) else { break }; // e.g. the node restarting
             for r in &p.rows {
-                if seen.insert(key(r)) {
+                if !a.network || seen.insert(key(r)) {
                     print(r);
                 }
             }
-            if p.cursor_ts > cursor_ts {
-                cursor_ts = p.cursor_ts;
-                seen.retain(|k| k.split('|').nth(1).is_some_and(|ts| ts >= cursor_ts.as_str()));
+            f.after_seq = p.cursor;
+            if a.network {
+                // Keep only what can still repeat: updates at the boundary time.
+                let boundary = p.net_cursor.split('|').nth(1).unwrap_or("").to_string();
+                seen.retain(|k| k.split('|').nth(1).is_some_and(|ts| ts >= boundary.as_str()));
+                f.net_after = Some(p.net_cursor);
             }
-        } else {
-            // Drain everything after the cursor, a page at a time (none skipped).
-            loop {
-                f.after_seq = cursor.max(1);
-                let Ok(p) = read(&f) else { break }; // e.g. the node restarting
-                for r in &p.rows {
-                    print(r);
-                }
-                if p.cursor <= cursor {
-                    break;
-                }
-                cursor = p.cursor;
+            if !p.more {
+                break;
             }
         }
     }

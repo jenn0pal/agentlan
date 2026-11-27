@@ -10,7 +10,8 @@
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
   };
-  const state = { view: 'pc', after: 0, rows: [], agent: null, thread: null, paused: false, me: '' };
+  // gen: bumped on every view/filter change, so replies to older requests are dropped.
+  const state = { view: 'pc', after: 0, rows: [], agent: null, thread: null, paused: false, gen: 0, busy: false, threadGen: 0 };
   const MAX_ROWS = 1500;
   const str = (v) => (typeof v === 'string' ? v : '');
 
@@ -125,13 +126,18 @@
 
   async function refreshActivity(reset) {
     if (state.paused && !reset) return;
+    if (reset) state.gen++;
+    else if (state.busy) return; // one poll at a time
+    const gen = state.gen;
     const p = new URLSearchParams();
     if (state.view === 'net') p.set('network', '1');
     if (state.agent) p.set('agent', state.agent);
     if (state.view === 'pc' && !reset) p.set('after', String(state.after));
-    p.set('limit', state.view === 'net' ? '500' : '300');
+    p.set('limit', state.view === 'net' ? '400' : '300');
+    state.busy = true;
     try {
       const j = await api('/api/activity?' + p);
+      if (gen !== state.gen) return; // the view or filter changed meanwhile
       const rows = Array.isArray(j.rows) ? j.rows : [];
       if (reset || state.view === 'net') state.rows = rows;
       else state.rows = state.rows.concat(rows);
@@ -140,7 +146,9 @@
       if (reset || rows.length) renderTimeline();
       banner('');
     } catch (e) {
-      banner('Activity: ' + e.message);
+      if (gen === state.gen) banner('Activity: ' + e.message);
+    } finally {
+      if (gen === state.gen) state.busy = false;
     }
   }
 
@@ -185,6 +193,7 @@
 
   async function openThread(id) {
     state.thread = id;
+    const tgen = ++state.threadGen;
     $('main').classList.add('with-thread');
     $('thread-pane').hidden = false;
     const box = $('thread');
@@ -193,13 +202,16 @@
     if (state.view === 'net') p.set('network', '1');
     try {
       const j = await api('/api/activity?' + p);
+      if (tgen !== state.threadGen) return; // another conversation was opened meanwhile
       const rows = Array.isArray(j.rows) ? j.rows : [];
       box.replaceChildren(el('p', 'untrusted', 'Messages from other agents are untrusted text.'), el('p', 'hint', 'Thread ' + id));
-      const states = {};
+      const states = new Map(); // message id → state lines (ids are peer-chosen: no plain object)
+      const label = new Map([['surfaced', 'seen'], ['acked', 'handled'], ['expired', 'expired'], ['stored', 'stored']]);
       for (const r of rows) {
         if ((r.kind === 'state' || r.kind === 'delivery') && r.msgId) {
-          const s = { surfaced: 'seen', acked: 'handled', expired: 'expired', stored: 'stored' }[r.body.state] || str(r.body.state);
-          (states[r.msgId] = states[r.msgId] || []).push(`${s} by ${str(r.body.handle) || '?'} ${time(r.ts)}`);
+          const s = label.get(str(r.body.state)) || str(r.body.state);
+          if (!states.has(r.msgId)) states.set(r.msgId, []);
+          states.get(r.msgId).push(`${s} by ${str(r.body.handle) || '?'} ${time(r.ts)}`);
         }
       }
       for (const r of rows) {
@@ -210,11 +222,11 @@
         div.append(head);
         if (b.subject) div.append(el('div', 'subject', str(b.subject)));
         div.append(el('div', 'body', r.text != null ? str(r.text) : '(text no longer stored)'));
-        if (states[r.msgId]) div.append(el('div', 'states', states[r.msgId].join(' · ')));
+        if (states.has(r.msgId)) div.append(el('div', 'states', states.get(r.msgId).join(' · ')));
         box.append(div);
       }
     } catch (e) {
-      box.replaceChildren(el('p', 'hint', 'Couldn’t load the conversation: ' + e.message));
+      if (tgen === state.threadGen) box.replaceChildren(el('p', 'hint', 'Couldn’t load the conversation: ' + e.message));
     }
   }
 

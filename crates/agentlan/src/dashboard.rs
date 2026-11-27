@@ -22,6 +22,10 @@ const INDEX: &str = include_str!("dashboard/index.html");
 const APP_JS: &str = include_str!("dashboard/app.js");
 const STYLE: &str = include_str!("dashboard/style.css");
 const MAX_REQUEST: usize = 16 * 1024;
+/// At most this many connections at once (the page needs a handful); more wait to be accepted.
+const MAX_CONNECTIONS: usize = 32;
+/// A request's headers must arrive within this.
+const HEADER_DEADLINE: Duration = Duration::from_secs(5);
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 pub async fn run(home: &Path, port: u16) -> Result<()> {
@@ -33,11 +37,23 @@ pub async fn run(home: &Path, port: u16) -> Result<()> {
     println!("AgentLAN dashboard (this PC only): http://127.0.0.1:{port}/#{key}");
     println!("Open that link in a browser; keep this running (Ctrl-C stops it).");
     let home: PathBuf = home.to_path_buf();
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (sock, _) = listener.accept().await?;
+        // Bounded: idle or slow connections can't use up this process's file handles.
+        let permit = slots.clone().acquire_owned().await?;
+        let sock = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                // e.g. out of file handles for a moment: wait and keep serving.
+                tracing::debug!("dashboard: accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let (home, key) = (home.clone(), key.clone());
         tokio::spawn(async move {
             let _ = tokio::time::timeout(Duration::from_secs(15), handle(sock, &home, &key, port)).await;
+            drop(permit);
         });
     }
 }
@@ -78,20 +94,25 @@ fn parse(raw: &[u8]) -> Option<Request> {
     let mut lines = text.split("\r\n");
     let mut first = lines.next()?.split(' ');
     let (method, target, version) = (first.next()?, first.next()?, first.next()?);
-    if !version.starts_with("HTTP/1.") {
+    if first.next().is_some() || !matches!(version, "HTTP/1.1" | "HTTP/1.0") || !target.starts_with('/') {
         return None;
     }
     let (path, q) = target.split_once('?').unwrap_or((target, ""));
     let query = q.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (pct_decode(k), pct_decode(v))).collect();
-    let (mut host, mut auth) = (String::new(), String::new());
+    let (mut host, mut auth) = (None::<String>, None::<String>);
     for l in lines.take_while(|l| !l.is_empty()) {
-        let Some((k, v)) = l.split_once(':') else { continue };
-        match k.trim().to_ascii_lowercase().as_str() {
-            "host" => host = v.trim().to_ascii_lowercase(),
-            "authorization" => auth = v.trim().to_string(),
-            _ => {}
+        let (k, v) = l.split_once(':')?;
+        let slot = match k.trim().to_ascii_lowercase().as_str() {
+            "host" => &mut host,
+            "authorization" => &mut auth,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return None; // a repeated Host or Authorization header is ambiguous: refuse
         }
+        *slot = Some(v.trim().to_string());
     }
+    let (host, auth) = (host.unwrap_or_default().to_ascii_lowercase(), auth.unwrap_or_default());
     Some(Request { method: method.to_string(), path: path.to_string(), query, host, auth })
 }
 
@@ -120,16 +141,41 @@ async fn json_reply(sock: &mut TcpStream, code: &str, v: &Value) {
 async fn handle(mut sock: TcpStream, home: &Path, key: &str, port: u16) {
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
-    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-        if buf.len() > MAX_REQUEST {
-            return respond(&mut sock, "431 Request Header Fields Too Large", "text/plain", b"too large").await;
+    let read_head = async {
+        loop {
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Some(end);
+            }
+            if buf.len() > MAX_REQUEST {
+                return None;
+            }
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return Some(usize::MAX),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
         }
-        match sock.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+    };
+    let end = match tokio::time::timeout(HEADER_DEADLINE, read_head).await {
+        Ok(Some(usize::MAX)) | Err(_) => return, // closed, or too slow
+        Ok(Some(end)) if end <= MAX_REQUEST => end,
+        Ok(_) => {
+            respond(&mut sock, "431 Request Header Fields Too Large", "text/plain", b"too large").await;
+            // Read what the client is still sending before closing, so the close isn't a reset
+            // (Windows drops the response on a reset); bounded in time and size.
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                let mut left = 256 * 1024;
+                while left > 0 {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => left -= n.min(left),
+                    }
+                }
+            })
+            .await;
+            return;
         }
-    }
-    let Some(req) = parse(&buf) else {
+    };
+    let Some(req) = parse(&buf[..end + 4]) else {
         return respond(&mut sock, "400 Bad Request", "text/plain", b"bad request").await;
     };
     // Only this address (a page on another site can't reach us through DNS rebinding).
@@ -161,13 +207,16 @@ async fn handle(mut sock: TcpStream, home: &Path, key: &str, port: u16) {
         }
         "/api/agents" => crate::call(home, IpcOp::ListAgents { project: None, role: None }).await.map_err(|e| format!("{e:#}")),
         "/api/activity" => {
+            // `after` present (even 0): read forward from that cursor; absent: the newest rows.
+            let after = req.query.iter().find(|(n, _)| n == "after").map(|(_, v)| v.parse::<i64>().unwrap_or(0));
             let f = LogFilter {
-                after_seq: q("after").and_then(|v| v.parse().ok()).unwrap_or(0),
-                since: None,
+                incremental: after.is_some(),
+                after_seq: after.unwrap_or(0),
                 agent: q("agent"),
                 thread: q("thread"),
-                limit: q("limit").and_then(|v| v.parse().ok()).unwrap_or(300).min(2000),
+                limit: q("limit").and_then(|v| v.parse().ok()).unwrap_or(300).min(1000),
                 with_text: q("body").as_deref() == Some("1"),
+                ..Default::default()
             };
             let network = q("network").as_deref() == Some("1");
             let home = home.to_path_buf();
@@ -196,6 +245,9 @@ mod tests {
         assert_eq!(r.query, vec![("after".to_string(), "5".to_string()), ("agent".to_string(), "co@pc x".to_string())]);
         assert!(key_ok(&r.auth, "abc") && !key_ok(&r.auth, "abd") && !key_ok("abc", "abc") && !key_ok("Bearer ab", "abc"));
         assert!(parse(b"GARBAGE\r\n\r\n").is_none());
+        assert!(parse(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n").is_none(), "duplicate Host");
+        assert!(parse(b"GET / HTTP/1.1\r\nAuthorization: Bearer a\r\nauthorization: Bearer b\r\n\r\n").is_none(), "duplicate Authorization");
+        assert!(parse(b"GET / HTTP/1.9\r\n\r\n").is_none() && parse(b"GET / HTTP/1.1 x\r\n\r\n").is_none() && parse(b"GET x HTTP/1.1\r\n\r\n").is_none());
         assert_eq!(pct_decode("100%"), "100%");
         assert_eq!(pct_decode("%zz"), "%zz");
     }
