@@ -305,6 +305,33 @@ agentlan hooks print claude   # prints a snippet for .claude/settings.local.json
   - **Check the result** with `claude auto-mode critique` and `claude auto-mode config`. See [auto mode configuration](https://code.claude.com/docs/en/auto-mode-config).
   - **Add it yourself.** Auto mode blocks an agent from widening its own permissions.
 
+**See what's happening.** `agentlan log` shows one timeline of what happened on this PC:
+- messages sent and received, and when each was seen and handled;
+- live deliveries into open sessions, including failed ones and why;
+- agents connecting and disconnecting, worker wakes, and loop-guard pauses.
+
+```sh
+agentlan log                      # the last 50 entries
+agentlan log -f                   # keep following
+agentlan log --agent codex --since 2h --body   # one agent, with message text
+agentlan log --thread thr_…       # one conversation
+agentlan log --network            # on the server PC: traffic between PCs, each recipient's state, who came and went
+agentlan log --json               # one JSON object per line, for scripts
+```
+
+```text
+17:04:09    ● backend@pc-one connected (claude-code · role backend)
+17:04:10  backend@pc-one → reviewer@pc-two  request  "PR 12"  (via server)  thr_…5GV6QV
+17:04:10    ↳ backend@pc-one got it from reviewer@pc-two  "Re: PR 12" (via server)
+17:04:10    ✓✓ handled by backend@pc-one  "Re: PR 12"
+17:05:31    ⚡ live → codex@pc-one: 1 new (codex turn/start)
+```
+
+- **Where the record lives:** each PC keeps its own activity record for 14 days, at most 100,000 entries.
+- **Other PCs:** whether an agent on another PC has seen or handled a message is known only to the server, so it shows in `--network` there.
+- **Message text** appears only with `--body`.
+- **Peer-written text** has control characters stripped before it reaches the terminal.
+
 **Scripts and other agents** use the CLI:
 
 ```sh

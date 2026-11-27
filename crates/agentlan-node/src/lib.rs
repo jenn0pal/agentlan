@@ -2,6 +2,7 @@
 //! link, routes same-machine messages locally (no LAN, no hub), keeps durable
 //! inboxes/outbox, and serves local clients over IPC.
 
+pub mod activity;
 mod ipc;
 mod link;
 pub mod netif;
@@ -633,6 +634,7 @@ pub async fn run_opts(home: &Path, opts: RunOpts) -> Result<()> {
     .await?;
     let mut st = state::NodeState::new(home.to_path_buf(), db, cfg.clone(), reported, ctl_tx, cmd_tx.clone(), tokio::runtime::Handle::current())?;
     st.with_hub = opts.with_hub;
+    st.activity("node", None, None, serde_json::json!({"status": "started", "version": node_version(), "withHub": opts.with_hub, "pid": std::process::id()}));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     std::thread::Builder::new().name("agentlan-node-state".into()).spawn(move || st.run(cmd_rx, stop_tx))?;
 

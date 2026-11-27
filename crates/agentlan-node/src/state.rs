@@ -33,7 +33,14 @@ CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEX
 CREATE TABLE IF NOT EXISTS budget(key TEXT NOT NULL, window INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(key, window));
 CREATE TABLE IF NOT EXISTS paused(key TEXT PRIMARY KEY, paused_at TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS request_recipients(msg_id TEXT NOT NULL, agent_id TEXT NOT NULL, PRIMARY KEY(msg_id, agent_id));
+CREATE TABLE IF NOT EXISTS activity(seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, kind TEXT NOT NULL,
+  agent TEXT, msg_id TEXT, thread_id TEXT, body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS activity_thread ON activity(thread_id);
 "#;
+
+/// How long and how much activity history a node keeps (`agentlan log`).
+const ACTIVITY_DAYS: i64 = 14;
+const ACTIVITY_MAX_ROWS: i64 = 100_000;
 
 /// Loop-guard limits (cost/safety brake; agents run as the same OS user, so this is
 /// not a security boundary). Overridable via env for tests and tuning.
@@ -186,6 +193,8 @@ pub struct NodeState {
     stopping: bool,
     /// Runs inside `agentlan up` (same process as the server).
     pub(crate) with_hub: bool,
+    /// When the activity log was last pruned.
+    activity_pruned: Instant,
     /// Worker wake: due time per agent (debounced), in-flight wakes, and agents that got
     /// new mail while their wake was running.
     wake_due: HashMap<String, Instant>,
@@ -280,6 +289,7 @@ impl NodeState {
             inflight: HashMap::new(),
             stopping: false,
             with_hub: false,
+            activity_pruned: Instant::now(),
             wake_due: HashMap::new(),
             wake_inflight: HashMap::new(),
             wake_again: HashSet::new(),
@@ -296,6 +306,7 @@ impl NodeState {
             }
             if self.stopping {
                 info!("node: stopping (requested over IPC)");
+                self.activity("node", None, None, json!({"status": "stopped"}));
                 // Stop running wakes (dropping a wake kills its agent process).
                 for (_, (_, h)) in self.wake_inflight.drain() {
                     h.abort();
@@ -797,6 +808,10 @@ impl NodeState {
 
     fn tick(&mut self) {
         let now_i = Instant::now();
+        if now_i.duration_since(self.activity_pruned) >= Duration::from_secs(60) {
+            self.activity_pruned = now_i;
+            self.prune_activity();
+        }
         let (expired, keep): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.deadline <= now_i);
         self.waiters = keep;
         for w in expired {
@@ -809,6 +824,53 @@ impl NodeState {
         let late: Vec<String> = self.pending.iter().filter(|(_, p)| p.deadline <= now_i).map(|(k, _)| k.clone()).collect();
         for m in late {
             self.finish_pending(&m, RemoteResult::Queued);
+        }
+    }
+
+    // ------------------------------------------------------------------ activity log
+
+    /// Record one activity row for `agentlan log`. Rows are self-contained (sender, intent,
+    /// subject, thread copied in) because messages expire. Best-effort: a failure is
+    /// logged, never allowed to fail the operation it describes.
+    pub(crate) fn activity(&self, kind: &str, agent: Option<&str>, msg: Option<&Amf>, mut body: Value) {
+        if let (Some(m), Value::Object(o)) = (msg, &mut body) {
+            o.entry("from").or_insert_with(|| json!(m.from.handle.clone().unwrap_or_else(|| m.from.agent.clone())));
+            o.entry("intent").or_insert_with(|| json!(m.intent));
+            if let Some(sub) = &m.subject {
+                o.entry("subject").or_insert_with(|| json!(sub));
+            }
+            if let Some(r) = &m.in_reply_to {
+                o.entry("inReplyTo").or_insert_with(|| json!(r));
+            }
+        }
+        if let (Some(a), Value::Object(o)) = (agent, &mut body)
+            && !o.contains_key("handle")
+            && let Some(p) = self.profiles.iter().find(|p| p.agent_id == a)
+        {
+            o.insert("handle".into(), json!(self.handle_of(p)));
+        }
+        let r = self.db.execute(
+            "INSERT INTO activity(ts, kind, agent, msg_id, thread_id, body) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![now().to_rfc3339(), kind, agent, msg.map(|m| m.id.as_str()), msg.map(|m| m.thread_id.as_str()), body.to_string()],
+        );
+        if let Err(e) = r {
+            debug!("activity: couldn't record {kind}: {e}");
+        }
+    }
+
+    /// The stored envelope of a message, if it hasn't expired.
+    fn envelope(&self, msg_id: &str) -> Option<Amf> {
+        let env: Option<String> = self.db.query_row("SELECT envelope FROM messages WHERE msg_id=?1", params![msg_id], |r| r.get(0)).optional().ok().flatten();
+        env.and_then(|e| serde_json::from_str(&e).ok())
+    }
+
+    fn prune_activity(&self) {
+        let cutoff = (now() - chrono::Duration::days(ACTIVITY_DAYS)).to_rfc3339();
+        let r = self.db.execute("DELETE FROM activity WHERE ts < ?1", params![cutoff]).and_then(|_| {
+            self.db.execute("DELETE FROM activity WHERE seq <= (SELECT MAX(seq) FROM activity) - ?1", params![ACTIVITY_MAX_ROWS])
+        });
+        if let Err(e) = r {
+            debug!("activity: prune failed: {e}");
         }
     }
 
@@ -827,6 +889,7 @@ impl NodeState {
         let Some(s) = self.sessions.remove(agent_id) else {
             return;
         };
+        self.activity("session", Some(agent_id), None, json!({"status": "ended", "reason": reason}));
         if let Err(e) = self.wake_followup(agent_id) {
             warn!("wake: follow-up check failed: {e:#}");
         }
@@ -884,6 +947,9 @@ impl NodeState {
             )?;
         }
         tx.commit()?;
+        if n > 0 {
+            self.activity("received", Some(agent), Some(env), json!({"remote": remote}));
+        }
         Ok(n > 0)
     }
 
@@ -912,6 +978,10 @@ impl NodeState {
             )?;
         }
         tx.commit()?;
+        match self.envelope(msg_id) {
+            Some(env) => self.activity("state", Some(agent), Some(&env), json!({"state": ds(state)})),
+            None => self.activity("state", Some(agent), None, json!({"state": ds(state), "msgId": msg_id})),
+        }
         Ok(())
     }
 
@@ -1034,6 +1104,21 @@ impl NodeState {
                 }
                 self.stopping = busy.is_empty();
                 Ok(Some(json!({"stopping": self.stopping, "busy": busy})))
+            }
+            IpcOp::Report { kind, data } => {
+                // Only what clients alone know (an adapter's live delivery), attributed to the
+                // identity attached on this connection; fields whitelisted and bounded.
+                let a = self.conns.get(&conn).and_then(|c| c.attached.clone()).ok_or(IpcErr("NOT_ATTACHED", "report on an attached connection".into()))?;
+                if kind != "live" {
+                    return Err(IpcErr("INVALID", format!("unknown report kind '{kind}'")));
+                }
+                let short = |k: &str, n: usize| data[k].as_str().map(|s| s.chars().take(n).collect::<String>());
+                let body = json!({
+                    "count": data["count"].as_u64(), "ok": data["ok"].as_bool(),
+                    "how": short("how", 80), "error": short("error", 300), "from": short("from", 120), "intent": short("intent", 40),
+                });
+                self.activity("live", Some(&a), None, body);
+                Ok(Some(json!({"recorded": true})))
             }
             IpcOp::Detach => {
                 let a = self.conns.get(&conn).and_then(|c| c.attached.clone()).ok_or(IpcErr("NOT_ATTACHED", "not attached".into()))?;
@@ -1223,6 +1308,7 @@ impl NodeState {
                 tx.execute("DELETE FROM budget WHERE key=?1", params![key])?;
                 tx.commit()?;
                 info!("node: {key} resumed by a human");
+                self.activity("resume", None, None, json!({"key": key}));
                 Ok(Some(json!({"resumed": true, "key": key})))
             }
             IpcOp::CancelWait { req_id } => {
@@ -1285,6 +1371,12 @@ impl NodeState {
             self.send_live(NodeToHub::AgentUp { session_id: sid.clone(), profile: p.clone() });
         }
         info!("node: {} attached (runner {:?}, pid {:?})", self.handle_of(&p), runner, pid);
+        self.activity(
+            "session",
+            Some(&p.agent_id),
+            None,
+            json!({"status": "attached", "runner": runner, "role": p.role, "project": p.project, "description": p.description, "takeover": takeover}),
+        );
         Ok(json!({
             "agent": rec, "sessionId": sid, "provisional": true,
             "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
@@ -1354,6 +1446,7 @@ impl NodeState {
             let rec = self.local_record(&p);
             self.push_local_roster("updated", &rec, Some(conn));
             self.register_changed_profiles();
+            self.activity("session", Some(&p.agent_id), None, json!({"status": "updated", "role": p.role, "project": p.project, "description": p.description}));
             return Ok(json!({
                 "agent": rec, "updated": true, "created": false,
                 "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "hub": self.hub_label(),
@@ -1459,6 +1552,7 @@ impl NodeState {
     }
 
     fn record_wake(&self, agent: &str, rev: Option<u64>, outcome: &str, seconds: f64, session: Option<Option<String>>) {
+        self.activity("wake", Some(agent), None, json!({"phase": "finished", "outcome": outcome, "seconds": seconds}));
         let rec = crate::wake::WakeRecord { at: now().to_rfc3339(), outcome: outcome.to_string(), seconds };
         let r = crate::update_wake(&self.home, |wf| {
             // Only into the configuration this wake ran with (not one re-enabled meanwhile).
@@ -1533,6 +1627,7 @@ impl NodeState {
                 let result = crate::wake::run(job, exe).await;
                 let _ = tx.send(NCmd::WakeDone { agent_id: id, result });
             });
+            self.activity("wake", Some(&agent), None, json!({"phase": "started"}));
             self.wake_inflight.insert(agent, (now_i, h.abort_handle()));
         }
         Ok(())
@@ -1568,8 +1663,11 @@ impl NodeState {
     }
 
     fn pause(&self, key: &str, reason: &str) -> Result<()> {
-        self.db.execute("INSERT OR IGNORE INTO paused(key, paused_at, reason) VALUES(?1,?2,?3)", params![key, now().to_rfc3339(), reason])?;
+        let n = self.db.execute("INSERT OR IGNORE INTO paused(key, paused_at, reason) VALUES(?1,?2,?3)", params![key, now().to_rfc3339(), reason])?;
         warn!("node: loop guard paused {key}");
+        if n > 0 {
+            self.activity("pause", None, None, json!({"key": key, "reason": reason}));
+        }
         Ok(())
     }
 
@@ -1845,6 +1943,9 @@ impl NodeState {
             }
             tx.commit()?;
         }
+        let recipients: Vec<String> =
+            local_ids.iter().map(|id| self.profiles.iter().find(|p| &p.agent_id == id).map(|p| self.handle_of(p)).unwrap_or_else(|| id.clone())).collect();
+        self.activity("sent", Some(&env.from.agent), Some(&env), json!({"to": env.to, "localRecipients": recipients, "remote": needs_remote}));
         Ok(Ok(Committed { env, result, needs_remote, local_ids }))
     }
 

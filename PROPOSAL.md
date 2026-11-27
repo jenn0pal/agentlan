@@ -1202,6 +1202,21 @@ Where the code differs from this spec, and why:
   - When a real window closes, its server exits: only the open session's server remained under a daemon that had hosted earlier sessions.
   - A conversation started over the daemon API and abandoned without unsubscribing kept its server running until it was stopped.
 
+**v0.2.0-beta.6 (in progress): seeing what happens (user request: "some logs or anything that we can observe and view interactions").**
+- **Activity table (`node.db`):** each node records sent, received, state (seen/handled/expired), session (connected/role change/disconnected), wake (started/finished/skipped), pause/resume, and node start/stop.
+  - **Self-contained rows:** sender, intent, subject and thread are copied in, because messages expire.
+  - **Best-effort:** a failed insert never fails the operation it describes.
+  - **Pruned to 14 days / 100,000 rows.**
+- **Live deliveries:** the adapter reports them with the new `Report { kind: "live" }` IPC op.
+  - **Attribution:** sent on the identity's own connection, so it's attributed to the attached agent.
+  - **Limits:** fields are whitelisted and bounded. The report is detached, with a 3 s timeout. Older nodes answer `BAD_REQUEST`, which is ignored.
+  - **Failures:** the hourly cap and an unknown Codex thread are recorded too.
+  - **Honest label:** Claude is recorded as "pointer sent", not "woke".
+- **`agentlan log`:** reads the databases read-only, without migrating them.
+  - **Options:** `-f`, `--agent`, `--thread`, `--since`, `-n`, `--body`, `--json`.
+  - **`--network` (server PC):** reads `hub.db`: messages, each recipient's latest delivery state, and roster changes. Read/handled receipts from other PCs reach only the hub.
+  - **Terminal safety:** peer text is stripped of control characters and bidi overrides.
+
 **v0.2.0-beta.5 (2026-11-27), fixes from the real test:**
 - **Answers are marked handled once returned.** Previously answers piled up in the inbox.
   - **`request`:** the reply it returns is acked unless it asks something back (`ask`, `request`, `handoff`) or uses a custom intent. The node has already matched that reply to the question, so a plain `chat` reply counts.

@@ -60,8 +60,26 @@ pub fn pointer(name: &str, count: u32, from: Option<&str>, intent: Option<&str>)
     )
 }
 
+/// Record a live-delivery attempt in the node's activity log (`agentlan log`), on the
+/// identity's own connection. Detached and time-limited: never holds up delivery. An
+/// older node answers an error for the unknown op, which is ignored.
+async fn report(idents: &Arc<tokio::sync::Mutex<Vec<crate::Ident>>>, name: &str, data: Value) {
+    let client = idents.lock().await.iter().find(|i| i.name == name).map(|i| i.client.clone());
+    if let Some(c) = client {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(3), c.call(agentlan_proto::ipc::IpcOp::Report { kind: "live".into(), data })).await;
+        });
+    }
+}
+
 /// The live-delivery loop for one adapter (all of its identities).
-pub async fn run(mut rx: mpsc::UnboundedReceiver<(String, Value)>, peer: Peer<RoleServer>, runner: Arc<OnceLock<Runner>>, codex_thread: Arc<Mutex<Option<String>>>) {
+pub(crate) async fn run(
+    mut rx: mpsc::UnboundedReceiver<(String, Value)>,
+    peer: Peer<RoleServer>,
+    runner: Arc<OnceLock<Runner>>,
+    codex_thread: Arc<Mutex<Option<String>>>,
+    idents: Arc<tokio::sync::Mutex<Vec<crate::Ident>>>,
+) {
     if disabled() {
         while rx.recv().await.is_some() {}
         return;
@@ -108,6 +126,7 @@ pub async fn run(mut rx: mpsc::UnboundedReceiver<(String, Value)>, peer: Peer<Ro
             }
             if h.1 >= PER_HOUR {
                 tracing::warn!("live: {name}: {PER_HOUR} live deliveries this hour; not pointing at more mail");
+                report(&idents, &name, json!({"ok": false, "count": b.count, "error": format!("reached {PER_HOUR} live deliveries this hour")})).await;
                 continue;
             }
             h.1 += 1;
@@ -127,7 +146,8 @@ pub async fn run(mut rx: mpsc::UnboundedReceiver<(String, Value)>, peer: Peer<Ro
                     });
                     peer.send_notification(ServerNotification::CustomNotification(CustomNotification::new("notifications/claude/channel", Some(params))))
                         .await
-                        .map(|_| "claude channel")
+                        // Claude Code drops it unless started with the channel enabled: sent, not "woke".
+                        .map(|_| "claude channel (pointer sent)")
                         .map_err(|e| anyhow!("{e}"))
                 }
                 Runner::Codex => {
@@ -139,9 +159,19 @@ pub async fn run(mut rx: mpsc::UnboundedReceiver<(String, Value)>, peer: Peer<Ro
                 }
                 Runner::Generic => Ok("none (this client has no push channel)"),
             };
+            if r == Runner::Generic {
+                continue; // nothing was attempted, so nothing to log
+            }
+            let (from, intent) = (b.from.as_deref().map(safe_handle), b.intent.as_deref().map(safe_intent));
             match res {
-                Ok(how) => tracing::info!("live: pointed {name} at {} new message(s) via {how}", b.count),
-                Err(e) => tracing::warn!("live: couldn't reach {name}'s session: {e:#}"),
+                Ok(how) => {
+                    tracing::info!("live: pointed {name} at {} new message(s) via {how}", b.count);
+                    report(&idents, &name, json!({"ok": true, "count": b.count, "how": how, "from": from, "intent": intent})).await;
+                }
+                Err(e) => {
+                    tracing::warn!("live: couldn't reach {name}'s session: {e:#}");
+                    report(&idents, &name, json!({"ok": false, "count": b.count, "error": format!("{e:#}"), "from": from, "intent": intent})).await;
+                }
             }
         }
     }

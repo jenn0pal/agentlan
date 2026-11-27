@@ -1,6 +1,7 @@
 //! `agentlan` — one binary: hub, node daemon and CLI client.
 
 mod hooks;
+mod logcli;
 mod wakecli;
 
 use std::io::Read;
@@ -107,6 +108,35 @@ enum Cmd {
     Watch {
         #[arg(long = "as")]
         as_agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What happened on this PC, as one timeline: messages and their delivery (seen,
+    /// handled), live deliveries into open sessions, agents connecting, worker wakes,
+    /// loop-guard pauses. With --network on the server PC: traffic between PCs.
+    Log {
+        /// Keep printing new activity as it happens.
+        #[arg(short, long)]
+        follow: bool,
+        /// The server's view of traffic between PCs (only on the PC that runs `agentlan up`).
+        #[arg(long)]
+        network: bool,
+        /// Only activity about this agent (name, name@machine or agt_…).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only this conversation thread (thr_…).
+        #[arg(long)]
+        thread: Option<String>,
+        /// Only since then: 30s, 15m, 2h, 3d or an RFC 3339 time.
+        #[arg(long)]
+        since: Option<String>,
+        /// How many recent entries to show first.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: usize,
+        /// Include the message text (peer-written; shown as plain text).
+        #[arg(long)]
+        body: bool,
+        /// One JSON object per line.
         #[arg(long)]
         json: bool,
     },
@@ -646,6 +676,9 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             stream(home, Some(IpcOp::Attach { agent, runner: Some("cli".into()), pid: Some(std::process::id()), host_pid: None, takeover }), json).await?
         }
         Cmd::Watch { as_agent, json } => stream(home, Some(IpcOp::Watch { agent: as_agent }), json).await?,
+        Cmd::Log { follow, network, agent, thread, since, limit, body, json } => {
+            logcli::run(home, logcli::LogArgs { follow, network, agent, thread, since, limit, body, json }).await?
+        }
         Cmd::Send { as_agent, target, text, subject, intent, id, reply_to, thread, stdin, json } => {
             let mut draft = if stdin || text.as_deref() == Some("-") {
                 let mut buf = String::new();
