@@ -66,11 +66,11 @@ async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io:
     w.write_all(line).await
 }
 
-static NODE_CHECK: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+static NODE_CHECK: tokio::sync::OnceCell<Option<agentlan_node::NodeCheck>> = tokio::sync::OnceCell::const_new();
 
 /// What this adapter found about the PC's node version when it first connected: that it
-/// updated an outdated node, or that one is still running and how to update it.
-pub fn node_note() -> Option<String> {
+/// updated an outdated node, or that one is still running.
+pub fn node_check() -> Option<agentlan_node::NodeCheck> {
     NODE_CHECK.get().cloned().flatten()
 }
 
@@ -126,11 +126,11 @@ impl NodeClient {
                 if !agentlan_node::is_running(&home).await {
                     return None;
                 }
-                let note = agentlan_node::refresh_outdated(&home).await.note();
-                if let Some(n) = &note {
+                let check = agentlan_node::refresh_outdated(&home).await;
+                if let Some(n) = check.note() {
                     tracing::info!("{n}");
                 }
-                note
+                Some(check)
             })
             .await;
         // A PC that has joined gets its node started on demand (it keeps running after

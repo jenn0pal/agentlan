@@ -696,7 +696,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             // One node operation: send + wait for the actual recipient's reply.
             let mut out = call(home, IpcOp::Request { as_agent: Some(as_agent.clone()), draft, timeout_ms: wait * 1000 }).await?;
             let id = out["sent"]["id"].as_str().unwrap_or_default().to_string();
-            let auto_ack = agentlan_proto::amf::is_answer(&out["reply"]);
+            let auto_ack = agentlan_proto::amf::is_answer(&out["reply"], true);
             out["autoAck"] = json!(auto_ack);
             print_value(&out, json, |o| {
                 // Index the Value (missing keys are Null), not the Map (missing keys panic).
@@ -709,7 +709,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             });
             // Only once it's been printed (a failed write panics before this).
             if auto_ack {
-                ack_answer(home, &as_agent, &out["reply"]).await;
+                ack_answer(home, &as_agent, &out["reply"], true).await;
             }
         }
         Cmd::Inbox { as_agent, limit, json } => {
@@ -785,7 +785,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         }
         Cmd::Wait { as_agent, timeout, json } => {
             let mut v = call(home, IpcOp::Wait { agent: Some(as_agent.clone()), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
-            let auto_ack = agentlan_proto::amf::is_answer(&v["message"]);
+            let auto_ack = agentlan_proto::amf::is_answer(&v["message"], false);
             v["autoAck"] = json!(auto_ack);
             print_value(&v, json, |v| {
                 let m = &v["message"]; // Value indexing: a missing subject is Null, not a panic
@@ -806,7 +806,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 }
             });
             if auto_ack {
-                ack_answer(home, &as_agent, &v["message"]).await;
+                ack_answer(home, &as_agent, &v["message"], false).await;
             }
         }
     }
@@ -815,8 +815,8 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
 
 /// Mark a returned answer handled (see `amf::is_answer`), as the MCP `request` and
 /// `wait_for_message` tools do. Called after it has been printed.
-async fn ack_answer(home: &Path, as_agent: &str, m: &Value) {
-    if let Some(mid) = m["id"].as_str().filter(|_| agentlan_proto::amf::is_answer(m)) {
+async fn ack_answer(home: &Path, as_agent: &str, m: &Value, matched: bool) {
+    if let Some(mid) = m["id"].as_str().filter(|_| agentlan_proto::amf::is_answer(m, matched)) {
         let _ = call(home, IpcOp::Ack { agent: Some(as_agent.to_string()), message_id: mid.to_string() }).await;
     }
 }

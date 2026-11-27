@@ -1358,11 +1358,20 @@ fn outdated_node_is_restarted_only_when_idle() {
     let mut a = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
     a.init();
     let w = a.tool("whoami", serde_json::json!({}));
-    assert!(note(&w).contains("Updated this PC's AgentLAN node") && note(&w).contains("0.0.1"), "{w}");
-    assert_eq!(e.status("n1")["version"], me, "the node now runs this binary");
-    assert!(e.kids[old].try_wait().unwrap().is_some(), "the old node process exited");
-    e.kill(ai);
-    e.run("n1", &["node", "stop"]); // the restarted node isn't one of the harness's children
+    if cfg!(windows) && note(&w).contains("can't start a node that outlives it") {
+        // This host's job object forbids breakaway (some CI runners): correctly left alone.
+        assert_eq!(e.status("n1")["version"], "0.0.1");
+        e.kill(ai);
+        e.kill(old);
+    } else {
+        assert!(note(&w).contains("Updated this PC's AgentLAN node") && note(&w).contains("0.0.1"), "{w}");
+        assert_eq!(e.status("n1")["version"], me, "the node now runs this binary");
+        assert!(e.kids[old].try_wait().unwrap().is_some(), "the old node process exited");
+        let w2 = a.tool("whoami", serde_json::json!({}));
+        assert_eq!(note(&w2), "", "the update note is shown once: {w2}");
+        e.kill(ai);
+        e.run("n1", &["node", "stop"]); // the restarted node isn't one of the harness's children
+    }
 
     // 2. Older, but a session is attached: left running and reported.
     let old2 = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "0.0.1")]);
@@ -1376,15 +1385,21 @@ fn outdated_node_is_restarted_only_when_idle() {
     assert_eq!(e.status("n1")["version"], "0.0.1", "not restarted under a session");
     let txt = String::from_utf8(e.run("n1", &["status"]).stdout).unwrap();
     assert!(txt.contains("node 0.0.1") && txt.contains("still running 0.0.1"), "{txt}");
-    e.kill(bi);
+    // The user follows the note (stops the old node; the adapter's next call starts a
+    // current one): the note goes away instead of going stale.
     e.kill(bi - 1); // the attach stream
-    e.kill(old2);
+    e.run("n1", &["node", "stop"]);
+    let w = b.tool("whoami", serde_json::json!({}));
+    assert_eq!(e.status("n1")["version"], me, "{w}");
+    assert_eq!(note(&w), "", "no stale note after the node was updated: {w}");
+    e.kill(bi);
+    e.run("n1", &["node", "stop"]);
+    let _ = old2;
 
     // 2b. Older, no session, but a script is waiting on it (`agentlan wait` doesn't attach).
     let old3 = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "0.0.1")]);
     let wi = e.spawn("n1", &["wait", "--as", "ci-bot", "--timeout", "30"]);
-    wait_until("the script's wait is registered", T, || e.status("n1")["sessions"].as_array().is_some_and(|a| a.is_empty()));
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("the script's wait is registered", T, || e.status("n1")["waiters"] == 1);
     let di = e.kids.len();
     let mut d = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
     d.init();

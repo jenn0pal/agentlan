@@ -1077,7 +1077,7 @@ impl NodeState {
                     "hub": self.hub_label(), "seq": self.base_seq, "outbox": outbox,
                     "profiles": self.profiles.len(), "sessions": sessions, "pausedThreads": paused,
                     // So a newer client can tell when this node outlived an upgrade, and whether it may restart it.
-                    "version": crate::node_version(), "pid": std::process::id(), "withHub": self.with_hub, "wakesRunning": self.wake_inflight.len(),
+                    "version": crate::node_version(), "pid": std::process::id(), "withHub": self.with_hub, "wakesRunning": self.wake_inflight.len(), "waiters": self.waiters.len(),
                 })))
             }
             IpcOp::ListAgents { project, role } => {

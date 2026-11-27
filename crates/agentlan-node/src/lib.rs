@@ -298,6 +298,9 @@ pub enum NodeCheck {
     Outdated { running: Option<String>, with_hub: bool },
     /// It was stopped, but no node of this version is running now.
     Failed { from: String, error: String },
+    /// Left alone because a node started from this session wouldn't outlive it (Windows,
+    /// a job object that forbids breakaway).
+    CantReplace { running: String },
 }
 
 impl NodeCheck {
@@ -315,6 +318,9 @@ impl NodeCheck {
             )),
             NodeCheck::Outdated { running: None, .. } => Some(format!(
                 "This PC's AgentLAN node is an older version than this {me} (from before nodes reported their version). Once other AgentLAN sessions are closed, run `agentlan node stop` (and restart `agentlan up` if this PC is the server)."
+            )),
+            NodeCheck::CantReplace { running } => Some(format!(
+                "This PC's AgentLAN node is still running {running} (this is {me}). This session can't start a node that outlives it, so it was left running: run `agentlan node stop`, then `agentlan connect` in a terminal."
             )),
             NodeCheck::Failed { from, error } => Some(format!(
                 "Stopped this PC's outdated AgentLAN node ({from}) to update it, but couldn't start {me}: {error}. Run `agentlan connect` to start it."
@@ -370,8 +376,11 @@ pub async fn refresh_outdated(home: &Path) -> NodeCheck {
     }
     let with_hub = st["withHub"] == true;
     let outdated = NodeCheck::Outdated { running: Some(running.clone()), with_hub };
-    if with_hub || !can_start_lasting_node() {
+    if with_hub {
         return outdated;
+    }
+    if !can_start_lasting_node() {
+        return NodeCheck::CantReplace { running };
     }
     let Ok(Ok(Some((r, _)))) = tokio::time::timeout(t, ipc_ask(home, IpcOp::ShutdownIfIdle, Some(conn))).await else { return outdated };
     if r["stopping"] != true {

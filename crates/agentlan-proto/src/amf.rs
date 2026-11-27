@@ -182,14 +182,20 @@ pub fn intent_ok(i: &str) -> bool {
     INTENTS.contains(&i) || (i.starts_with("x-") && i.len() > 2)
 }
 
-/// Is this message (AMF JSON) an answer: a reply (`inReplyTo` set) that asks nothing back
-/// (`result`, `status`, `error` or `chat`; a plain `send --reply-to` is `chat`)? An answer
-/// needs no further handling once the asker has it, so `request` and `wait_for_message`
-/// mark answers handled when they return them. Replies that ask, request or hand off
-/// something, custom intents, and anything that isn't a reply stay open until the agent
-/// replies or acks.
-pub fn is_answer(m: &Value) -> bool {
-    m["inReplyTo"].as_str().is_some_and(|s| !s.is_empty()) && matches!(m["intent"].as_str(), Some("result" | "status" | "error" | "chat"))
+/// Is this message (AMF JSON) an answer that needs no further handling once the asker has
+/// it? A reply (`inReplyTo` set) with intent `result`, `status` or `error`; and, when
+/// `matched` (the node itself matched it to the caller's request, as `request` does), also
+/// `chat`, which is what a plain `send --reply-to` uses. An unmatched `chat` could be a
+/// follow-up question, so it stays open. `request` and `wait_for_message` mark answers
+/// handled when they return them; asks, requests, handoffs, custom intents and
+/// non-replies stay open until the agent replies or acks.
+pub fn is_answer(m: &Value, matched: bool) -> bool {
+    m["inReplyTo"].as_str().is_some_and(|s| !s.is_empty())
+        && match m["intent"].as_str() {
+            Some("result" | "status" | "error") => true,
+            Some("chat") => matched,
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -199,14 +205,16 @@ mod answer_tests {
 
     #[test]
     fn answers_are_replies_that_ask_nothing_back() {
-        for i in ["result", "status", "error", "chat"] {
-            assert!(is_answer(&json!({"intent": i, "inReplyTo": "msg_1"})), "{i}");
+        for i in ["result", "status", "error"] {
+            assert!(is_answer(&json!({"intent": i, "inReplyTo": "msg_1"}), false), "{i}");
         }
+        assert!(is_answer(&json!({"intent": "chat", "inReplyTo": "msg_1"}), true), "a matched chat reply");
+        assert!(!is_answer(&json!({"intent": "chat", "inReplyTo": "msg_1"}), false), "an unmatched chat may be a follow-up question");
         for i in ["ask", "request", "handoff", "x-review"] {
-            assert!(!is_answer(&json!({"intent": i, "inReplyTo": "msg_1"})), "{i}");
+            assert!(!is_answer(&json!({"intent": i, "inReplyTo": "msg_1"}), true), "{i}");
         }
-        assert!(!is_answer(&json!({"intent": "result"})), "not a reply");
-        assert!(!is_answer(&json!({"intent": "result", "inReplyTo": ""})), "empty inReplyTo");
+        assert!(!is_answer(&json!({"intent": "result"}), true), "not a reply");
+        assert!(!is_answer(&json!({"intent": "result", "inReplyTo": ""}), true), "empty inReplyTo");
     }
 }
 

@@ -1203,7 +1203,10 @@ Where the code differs from this spec, and why:
   - A conversation started over the daemon API and abandoned without unsubscribing kept its server running until it was stopped.
 
 **v0.2.0-beta.5 (2026-11-27), fixes from the real test:**
-- **Answers are marked handled once returned.** A reply that asks nothing back (`inReplyTo` set, intent `result`, `status`, `error` or `chat`) is acked when `request` or `wait_for_message` (MCP or CLI) returns it. Previously answers piled up in the inbox. Asks, requests, handoffs, custom intents and non-replies stay open.
+- **Answers are marked handled once returned.** Previously answers piled up in the inbox.
+  - **`request`:** the reply it returns is acked unless it asks something back (`ask`, `request`, `handoff`) or uses a custom intent. The node has already matched that reply to the question, so a plain `chat` reply counts.
+  - **`wait_for_message` and CLI `wait`:** a reply is acked only with intent `result`, `status` or `error`. An unmatched `chat` with `inReplyTo` could be a follow-up question, so it stays open.
+  - Non-replies always stay open.
   - The MCP ack is detached and starts only after the tool result is built, so a cancelled call can't ack a message the agent never saw.
   - A handled answer can still be replied to by id.
 - **Outdated nodes after an upgrade:**
@@ -1223,6 +1226,11 @@ Where the code differs from this spec, and why:
   - **Windows breakaway:** checked before stopping the node.
   - **Unverified restarts:** the version that came up is now checked.
   - **Version ordering:** now uses the `semver` crate.
+- **Second-opinion review (Claude's advisor) of the fixed version:**
+  - The node note no longer goes stale: it's re-checked before showing, and the "updated" note is shown once.
+  - The no-breakaway Windows case gets its own wording.
+  - `chat` counts as an answer only on `request`.
+  - `Status` reports `waiters`.
 - **Safety:**
   - pointer only, with sender and intent sanitized;
   - batched, with at most one push per 10 s and 30 per hour per identity;
