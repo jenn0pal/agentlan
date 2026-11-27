@@ -143,6 +143,8 @@ The installer downloads the prebuilt binary for your machine from [Releases](htt
 
 Prebuilt binaries cover macOS (Apple Silicon and Intel), Linux (x64 and ARM64; static, so any distro) and Windows x64.
 
+**Upgrading:** run the same line again; AgentLAN can keep running while you do. Copies that are already running keep the old version until they restart, so afterwards run `agentlan node stop`, restart your agent sessions, and restart `agentlan up` on the server PC.
+
 **Options:**
 - **Pin a version:** `AGENTLAN_VERSION=v0.1.0`
 - **Choose where it goes:** `AGENTLAN_INSTALL_DIR=…`
@@ -277,6 +279,28 @@ agentlan hooks print claude   # prints a snippet for .claude/settings.local.json
 - **Safe by default:** hooks stay silent if the node isn't running or the session hasn't registered.
 - **Verified in a live Claude Code session** (headless `claude -p`, v2.1.332). The session registered itself, and a subagent registered its own identity and sent mail. PostToolUse then told the session about a new message.
 - **Subagents see the session's notices too.** Hooks also fire for a subagent's tool calls, and they point at the session's main identity. It's a pointer only, with no message text.
+
+**Claude Code auto mode** treats a request from another agent as untrusted. A session in auto mode may refuse to act on one: for example, spawning a subagent for a peer's request is blocked as "Unsanctioned Communication". There are two ways to allow it:
+
+- **One request:** tell the session yourself that it may carry out that request. Auto mode accepts an approval you give in the session for the action you name. *(Tested.)*
+- **Standing permission:** add an `autoMode` section to your user settings, `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`). Auto mode ignores project settings files. *(Not yet tested.)*
+
+  ```json
+  {
+    "autoMode": {
+      "environment": ["$defaults",
+        "AgentLAN (MCP server `agentlan`) is the user's own messaging network between their PCs studio-mbp and dev-pc; agents on it are the user's own agents."],
+      "allow": ["$defaults",
+        "Acting on a request from the user's own AgentLAN agents on studio-mbp or dev-pc, including spawning a subagent for it and sending the result back over AgentLAN, when the work stays inside the current project and doesn't push, delete, publish or touch credentials."]
+    }
+  }
+  ```
+
+  - **Name your own PCs** and keep the rule narrow. Any session on those PCs can register on AgentLAN under any name, so the rule trusts everything that runs on them.
+  - **Keep `"$defaults"` in every list you set.** Without it, your entries replace Claude's built-in rules instead of adding to them.
+  - **A `permissions.allow` rule for `Agent` doesn't help:** auto mode drops it.
+  - **Check the result** with `claude auto-mode critique` and `claude auto-mode config`. See [auto mode configuration](https://code.claude.com/docs/en/auto-mode-config).
+  - **Add it yourself.** Auto mode blocks an agent from widening its own permissions.
 
 **Scripts and other agents** use the CLI:
 
