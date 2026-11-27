@@ -1015,6 +1015,26 @@ impl NodeState {
                 self.stopping = true;
                 Ok(Some(json!({"stopping": true})))
             }
+            IpcOp::ShutdownIfIdle => {
+                let mut busy: Vec<&str> = vec![];
+                if self.with_hub {
+                    busy.push("runs inside agentlan up");
+                }
+                if !self.sessions.is_empty() {
+                    busy.push("agent sessions");
+                }
+                if self.conns.keys().any(|c| *c != conn) {
+                    busy.push("other connections");
+                }
+                if !self.waiters.is_empty() || !self.pending.is_empty() {
+                    busy.push("calls in progress");
+                }
+                if !self.wake_inflight.is_empty() || !self.wake_due.is_empty() {
+                    busy.push("worker wakes");
+                }
+                self.stopping = busy.is_empty();
+                Ok(Some(json!({"stopping": self.stopping, "busy": busy})))
+            }
             IpcOp::Detach => {
                 let a = self.conns.get(&conn).and_then(|c| c.attached.clone()).ok_or(IpcErr("NOT_ATTACHED", "not attached".into()))?;
                 self.end_session(&a, EndReason::Left);

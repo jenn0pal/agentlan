@@ -827,13 +827,13 @@ fn request_reply_ignores_unrelated_mail() {
     assert_eq!(r["status"], "replied", "{r}");
     assert_eq!(r["reply"]["inReplyTo"], qid.as_str());
     assert_eq!(r["reply"]["parts"][0]["text"], "yes, 30s covers clock drift");
-    assert_eq!(r["acked"], true, "a reply (plain `send --reply-to` is chat) is marked handled once returned: {r}");
-    assert_eq!(q["acked"], false, "a request stays open until it's answered: {q}");
+    assert_eq!(r["autoAck"], true, "a reply (plain `send --reply-to` is chat) is marked handled once returned: {r}");
+    assert_eq!(q["autoAck"], false, "a request stays open until it's answered: {q}");
 
     // The unrelated message was not consumed by the request, and isn't an answer.
     let w = e.json("n1", &["wait", "--as", "backend", "--timeout", "3", "--json"]);
     assert_eq!(w["message"]["subject"], "noise", "{w}");
-    assert_eq!(w["acked"], false, "{w}");
+    assert_eq!(w["autoAck"], false, "{w}");
     let ib = e.json("n1", &["inbox", "--as", "backend", "--json"]);
     let subjects: Vec<&str> = ib["messages"].as_array().unwrap().iter().map(|m| m["subject"].as_str().unwrap_or("")).collect();
     assert_eq!(subjects, ["noise"], "only the unanswered note is left: {ib}");
@@ -868,8 +868,8 @@ fn mcp_request_tool_and_cancelled_wait() {
     assert_eq!(res["structuredContent"]["status"], "replied", "{res}");
     assert_eq!(res["structuredContent"]["reply"]["parts"][0]["text"], "approved");
     // The answer is marked handled once the asker has it; the question was not (it needed a reply).
-    assert_eq!(res["structuredContent"]["acked"], true, "{res}");
-    assert_eq!(got["structuredContent"]["acked"], false, "a request isn't an answer: {got}");
+    assert_eq!(res["structuredContent"]["autoAck"], true, "{res}");
+    assert_eq!(got["structuredContent"]["autoAck"], false, "a request isn't an answer: {got}");
     // (marked handled in the background, just after the tool returns)
     wait_until("answer marked handled", T, || {
         back.tool("inbox", serde_json::json!({}))["structuredContent"]["messages"].as_array().is_some_and(|a| a.is_empty())
@@ -906,7 +906,7 @@ fn mcp_request_tool_and_cancelled_wait() {
     rev.tool("reply", serde_json::json!({"messageId": ac, "text": "yes"}));
     let ans = back.tool("wait_for_message", serde_json::json!({"timeoutS": 10}));
     assert_eq!(ans["structuredContent"]["messages"][0]["inReplyTo"], ac.as_str(), "{ans}");
-    assert_eq!(ans["structuredContent"]["acked"], true, "{ans}");
+    assert_eq!(ans["structuredContent"]["autoAck"], true, "{ans}");
     // (marked handled in the background, just after the tool returns)
     wait_until("answer marked handled", T, || {
         back.tool("inbox", serde_json::json!({}))["structuredContent"]["messages"].as_array().is_some_and(|a| a.is_empty())
@@ -1379,6 +1379,22 @@ fn outdated_node_is_restarted_only_when_idle() {
     e.kill(bi);
     e.kill(bi - 1); // the attach stream
     e.kill(old2);
+
+    // 2b. Older, no session, but a script is waiting on it (`agentlan wait` doesn't attach).
+    let old3 = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "0.0.1")]);
+    let wi = e.spawn("n1", &["wait", "--as", "ci-bot", "--timeout", "30"]);
+    wait_until("the script's wait is registered", T, || e.status("n1")["sessions"].as_array().is_some_and(|a| a.is_empty()));
+    std::thread::sleep(Duration::from_millis(300));
+    let di = e.kids.len();
+    let mut d = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    d.init();
+    let w = d.tool("whoami", serde_json::json!({}));
+    assert!(note(&w).contains("is in use"), "{w}");
+    assert_eq!(e.status("n1")["version"], "0.0.1", "not restarted under a waiting script");
+    assert!(e.kids[wi].try_wait().unwrap().is_none(), "the script is still waiting");
+    e.kill(di);
+    e.kill(wi);
+    e.kill(old3);
 
     // 3. Newer than this binary: left alone, nothing to report.
     let newer = e.start_node_with("n1", &[("AGENTLAN_DEV_NODE_VERSION", "99.0.0")]);

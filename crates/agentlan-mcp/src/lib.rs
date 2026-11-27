@@ -891,7 +891,7 @@ impl Adapter {
                         let views = render::views(&msgs, &my_machine);
                         self.result(
                             text,
-                            json!({"status": "replied", "sent": sent, "reply": v["reply"], "acked": acked, "views": views, "trust": "untrusted-peer", "unread": unread}),
+                            json!({"status": "replied", "sent": sent, "reply": v["reply"], "autoAck": acked, "views": views, "trust": "untrusted-peer", "unread": unread}),
                             &unread,
                         )
                     }
@@ -901,6 +901,11 @@ impl Adapter {
                         &unread,
                     ),
                 };
+                if ct.is_cancelled() {
+                    // The host cancelled meanwhile: rmcp drops this response, so the guard
+                    // puts the message back as unseen and nothing is marked handled.
+                    return out;
+                }
                 guard.disarm();
                 self.ack_answer(&client, &v["reply"]);
                 out
@@ -975,10 +980,15 @@ impl Adapter {
                             text.push_str("\n(It answers something you sent, so it's marked handled.)");
                         }
                         let views = render::views(&msgs, &my_machine);
-                        self.result(text, json!({"messages": msgs, "acked": acked, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                        self.result(text, json!({"messages": msgs, "autoAck": acked, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
                     }
                     None => self.result(format!("No message within {t}s."), json!({"messages": [], "timedOut": true, "unread": unread}), &unread),
                 };
+                if ct.is_cancelled() {
+                    // The host cancelled meanwhile: rmcp drops this response, so the guard
+                    // puts the message back as unseen and nothing is marked handled.
+                    return out;
+                }
                 guard.disarm();
                 self.ack_answer(&client, &v["message"]);
                 out

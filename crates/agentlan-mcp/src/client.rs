@@ -66,13 +66,12 @@ async fn write_line(stream: &Stream, wlock: &Mutex<()>, line: &[u8]) -> std::io:
     w.write_all(line).await
 }
 
-static NODE_CHECKED: AtomicBool = AtomicBool::new(false);
-static NODE_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static NODE_CHECK: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
 
 /// What this adapter found about the PC's node version when it first connected: that it
 /// updated an outdated node, or that one is still running and how to update it.
 pub fn node_note() -> Option<String> {
-    NODE_NOTE.lock().unwrap().clone()
+    NODE_CHECK.get().cloned().flatten()
 }
 
 /// Where new-mail pushes for an identity go (the adapter's live delivery): (name, data).
@@ -119,13 +118,21 @@ impl NodeClient {
     async fn open(&self) -> Result<(Live, Value)> {
         // Once per adapter process: a node left running on an older version by an upgrade
         // is restarted on this binary if nothing uses it, or reported (see `node_note`).
-        if !NODE_CHECKED.swap(true, Ordering::SeqCst) && agentlan_node::is_running(&self.home).await {
-            let check = agentlan_node::refresh_outdated(&self.home).await;
-            if let Some(n) = check.note() {
-                tracing::info!("{n}");
-                *NODE_NOTE.lock().unwrap() = Some(n);
-            }
-        }
+        // Concurrent first opens (several identities) wait for that one check, so they
+        // don't count as "in use" against it.
+        let home = self.home.clone();
+        NODE_CHECK
+            .get_or_init(|| async move {
+                if !agentlan_node::is_running(&home).await {
+                    return None;
+                }
+                let note = agentlan_node::refresh_outdated(&home).await.note();
+                if let Some(n) = &note {
+                    tracing::info!("{n}");
+                }
+                note
+            })
+            .await;
         // A PC that has joined gets its node started on demand (it keeps running after
         // this session ends); one that hasn't must `connect` with a join code first.
         if !agentlan_node::is_running(&self.home).await {

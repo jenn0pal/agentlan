@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentlan-node = { version = "0.2.0-beta.4", path = "../agentlan-node" }
-agentlan-proto = { version = "0.2.0-beta.4", path = "../agentlan-proto" }
+agentlan-node = { version = "0.2.0-beta.5", path = "../agentlan-node" }
+agentlan-proto = { version = "0.2.0-beta.5", path = "../agentlan-proto" }
 anyhow = "1.0.105"
 chrono = "0.4.45"
 futures-util = "0.3.34"

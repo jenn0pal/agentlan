@@ -1197,6 +1197,32 @@ Where the code differs from this spec, and why:
 - **Real test (2026-11-27, v0.2.0-beta.4):**
   - **Codex** (the user's open session on the Mac): idle, it woke and replied in about 23 s; busy, the pointer arrived mid-turn and it replied in about 12 s.
   - **Claude Code** (Windows, started with the channel flag, request from the Mac): idle, it woke and replied in about 15 s; busy, the pointer arrived mid-turn as a `<channel source="agentlan">` block with the next tool result.
+- **One MCP server per Codex conversation (checked 2026-11-27):**
+  - A second conversation started in the same app-server daemon got its own `agentlan mcp` process, and Codex reports MCP startup per thread id. So live mail for one window's identity goes to that window's thread.
+  - When a real window closes, its server exits: only the open session's server remained under a daemon that had hosted earlier sessions.
+  - A conversation started over the daemon API and abandoned without unsubscribing kept its server running until it was stopped.
+
+**v0.2.0-beta.5 (2026-11-27), fixes from the real test:**
+- **Answers are marked handled once returned.** A reply that asks nothing back (`inReplyTo` set, intent `result`, `status`, `error` or `chat`) is acked when `request` or `wait_for_message` (MCP or CLI) returns it. Previously answers piled up in the inbox. Asks, requests, handoffs, custom intents and non-replies stay open.
+  - The MCP ack is detached and starts only after the tool result is built, so a cancelled call can't ack a message the agent never saw.
+  - A handled answer can still be replied to by id.
+- **Outdated nodes after an upgrade:**
+  - **What nodes report:** `Status` now includes `version`, `pid`, `withHub` and `wakesRunning`.
+  - **When the check runs:** the first time an MCP adapter connects, and on `agentlan connect` or `up` while a node is running.
+  - **Restart:** a node older than the binary (SemVer precedence, via the `semver` crate) is asked to stop with `ShutdownIfIdle`.
+    - **Idle check:** the node checks in one state-loop step that nothing depends on it: no other IPC connection, session, waiter, pending send, or queued or running wake, and not inside `agentlan up`.
+    - **After restarting:** the client starts it again on the new binary and checks the version that came up.
+    - **Windows:** a host that can't start a node outliving it (its job object forbids breakaway) leaves the old node alone.
+  - **Report only:** otherwise it's reported in `whoami`, `connect` and `register` (`nodeNote`) and in `agentlan status`.
+    - Nodes inside `agentlan up`, and older nodes that don't report a version, are never stopped.
+    - If a stop succeeds but the start fails, `connect` and `up` start the node themselves.
+- **Codex review of these fixes** found 8 issues, all real and all fixed:
+  - **Idle check:** the gap between the check and the stop, CLI waiters that looked idle, and queued wakes. All are now covered by `ShutdownIfIdle`.
+  - **Cancelled MCP calls:** rmcp drops the response, so the call now checks the cancellation token before marking anything handled.
+  - **CLI order:** it prints before marking handled, and `wait` now shows the body.
+  - **Windows breakaway:** checked before stopping the node.
+  - **Unverified restarts:** the version that came up is now checked.
+  - **Version ordering:** now uses the `semver` crate.
 - **Safety:**
   - pointer only, with sender and intent sanitized;
   - batched, with at most one push per 10 s and 30 per hour per identity;
