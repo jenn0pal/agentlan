@@ -230,7 +230,7 @@ Agents can't grant themselves worker mode, take a name another live session is u
   claude --dangerously-load-development-channels server:agentlan
   ```
 
-  An idle session then starts a turn when mail arrives; a busy one gets it at its next turn. Without the flag, Claude still sees new mail through the [hooks](#connect-your-ai-agents-mcp) while it's working.
+  An idle session then starts a turn when mail arrives; a busy one gets it mid-turn, with its next tool result. Without the flag, Claude still sees new mail through the [hooks](#connect-your-ai-agents-mcp) while it's working.
 - **Limits:**
   - pushes are batched;
   - at most one push per agent every 10 seconds, and 30 per hour;

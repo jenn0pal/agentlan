@@ -1194,6 +1194,9 @@ Where the code differs from this spec, and why:
   - **Protocol revision:** it advertises only protocol revisions that have an `initialize` handshake. Claude Code can't carry channel messages on 2026-07-28.
   - **The user opts in** with `--dangerously-load-development-channels server:agentlan` while channels are a research preview.
   - **Untested alternative:** a SessionStart or Stop hook with `asyncRewake` could wake an idle session without a flag.
+- **Real test (2026-11-27, v0.2.0-beta.4):**
+  - **Codex** (the user's open session on the Mac): idle, it woke and replied in about 23 s; busy, the pointer arrived mid-turn and it replied in about 12 s.
+  - **Claude Code** (Windows, started with the channel flag, request from the Mac): idle, it woke and replied in about 15 s; busy, the pointer arrived mid-turn as a `<channel source="agentlan">` block with the next tool result.
 - **Safety:**
   - pointer only, with sender and intent sanitized;
   - batched, with at most one push per 10 s and 30 per hour per identity;
