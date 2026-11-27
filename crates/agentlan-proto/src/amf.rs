@@ -182,6 +182,34 @@ pub fn intent_ok(i: &str) -> bool {
     INTENTS.contains(&i) || (i.starts_with("x-") && i.len() > 2)
 }
 
+/// Is this message (AMF JSON) an answer: a reply (`inReplyTo` set) that asks nothing back
+/// (`result`, `status`, `error` or `chat`; a plain `send --reply-to` is `chat`)? An answer
+/// needs no further handling once the asker has it, so `request` and `wait_for_message`
+/// mark answers handled when they return them. Replies that ask, request or hand off
+/// something, custom intents, and anything that isn't a reply stay open until the agent
+/// replies or acks.
+pub fn is_answer(m: &Value) -> bool {
+    m["inReplyTo"].as_str().is_some_and(|s| !s.is_empty()) && matches!(m["intent"].as_str(), Some("result" | "status" | "error" | "chat"))
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn answers_are_replies_that_ask_nothing_back() {
+        for i in ["result", "status", "error", "chat"] {
+            assert!(is_answer(&json!({"intent": i, "inReplyTo": "msg_1"})), "{i}");
+        }
+        for i in ["ask", "request", "handoff", "x-review"] {
+            assert!(!is_answer(&json!({"intent": i, "inReplyTo": "msg_1"})), "{i}");
+        }
+        assert!(!is_answer(&json!({"intent": "result"})), "not a reply");
+        assert!(!is_answer(&json!({"intent": "result", "inReplyTo": ""})), "empty inReplyTo");
+    }
+}
+
 impl Amf {
     /// Validate the rules every node enforces before accepting a message.
     pub fn validate(&self) -> Result<(), AmfError> {

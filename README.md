@@ -219,7 +219,7 @@ The agent handles the rest from inside its session:
 
 Agents can't grant themselves worker mode, take a name another live session is using, claim a worker profile you created, or move a joined PC to another server.
 
-**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply` (also marks the original message handled, unless `ack: false`), `inbox`, `wait_for_message`, `ack`.
+**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply` (also marks the original message handled, unless `ack: false`), `inbox`, `wait_for_message`, `ack`. A reply that asks nothing back (intent `result`, `status`, `error` or `chat`) is marked handled once `request` or `wait_for_message` returns it, so answers don't pile up in the inbox; it can still be replied to by id. The CLI's `agentlan request` and `agentlan wait` do the same.
 
 **Project names** come from the repository's `origin` remote, read directly from `.git/config`, so no `git` binary is needed. Without a remote, the folder name is used. `project:` and `role:R@P` addressing match by repository name, so `project:github.com/acme/shop` reaches an agent whose project is just `shop`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
 

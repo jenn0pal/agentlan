@@ -668,8 +668,9 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 ..Default::default()
             };
             // One node operation: send + wait for the actual recipient's reply.
-            let out = call(home, IpcOp::Request { as_agent: Some(as_agent), draft, timeout_ms: wait * 1000 }).await?;
+            let mut out = call(home, IpcOp::Request { as_agent: Some(as_agent.clone()), draft, timeout_ms: wait * 1000 }).await?;
             let id = out["sent"]["id"].as_str().unwrap_or_default().to_string();
+            out["acked"] = json!(ack_answer(home, &as_agent, &out["reply"]).await);
             print_value(&out, json, |o| {
                 // Index the Value (missing keys are Null), not the Map (missing keys panic).
                 let m = &o["reply"];
@@ -752,7 +753,8 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             println!("{}", if v["resumed"] == true { format!("✓ resumed {}", v["key"].as_str().unwrap_or(&thread_id)) } else { format!("{thread_id} was not paused") });
         }
         Cmd::Wait { as_agent, timeout, json } => {
-            let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
+            let mut v = call(home, IpcOp::Wait { agent: Some(as_agent.clone()), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
+            v["acked"] = json!(ack_answer(home, &as_agent, &v["message"]).await);
             print_value(&v, json, |v| {
                 let m = &v["message"]; // Value indexing: a missing subject is Null, not a panic
                 if m.is_object() {
@@ -765,6 +767,13 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Mark a returned message handled if it's an answer (see `amf::is_answer`), as the MCP
+/// `request` and `wait_for_message` tools do.
+async fn ack_answer(home: &Path, as_agent: &str, m: &Value) -> bool {
+    let Some(mid) = m["id"].as_str().filter(|_| agentlan_proto::amf::is_answer(m)) else { return false };
+    call(home, IpcOp::Ack { agent: Some(as_agent.to_string()), message_id: mid.to_string() }).await.is_ok()
 }
 
 /// Is a node already serving this home's IPC endpoint?

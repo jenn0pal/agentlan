@@ -816,10 +816,16 @@ fn request_reply_ignores_unrelated_mail() {
     assert_eq!(r["status"], "replied", "{r}");
     assert_eq!(r["reply"]["inReplyTo"], qid.as_str());
     assert_eq!(r["reply"]["parts"][0]["text"], "yes, 30s covers clock drift");
+    assert_eq!(r["acked"], true, "a reply (plain `send --reply-to` is chat) is marked handled once returned: {r}");
+    assert_eq!(q["acked"], false, "a request stays open until it's answered: {q}");
 
-    // The unrelated message was not consumed by the request.
+    // The unrelated message was not consumed by the request, and isn't an answer.
     let w = e.json("n1", &["wait", "--as", "backend", "--timeout", "3", "--json"]);
     assert_eq!(w["message"]["subject"], "noise", "{w}");
+    assert_eq!(w["acked"], false, "{w}");
+    let ib = e.json("n1", &["inbox", "--as", "backend", "--json"]);
+    let subjects: Vec<&str> = ib["messages"].as_array().unwrap().iter().map(|m| m["subject"].as_str().unwrap_or("")).collect();
+    assert_eq!(subjects, ["noise"], "only the unanswered note is left: {ib}");
 }
 
 /// MCP `request` round trip, and a cancelled `wait_for_message` does not lose the
@@ -850,6 +856,19 @@ fn mcp_request_tool_and_cancelled_wait() {
     let res = back.finish(rid);
     assert_eq!(res["structuredContent"]["status"], "replied", "{res}");
     assert_eq!(res["structuredContent"]["reply"]["parts"][0]["text"], "approved");
+    // The answer is marked handled once the asker has it; the question was not (it needed a reply).
+    assert_eq!(res["structuredContent"]["acked"], true, "{res}");
+    assert_eq!(got["structuredContent"]["acked"], false, "a request isn't an answer: {got}");
+    // (marked handled in the background, just after the tool returns)
+    wait_until("answer marked handled", T, || {
+        back.tool("inbox", serde_json::json!({}))["structuredContent"]["messages"].as_array().is_some_and(|a| a.is_empty())
+    });
+    // A handled answer can still be replied to (follow-up on the same thread).
+    let aid = res["structuredContent"]["reply"]["id"].as_str().unwrap().to_string();
+    let fu = back.tool("reply", serde_json::json!({"messageId": aid, "text": "thanks, merging", "intent": "status"}));
+    assert!(fu["structuredContent"]["sent"]["id"].is_string(), "reply to a handled answer: {fu}");
+    let got_fu = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 10}));
+    assert_eq!(got_fu["structuredContent"]["messages"][0]["inReplyTo"], aid.as_str(), "{got_fu}");
 
     // Cancelling one wait leaves a concurrent request on the same adapter untouched.
     let rid2 = back.start("tools/call", serde_json::json!({"name": "request", "arguments": {"to": "@reviewer@pc-two", "text": "second?", "waitS": 20}}));
@@ -870,6 +889,17 @@ fn mcp_request_tool_and_cancelled_wait() {
     back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "subject": "after-cancel", "text": "still there?"}));
     let again = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 10}));
     assert_eq!(again["structuredContent"]["messages"][0]["subject"], "after-cancel", "{again}");
+
+    // An answer that arrives through wait_for_message is marked handled too.
+    let ac = again["structuredContent"]["messages"][0]["id"].as_str().unwrap().to_string();
+    rev.tool("reply", serde_json::json!({"messageId": ac, "text": "yes"}));
+    let ans = back.tool("wait_for_message", serde_json::json!({"timeoutS": 10}));
+    assert_eq!(ans["structuredContent"]["messages"][0]["inReplyTo"], ac.as_str(), "{ans}");
+    assert_eq!(ans["structuredContent"]["acked"], true, "{ans}");
+    // (marked handled in the background, just after the tool returns)
+    wait_until("answer marked handled", T, || {
+        back.tool("inbox", serde_json::json!({}))["structuredContent"]["messages"].as_array().is_some_and(|a| a.is_empty())
+    });
 }
 
 /// Run a Claude Code hook the way Claude does: JSON on stdin; stdout is JSON or empty.

@@ -337,7 +337,7 @@ fn base_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "request",
-            "Ask one agent something and wait for its reply (up to 45 s). Targets: \"@name@machine\", \"agt_…\", or \"role:R\" / \"project:P\" (one agent is picked, preferring this machine). If no reply arrives in time you get status \"pending\"; the reply will still land in your inbox.",
+            "Ask one agent something and wait for its reply (up to 45 s). Targets: \"@name@machine\", \"agt_…\", or \"role:R\" / \"project:P\" (one agent is picked, preferring this machine). If no reply arrives in time you get status \"pending\"; the reply will still land in your inbox. A reply that asks nothing back (intent result, status, error or chat) is marked handled when it's returned.",
             schema(json!({
                 "type":"object",
                 "properties":{
@@ -366,7 +366,7 @@ fn base_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "wait_for_message",
-            "Block until a new message arrives (or the timeout passes, max 45 s). Call again to keep waiting.",
+            "Block until a new message arrives (or the timeout passes, max 45 s). Call again to keep waiting. A reply to something you sent that asks nothing back (intent result, status, error or chat) is marked handled when it's returned; anything else stays open until you reply or ack.",
             schema(json!({"type":"object","properties":{"timeoutS":{"type":"integer","minimum":1,"maximum":MAX_WAIT_S}}})),
         ),
         Tool::new("ack", "Mark a message as handled.", schema(json!({"type":"object","properties":{"messageId":{"type":"string"}},"required":["messageId"]}))),
@@ -392,6 +392,18 @@ impl Adapter {
 
     async fn footer(&self, client: &NodeClient) -> Value {
         client.call(IpcOp::Whoami).await.map(|w| json!({"count": w["unread"], "latest": w["unreadLatest"]})).unwrap_or(json!({"count": null}))
+    }
+
+    /// If a message being returned is an answer (see `amf::is_answer`), mark it handled in
+    /// the background and say so. Detached, and started only once the tool result is built,
+    /// so a call cancelled before it returns can't leave an answer handled but never shown.
+    fn ack_answer(&self, client: &Arc<NodeClient>, m: &Value) -> bool {
+        let Some(mid) = m["id"].as_str().filter(|_| agentlan_proto::amf::is_answer(m)) else { return false };
+        let (c, mid) = (client.clone(), mid.to_string());
+        tokio::spawn(async move {
+            let _ = c.call(IpcOp::Ack { agent: None, message_id: mid }).await;
+        });
+        true
     }
 
     fn result(&self, text: String, structured: Value, unread: &Value) -> CallToolResult {
@@ -871,9 +883,17 @@ impl Adapter {
                 let out = match v["reply"].as_object() {
                     Some(_) => {
                         let msgs = vec![v["reply"].clone()];
-                        let text = format!("Reply to {id}:\n\n{}", render::messages(&msgs, self.rn(), &my_machine));
+                        let acked = agentlan_proto::amf::is_answer(&v["reply"]);
+                        let mut text = format!("Reply to {id}:\n\n{}", render::messages(&msgs, self.rn(), &my_machine));
+                        if acked {
+                            text.push_str("\n(It answers your request, so it's marked handled.)");
+                        }
                         let views = render::views(&msgs, &my_machine);
-                        self.result(text, json!({"status": "replied", "sent": sent, "reply": v["reply"], "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                        self.result(
+                            text,
+                            json!({"status": "replied", "sent": sent, "reply": v["reply"], "acked": acked, "views": views, "trust": "untrusted-peer", "unread": unread}),
+                            &unread,
+                        )
                     }
                     None => self.result(
                         format!("Sent {id}; no reply within {t}s. The reply will land in your inbox (call wait_for_message or inbox later)."),
@@ -882,6 +902,7 @@ impl Adapter {
                     ),
                 };
                 guard.disarm();
+                self.ack_answer(&client, &v["reply"]);
                 out
             }
             "reply" => {
@@ -948,13 +969,18 @@ impl Adapter {
                 let out = match v["message"].as_object() {
                     Some(_) => {
                         let msgs = vec![v["message"].clone()];
-                        let text = render::messages(&msgs, self.rn(), &my_machine);
+                        let acked = agentlan_proto::amf::is_answer(&v["message"]);
+                        let mut text = render::messages(&msgs, self.rn(), &my_machine);
+                        if acked {
+                            text.push_str("\n(It answers something you sent, so it's marked handled.)");
+                        }
                         let views = render::views(&msgs, &my_machine);
-                        self.result(text, json!({"messages": msgs, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                        self.result(text, json!({"messages": msgs, "acked": acked, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
                     }
                     None => self.result(format!("No message within {t}s."), json!({"messages": [], "timedOut": true, "unread": unread}), &unread),
                 };
                 guard.disarm();
+                self.ack_answer(&client, &v["message"]);
                 out
             }
             "ack" => {
