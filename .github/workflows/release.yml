@@ -148,6 +148,27 @@ jobs:
         run: |
           ./install.ps1
           & "$env:AGENTLAN_INSTALL_DIR\agentlan.exe" --version
+      - name: install.ps1 again while that agentlan.exe is running (upgrade in place)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AGENTLAN_VERSION: ${{ env.PIN }}
+          AGENTLAN_INSTALL_DIR: ${{ runner.temp }}\agl-bin
+          AGENTLAN_HOME: ${{ runner.temp }}\agl-home
+        run: |
+          $exe = "$env:AGENTLAN_INSTALL_DIR\agentlan.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList 'up', '--listen', '127.0.0.1:47820' -PassThru `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\up.out" -RedirectStandardError "$env:RUNNER_TEMP\up.err"
+          Start-Sleep -Seconds 3
+          if ($p.HasExited) { Get-Content "$env:RUNNER_TEMP\up.err"; throw 'agentlan up exited early' }
+          try {
+            ./install.ps1
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'the new agentlan.exe did not run' }
+          }
+          finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
       - name: install.ps1 (unpinned "latest", as in the README one-liner)
         if: runner.os == 'Windows'
         shell: pwsh

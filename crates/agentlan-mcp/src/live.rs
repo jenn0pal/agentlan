@@ -2,7 +2,7 @@
 //! of waiting for the agent to check its inbox.
 //!
 //! - Claude Code: a channel notification (`notifications/claude/channel`). An idle session
-//!   starts a turn; a busy one gets it at its next turn. Claude Code only listens when
+//!   starts a turn; a busy one gets it mid-turn, with its next tool result. Claude Code only listens when
 //!   started with the channel enabled (`--dangerously-load-development-channels
 //!   server:agentlan` while channels are a research preview); otherwise it's dropped.
 //! - Codex: `turn/start` on the session's own thread through the local Codex app-server

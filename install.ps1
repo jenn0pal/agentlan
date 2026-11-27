@@ -19,9 +19,30 @@ $Version = if ($env:AGENTLAN_VERSION) { $env:AGENTLAN_VERSION } else { 'latest' 
 $InstallDir = if ($env:AGENTLAN_INSTALL_DIR) { $env:AGENTLAN_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\agentlan' }
 $Target = 'x86_64-pc-windows-msvc'   # also runs on Windows on Arm (x64 emulation)
 $Asset = "agentlan-$Target.zip"
+# Was AgentLAN running when the install started (background node, an agent's MCP server, `agentlan up`)?
+$WasRunning = @(Get-Process -Name agentlan -ErrorAction SilentlyContinue).Count -gt 0
+
 function Install-Bin([string]$Built) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item $Built (Join-Path $InstallDir 'agentlan.exe') -Force
+    $Dest = Join-Path $InstallDir 'agentlan.exe'
+    # Windows can't overwrite a running .exe, but it can rename one: move the old binary
+    # aside (running copies keep working) and put the new one in its place. Asides left by
+    # earlier upgrades are removed once nothing runs them any more.
+    Get-ChildItem -Path $InstallDir -Filter 'agentlan.old-*.exe' -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $Old = $null
+    if (Test-Path -LiteralPath $Dest) {
+        $Old = Join-Path $InstallDir ('agentlan.old-' + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.exe')
+        Move-Item -LiteralPath $Dest -Destination $Old
+    }
+    try {
+        Copy-Item -LiteralPath $Built -Destination $Dest -Force
+    }
+    catch {
+        if ($Old -and -not (Test-Path -LiteralPath $Dest)) { Move-Item -LiteralPath $Old -Destination $Dest }
+        throw
+    }
+    if ($Old) { Remove-Item -LiteralPath $Old -Force -ErrorAction SilentlyContinue }
 }
 
 function Install-FromSource {
@@ -79,6 +100,11 @@ if (-not (($UserPath -split ';') -contains $InstallDir)) {
 $Exe = Join-Path $InstallDir 'agentlan.exe'
 Write-Host ''
 Write-Host ("Installed " + (& $Exe --version) + " -> $Exe")
+if ($WasRunning) {
+    Write-Host ''
+    Write-Host 'AgentLAN was running. Running copies keep the old version until they restart:'
+    Write-Host '  run "agentlan node stop", restart your agent sessions, and restart "agentlan up" if this PC is the server.'
+}
 Write-Host @'
 
 Next steps:
