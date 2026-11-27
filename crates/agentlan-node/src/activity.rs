@@ -204,7 +204,8 @@ pub fn read_network(home: &Path, f: &LogFilter) -> Result<Page> {
     let c = open_ro(&path)?;
     has_table(&c, "messages")?;
     let since = f.since.clone().unwrap_or_default();
-    let lim = f.limit.max(1) as i64;
+    // An agent filter is applied after reading, so read a wider window for it.
+    let lim = if f.agent.is_some() && !f.incremental { (f.limit.max(1) * 20).min(20_000) } else { f.limit.max(1) } as i64;
     let names: std::collections::HashMap<String, String> = {
         let mut st = c.prepare("SELECT a.agent_id, a.name || '@' || m.alias FROM agents a JOIN machines m USING(machine_id)")?;
         st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<_, _>>()?
@@ -321,7 +322,7 @@ pub fn read_network(home: &Path, f: &LogFilter) -> Result<Page> {
         rows.retain(|r| mentions(r, who));
     }
     if !inc {
-        let skip = rows.len().saturating_sub(lim as usize);
+        let skip = rows.len().saturating_sub(f.limit.max(1));
         rows = rows.split_off(skip);
         (m_cur, d_cur, e_cur) = (m_top, d_top, e_top);
     }

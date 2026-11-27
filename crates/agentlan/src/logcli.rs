@@ -207,7 +207,8 @@ pub async fn run(home: &Path, a: LogArgs) -> Result<()> {
     // Continue from the cursors of that same read, a page at a time (nothing skipped).
     // The network view can repeat delivery updates at the boundary time: drop repeats.
     let key = |r: &ActivityRow| format!("{}|{}|{}|{}|{}", r.kind, r.ts, r.msg_id.as_deref().unwrap_or(""), r.agent.as_deref().unwrap_or(""), r.body["state"]);
-    let mut seen: HashSet<String> = HashSet::new();
+    // Seeded with what was just printed: the first poll starts at the same boundary time.
+    let mut seen: HashSet<String> = if a.network { page.rows.iter().map(key).collect() } else { HashSet::new() };
     f.incremental = true;
     f.limit = 1000;
     f.after_seq = page.cursor;

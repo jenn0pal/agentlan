@@ -385,6 +385,11 @@ fn queued_while_hub_down_then_delivered() {
     wait_until("delivered to reviewer", T, || {
         e.json("n2", &["inbox", "--as", "reviewer", "--json"])["messages"].as_array().unwrap().iter().any(|m| m["id"] == wire_id.as_str())
     });
+    // The log shows it queued while the server was down, then taken once it was back.
+    let rows = log_rows(&e, "n1", &["--json"]);
+    let outcome = |st: &str| rows.iter().position(|r| r["kind"] == "remote" && r["msgId"] == wire_id.as_str() && r["body"]["result"]["status"] == st);
+    let (q, a) = (outcome("queued"), outcome("accepted"));
+    assert!(q.is_some() && a.is_some() && q < a, "queued, then accepted: {rows:?}");
 }
 
 /// A spawned `agentlan mcp` speaking JSON-RPC (newline-delimited) over stdio.
@@ -1476,12 +1481,22 @@ fn log_shows_the_timeline() {
     back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "subject": "network-followed", "text": "hi"}));
     let t0 = Instant::now();
     let (mut msg, mut extra) = (false, 0);
-    while t0.elapsed() < T && !msg {
+    let mut first_key = first.clone();
+    first_key["seq"] = Value::Null;
+    let mut printed = std::collections::HashSet::from([first_key.to_string()]);
+    let mut repeats = vec![];
+    while t0.elapsed() < Duration::from_secs(4) || (!msg && t0.elapsed() < T) {
         if let Ok(v) = rx.recv_timeout(Duration::from_millis(500)) {
             msg |= v["kind"] == "message" && v["body"]["subject"] == "network-followed";
             extra += usize::from(v["ts"].as_str() < first["ts"].as_str());
+            let mut k = v.clone();
+            k["seq"] = Value::Null; // page-local numbering
+            if !printed.insert(k.to_string()) {
+                repeats.push(v);
+            }
         }
     }
+    assert!(repeats.is_empty(), "no row printed twice: {repeats:?}");
     let _ = nf.kill();
     let _ = nf.wait();
     assert!(msg, "--network --follow printed the new message");
@@ -1623,9 +1638,12 @@ fn dashboard_serves_only_this_pc() {
     e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code"]);
     e.start_node("n1");
     let mut d = e.cmd("n1", &["dashboard"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut out = BufReader::new(d.stdout.take().unwrap());
     let mut first = String::new();
-    BufReader::new(d.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    out.read_line(&mut first).unwrap();
     e.kids.push(d);
+    // Keep draining its output (a closed pipe would stop it at its next line).
+    std::thread::spawn(move || for _ in out.lines().map_while(Result::ok) {});
     let url = first.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).expect("printed a link").to_string();
     let (addr, key) = url.trim_start_matches("http://").split_once("/#").unwrap();
     let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();

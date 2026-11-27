@@ -822,6 +822,14 @@ impl NodeState {
 
     fn finish_pending(&mut self, msg_id: &str, remote: RemoteResult) {
         if let Some(mut p) = self.pending.remove(msg_id) {
+            // The server's answer is recorded in settle_submit; a timeout or a dropped link
+            // leaves the send queued, which is recorded here.
+            if matches!(remote, RemoteResult::Queued) {
+                match self.envelope(msg_id) {
+                    Some(env) => self.activity("remote", Some(&env.from.agent), Some(&env), json!({"result": remote})),
+                    None => self.activity("remote", None, None, json!({"result": remote, "msgId": msg_id})),
+                }
+            }
             p.result.remote = remote;
             let v = serde_json::to_value(&p.result).unwrap_or(Value::Null);
             self.reply(p.conn, ok(p.req, v));
@@ -2003,6 +2011,9 @@ impl NodeState {
         let recipients: Vec<String> =
             local_ids.iter().map(|id| self.profiles.iter().find(|p| &p.agent_id == id).map(|p| self.handle_of(p)).unwrap_or_else(|| id.clone())).collect();
         self.activity("sent", Some(&env.from.agent), Some(&env), json!({"to": env.to, "localRecipients": recipients, "remote": needs_remote}));
+        if needs_remote && self.hub != HubStatus::Ready {
+            self.activity("remote", Some(&env.from.agent), Some(&env), json!({"result": RemoteResult::Queued}));
+        }
         Ok(Ok(Committed { env, result, needs_remote, local_ids }))
     }
 
