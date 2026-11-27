@@ -1,17 +1,18 @@
 [package]
 name = "agentlan-node"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 edition = "2024"
 
 [dependencies]
-agentlan-net = { version = "0.2.0-beta.4", path = "../agentlan-net" }
-agentlan-proto = { version = "0.2.0-beta.4", path = "../agentlan-proto" }
-agentlan-store = { version = "0.2.0-beta.4", path = "../agentlan-store" }
+agentlan-net = { version = "0.2.0-beta.5", path = "../agentlan-net" }
+agentlan-proto = { version = "0.2.0-beta.5", path = "../agentlan-proto" }
+agentlan-store = { version = "0.2.0-beta.5", path = "../agentlan-store" }
 anyhow = "1.0.105"
 chrono = { version = "0.4.45", features = ["serde"] }
 data-encoding = "2.11.1"
 if-addrs = "0.15.0"
 interprocess = { version = "2.4.10", features = ["tokio"] }
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.2"

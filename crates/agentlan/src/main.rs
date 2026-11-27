@@ -410,7 +410,13 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         Cmd::Up { name, listen, advertise, tailscale, alias } => {
             // The node may already be running (e.g. started by an agent's `connect`): then only
             // the server starts here and the node is left as it is.
-            let node_up = node_running(home).await;
+            let mut node_up = node_running(home).await;
+            // A node an upgrade left on an older version is replaced first if it's idle.
+            let mut node_note = None;
+            if node_up {
+                node_note = agentlan_node::refresh_outdated(home).await.note();
+                node_up = node_running(home).await; // stopped but not restarted: start it here
+            }
             let fresh = !agentlan_hub::hub_dir(home).join("hub.json").exists();
             let listen_override = if fresh {
                 let l = listen.clone().unwrap_or_else(|| format!("0.0.0.0:{}", agentlan_hub::DEFAULT_PORT));
@@ -473,11 +479,14 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             println!("\nOn each other PC, run (code valid 15 min; `agentlan hub invite` makes more):\n\n  agentlan connect {}\n", code.encode());
             println!("Agents connect from their session through the agentlan MCP tools (`connect`, then `register`).");
             if node_up {
-                println!("(this PC's node was already running and keeps running)");
+                match node_note {
+                    Some(n) => println!("(this PC's node was already running) {n}"),
+                    None => println!("(this PC's node was already running and keeps running)"),
+                }
                 hub_task.await??;
             } else {
                 let node_home = home.to_path_buf();
-                let node_task = tokio::spawn(async move { agentlan_node::run(&node_home).await });
+                let node_task = tokio::spawn(async move { agentlan_node::run_opts(&node_home, agentlan_node::RunOpts { with_hub: true }).await });
                 tokio::select! {
                     r = &mut hub_task => r??,
                     r = node_task => {
@@ -492,8 +501,15 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         Cmd::Connect { code, alias } => {
             if node_running(home).await {
                 let cfg = agentlan_node::load_config(home)?;
-                println!("✓ this PC's node is already running (network '{}' as {})", cfg.net, cfg.alias);
-                return Ok(());
+                let check = agentlan_node::refresh_outdated(home).await;
+                if node_running(home).await {
+                    match check.note() {
+                        Some(n) => println!("✓ this PC's node is running (network '{}' as {})\n{n}", cfg.net, cfg.alias),
+                        None => println!("✓ this PC's node is already running (network '{}' as {})", cfg.net, cfg.alias),
+                    }
+                    return Ok(());
+                }
+                // The outdated node was stopped but no new one came up: start it here, as usual.
             }
             match agentlan_node::load_config(home) {
                 Ok(cfg) => {
@@ -564,16 +580,26 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
         Cmd::Status { json } => {
             let v = call(home, IpcOp::Status).await?;
             print_value(&v, json, |v| {
-                format!(
-                    "machine {} ({})  net {}\nserver: {}  seq {}  outbox {}  sessions {}",
+                let mut s = format!(
+                    "machine {} ({})  net {}\nserver: {}  seq {}  outbox {}  sessions {}\nnode {}",
                     v["alias"].as_str().unwrap_or("?"),
                     v["machineId"].as_str().unwrap_or("?"),
                     v["net"].as_str().unwrap_or("?"),
                     v["hub"].as_str().unwrap_or("?"),
                     v["seq"],
                     v["outbox"],
-                    v["sessions"].as_array().map(|a| a.len()).unwrap_or(0)
-                )
+                    v["sessions"].as_array().map(|a| a.len()).unwrap_or(0),
+                    v["version"].as_str().unwrap_or("(older; doesn't report its version)"),
+                );
+                // Report only: `status` never restarts anything.
+                let running = v["version"].as_str().map(String::from);
+                if running.as_deref().is_none_or(|r| agentlan_node::version_older(r, env!("CARGO_PKG_VERSION"))) {
+                    let check = agentlan_node::NodeCheck::Outdated { running, with_hub: v["withHub"] == true };
+                    if let Some(n) = check.note() {
+                        s.push_str(&format!("\n{n}"));
+                    }
+                }
+                s
             });
         }
         Cmd::Ls { project, role, json } => {
@@ -668,8 +694,10 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                 ..Default::default()
             };
             // One node operation: send + wait for the actual recipient's reply.
-            let out = call(home, IpcOp::Request { as_agent: Some(as_agent), draft, timeout_ms: wait * 1000 }).await?;
+            let mut out = call(home, IpcOp::Request { as_agent: Some(as_agent.clone()), draft, timeout_ms: wait * 1000 }).await?;
             let id = out["sent"]["id"].as_str().unwrap_or_default().to_string();
+            let auto_ack = agentlan_proto::amf::is_answer(&out["reply"], true);
+            out["autoAck"] = json!(auto_ack);
             print_value(&out, json, |o| {
                 // Index the Value (missing keys are Null), not the Map (missing keys panic).
                 let m = &o["reply"];
@@ -679,6 +707,10 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
                     format!("sent {id}; no reply within {wait}s (it will land in the inbox)")
                 }
             });
+            // Only once it's been printed (a failed write panics before this).
+            if auto_ack {
+                ack_answer(home, &as_agent, &out["reply"], true).await;
+            }
         }
         Cmd::Inbox { as_agent, limit, json } => {
             let v = call(home, IpcOp::Inbox { agent: Some(as_agent), limit, message_id: None }).await?;
@@ -752,19 +784,41 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             println!("{}", if v["resumed"] == true { format!("✓ resumed {}", v["key"].as_str().unwrap_or(&thread_id)) } else { format!("{thread_id} was not paused") });
         }
         Cmd::Wait { as_agent, timeout, json } => {
-            let v = call(home, IpcOp::Wait { agent: Some(as_agent), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
+            let mut v = call(home, IpcOp::Wait { agent: Some(as_agent.clone()), timeout_ms: timeout * 1000, in_reply_to: None }).await?;
+            let auto_ack = agentlan_proto::amf::is_answer(&v["message"], false);
+            v["autoAck"] = json!(auto_ack);
             print_value(&v, json, |v| {
                 let m = &v["message"]; // Value indexing: a missing subject is Null, not a panic
                 if m.is_object() {
-                    let what = m["subject"].as_str().or(m["parts"][0]["text"].as_str()).unwrap_or("");
-                    format!("{} from {}: {what}", m["id"].as_str().unwrap_or("?"), m["from"]["handle"].as_str().unwrap_or("?"))
+                    let mut s = format!("{} from {} [{}]", m["id"].as_str().unwrap_or("?"), m["from"]["handle"].as_str().unwrap_or("?"), m["intent"].as_str().unwrap_or("?"));
+                    if let Some(sub) = m["subject"].as_str() {
+                        s.push_str(&format!(": {sub}"));
+                    }
+                    // The body too: an answer is marked handled once shown, so it won't be in `inbox` later.
+                    let amf: Result<agentlan_proto::amf::Amf, _> = serde_json::from_value(m.clone());
+                    let body = amf.map(|a| a.render_text()).unwrap_or_default();
+                    if !body.trim().is_empty() {
+                        s.push_str(&format!("\n{}", body.trim_end()));
+                    }
+                    s
                 } else {
                     "(timed out)".into()
                 }
             });
+            if auto_ack {
+                ack_answer(home, &as_agent, &v["message"], false).await;
+            }
         }
     }
     Ok(())
+}
+
+/// Mark a returned answer handled (see `amf::is_answer`), as the MCP `request` and
+/// `wait_for_message` tools do. Called after it has been printed.
+async fn ack_answer(home: &Path, as_agent: &str, m: &Value, matched: bool) {
+    if let Some(mid) = m["id"].as_str().filter(|_| agentlan_proto::amf::is_answer(m, matched)) {
+        let _ = call(home, IpcOp::Ack { agent: Some(as_agent.to_string()), message_id: mid.to_string() }).await;
+    }
 }
 
 /// Is a node already serving this home's IPC endpoint?

@@ -143,7 +143,10 @@ The installer downloads the prebuilt binary for your machine from [Releases](htt
 
 Prebuilt binaries cover macOS (Apple Silicon and Intel), Linux (x64 and ARM64; static, so any distro) and Windows x64.
 
-**Upgrading:** run the same line again; AgentLAN can keep running while you do. Copies that are already running keep the old version until they restart, so afterwards run `agentlan node stop`, restart your agent sessions, and restart `agentlan up` on the server PC.
+**Upgrading:** run the same line again; AgentLAN can keep running while you do. Copies that are already running keep the old version until they restart:
+- **The background node** is restarted on the new version by the next agent session or `agentlan connect`, as long as nothing is using it: no agent session, script waiting on it, or worker wake. From 0.2.0-beta.5 on, nodes report their version. Otherwise `whoami`, `connect`, `register` and `agentlan status` tell you it's outdated and what to run (`agentlan node stop` once the other sessions are closed). Older nodes don't report a version, so they're only reported, never restarted.
+- **A node inside `agentlan up`** is never restarted automatically; restart `agentlan up`.
+- **Agent sessions** keep their old MCP server until you restart them.
 
 **Options:**
 - **Pin a version:** `AGENTLAN_VERSION=v0.1.0`
@@ -219,7 +222,7 @@ The agent handles the rest from inside its session:
 
 Agents can't grant themselves worker mode, take a name another live session is using, claim a worker profile you created, or move a joined PC to another server.
 
-**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply` (also marks the original message handled, unless `ack: false`), `inbox`, `wait_for_message`, `ack`.
+**Tools:** `connect`, `register`, `leave`, `setup`, `whoami`, `list_agents`, `list_machines`, `send`, `request` (ask one agent and wait for the reply), `reply` (also marks the original message handled, unless `ack: false`), `inbox`, `wait_for_message`, `ack`. Answers don't pile up in the inbox: the reply `request` returns is marked handled unless it asks something back (intent `ask`, `request` or `handoff`) or uses a custom intent, and a reply that `wait_for_message` returns is marked handled if its intent is `result`, `status` or `error`. A handled answer can still be replied to by id. The CLI's `agentlan request` and `agentlan wait` do the same.
 
 **Project names** come from the repository's `origin` remote, read directly from `.git/config`, so no `git` binary is needed. Without a remote, the folder name is used. `project:` and `role:R@P` addressing match by repository name, so `project:github.com/acme/shop` reaches an agent whose project is just `shop`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
 

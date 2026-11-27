@@ -337,7 +337,7 @@ fn base_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "request",
-            "Ask one agent something and wait for its reply (up to 45 s). Targets: \"@name@machine\", \"agt_…\", or \"role:R\" / \"project:P\" (one agent is picked, preferring this machine). If no reply arrives in time you get status \"pending\"; the reply will still land in your inbox.",
+            "Ask one agent something and wait for its reply (up to 45 s). Targets: \"@name@machine\", \"agt_…\", or \"role:R\" / \"project:P\" (one agent is picked, preferring this machine). If no reply arrives in time you get status \"pending\"; the reply will still land in your inbox. The reply is marked handled when it's returned, unless it asks something back (intent ask, request or handoff) or uses a custom intent.",
             schema(json!({
                 "type":"object",
                 "properties":{
@@ -366,7 +366,7 @@ fn base_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "wait_for_message",
-            "Block until a new message arrives (or the timeout passes, max 45 s). Call again to keep waiting.",
+            "Block until a new message arrives (or the timeout passes, max 45 s). Call again to keep waiting. A reply to something you sent with intent result, status or error is marked handled when it's returned; anything else stays open until you reply or ack.",
             schema(json!({"type":"object","properties":{"timeoutS":{"type":"integer","minimum":1,"maximum":MAX_WAIT_S}}})),
         ),
         Tool::new("ack", "Mark a message as handled.", schema(json!({"type":"object","properties":{"messageId":{"type":"string"}},"required":["messageId"]}))),
@@ -392,6 +392,41 @@ impl Adapter {
 
     async fn footer(&self, client: &NodeClient) -> Value {
         client.call(IpcOp::Whoami).await.map(|w| json!({"count": w["unread"], "latest": w["unreadLatest"]})).unwrap_or(json!({"count": null}))
+    }
+
+    /// The node-version note to show, if it still applies: "updated" once; "outdated"
+    /// only while the running node is still older (the user may have restarted it since).
+    async fn node_note(&self) -> Option<String> {
+        use agentlan_node::NodeCheck;
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let check = client::node_check()?;
+        match &check {
+            NodeCheck::Current => return None,
+            NodeCheck::Restarted { .. } => DONE.store(true, std::sync::atomic::Ordering::SeqCst),
+            _ => {
+                let v = self.anon.call(IpcOp::Status).await.ok();
+                if v.as_ref().and_then(|v| v["version"].as_str()).is_some_and(|v| !agentlan_node::version_older(v, env!("CARGO_PKG_VERSION"))) {
+                    DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return None;
+                }
+            }
+        }
+        check.note()
+    }
+
+    /// If a message being returned is an answer (see `amf::is_answer`), mark it handled in
+    /// the background and say so. Detached, and started only once the tool result is built,
+    /// so a call cancelled before it returns can't leave an answer handled but never shown.
+    fn ack_answer(&self, client: &Arc<NodeClient>, m: &Value, matched: bool) -> bool {
+        let Some(mid) = m["id"].as_str().filter(|_| agentlan_proto::amf::is_answer(m, matched)) else { return false };
+        let (c, mid) = (client.clone(), mid.to_string());
+        tokio::spawn(async move {
+            let _ = c.call(IpcOp::Ack { agent: None, message_id: mid }).await;
+        });
+        true
     }
 
     fn result(&self, text: String, structured: Value, unread: &Value) -> CallToolResult {
@@ -871,9 +906,17 @@ impl Adapter {
                 let out = match v["reply"].as_object() {
                     Some(_) => {
                         let msgs = vec![v["reply"].clone()];
-                        let text = format!("Reply to {id}:\n\n{}", render::messages(&msgs, self.rn(), &my_machine));
+                        let acked = agentlan_proto::amf::is_answer(&v["reply"], true);
+                        let mut text = format!("Reply to {id}:\n\n{}", render::messages(&msgs, self.rn(), &my_machine));
+                        if acked {
+                            text.push_str("\n(It answers your request, so it's marked handled.)");
+                        }
                         let views = render::views(&msgs, &my_machine);
-                        self.result(text, json!({"status": "replied", "sent": sent, "reply": v["reply"], "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                        self.result(
+                            text,
+                            json!({"status": "replied", "sent": sent, "reply": v["reply"], "autoAck": acked, "views": views, "trust": "untrusted-peer", "unread": unread}),
+                            &unread,
+                        )
                     }
                     None => self.result(
                         format!("Sent {id}; no reply within {t}s. The reply will land in your inbox (call wait_for_message or inbox later)."),
@@ -881,7 +924,13 @@ impl Adapter {
                         &unread,
                     ),
                 };
+                if ct.is_cancelled() {
+                    // The host cancelled meanwhile: rmcp drops this response, so the guard
+                    // puts the message back as unseen and nothing is marked handled.
+                    return out;
+                }
                 guard.disarm();
+                self.ack_answer(&client, &v["reply"], true);
                 out
             }
             "reply" => {
@@ -948,13 +997,23 @@ impl Adapter {
                 let out = match v["message"].as_object() {
                     Some(_) => {
                         let msgs = vec![v["message"].clone()];
-                        let text = render::messages(&msgs, self.rn(), &my_machine);
+                        let acked = agentlan_proto::amf::is_answer(&v["message"], false);
+                        let mut text = render::messages(&msgs, self.rn(), &my_machine);
+                        if acked {
+                            text.push_str("\n(It's a result for something you sent, so it's marked handled.)");
+                        }
                         let views = render::views(&msgs, &my_machine);
-                        self.result(text, json!({"messages": msgs, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
+                        self.result(text, json!({"messages": msgs, "autoAck": acked, "views": views, "trust": "untrusted-peer", "unread": unread}), &unread)
                     }
                     None => self.result(format!("No message within {t}s."), json!({"messages": [], "timedOut": true, "unread": unread}), &unread),
                 };
+                if ct.is_cancelled() {
+                    // The host cancelled meanwhile: rmcp drops this response, so the guard
+                    // puts the message back as unseen and nothing is marked handled.
+                    return out;
+                }
                 guard.disarm();
+                self.ack_answer(&client, &v["message"], false);
                 out
             }
             "ack" => {
@@ -1022,6 +1081,16 @@ impl ServerHandler for Adapter {
         if self.worker && !WORKER_TOOLS.contains(&request.name.as_ref()) {
             return Ok(self.error("NOT_AVAILABLE", &format!("'{}' isn't available to a woken worker", request.name)).into());
         }
-        Ok(self.dispatch(&request.name, args, &context.ct).await.into())
+        let mut r = self.dispatch(&request.name, args, &context.ct).await;
+        // Say so where an agent looks at its connection: the PC's node outlived an upgrade.
+        if matches!(request.name.as_ref(), "whoami" | "connect" | "register")
+            && let Some(note) = self.node_note().await
+        {
+            r.content.push(ContentBlock::text(note.clone()));
+            if let Some(Value::Object(m)) = r.structured_content.as_mut() {
+                m.insert("nodeNote".into(), Value::String(note));
+            }
+        }
+        Ok(r.into())
     }
 }

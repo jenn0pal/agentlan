@@ -53,6 +53,11 @@ pub enum IpcOp {
     },
     /// Stop the node daemon (local clients only; the IPC endpoint is private to this user).
     Shutdown,
+    /// Stop the node only if nothing depends on it: no other IPC connection, session,
+    /// waiter, pending send, or queued or running wake, and not inside `agentlan up`.
+    /// Checked and committed in one step (used to replace a node an upgrade left behind;
+    /// only sent to nodes that report a version, which all know this op).
+    ShutdownIfIdle,
     /// Wake a wake-enabled worker now (it must have unread mail and not be running).
     WakeNow { agent: String },
     /// Wake configuration and state of this node's workers.

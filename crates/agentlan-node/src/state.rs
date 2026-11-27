@@ -184,6 +184,8 @@ pub struct NodeState {
     inflight: HashMap<i64, Instant>,
     /// Set by a Shutdown request: the state loop exits after replying.
     stopping: bool,
+    /// Runs inside `agentlan up` (same process as the server).
+    pub(crate) with_hub: bool,
     /// Worker wake: due time per agent (debounced), in-flight wakes, and agents that got
     /// new mail while their wake was running.
     wake_due: HashMap<String, Instant>,
@@ -277,6 +279,7 @@ impl NodeState {
             pending: HashMap::new(),
             inflight: HashMap::new(),
             stopping: false,
+            with_hub: false,
             wake_due: HashMap::new(),
             wake_inflight: HashMap::new(),
             wake_again: HashSet::new(),
@@ -1012,6 +1015,26 @@ impl NodeState {
                 self.stopping = true;
                 Ok(Some(json!({"stopping": true})))
             }
+            IpcOp::ShutdownIfIdle => {
+                let mut busy: Vec<&str> = vec![];
+                if self.with_hub {
+                    busy.push("runs inside agentlan up");
+                }
+                if !self.sessions.is_empty() {
+                    busy.push("agent sessions");
+                }
+                if self.conns.keys().any(|c| *c != conn) {
+                    busy.push("other connections");
+                }
+                if !self.waiters.is_empty() || !self.pending.is_empty() {
+                    busy.push("calls in progress");
+                }
+                if !self.wake_inflight.is_empty() || !self.wake_due.is_empty() {
+                    busy.push("worker wakes");
+                }
+                self.stopping = busy.is_empty();
+                Ok(Some(json!({"stopping": self.stopping, "busy": busy})))
+            }
             IpcOp::Detach => {
                 let a = self.conns.get(&conn).and_then(|c| c.attached.clone()).ok_or(IpcErr("NOT_ATTACHED", "not attached".into()))?;
                 self.end_session(&a, EndReason::Left);
@@ -1053,6 +1076,8 @@ impl NodeState {
                     "machineId": self.cfg.machine_id, "alias": self.cfg.alias, "net": self.cfg.net,
                     "hub": self.hub_label(), "seq": self.base_seq, "outbox": outbox,
                     "profiles": self.profiles.len(), "sessions": sessions, "pausedThreads": paused,
+                    // So a newer client can tell when this node outlived an upgrade, and whether it may restart it.
+                    "version": crate::node_version(), "pid": std::process::id(), "withHub": self.with_hub, "wakesRunning": self.wake_inflight.len(), "waiters": self.waiters.len(),
                 })))
             }
             IpcOp::ListAgents { project, role } => {
