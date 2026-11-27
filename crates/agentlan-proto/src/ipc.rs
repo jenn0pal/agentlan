@@ -58,6 +58,14 @@ pub enum IpcOp {
     /// Checked and committed in one step (used to replace a node an upgrade left behind;
     /// only sent to nodes that report a version, which all know this op).
     ShutdownIfIdle,
+    /// Record something only a client knows in the node's activity log (`agentlan log`),
+    /// for the identity attached on this connection. Kinds: `live` (an adapter pointed its
+    /// session at new mail, or failed to).
+    Report {
+        kind: String,
+        #[serde(default)]
+        data: Value,
+    },
     /// Wake a wake-enabled worker now (it must have unread mail and not be running).
     WakeNow { agent: String },
     /// Wake configuration and state of this node's workers.

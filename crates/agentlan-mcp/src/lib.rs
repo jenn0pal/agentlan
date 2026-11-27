@@ -96,7 +96,7 @@ pub struct Adapter {
     codex_thread: Arc<std::sync::Mutex<Option<String>>>,
     /// New-mail pushes from every identity's node connection, for live delivery.
     live_tx: client::PushSink,
-    idents: tokio::sync::Mutex<Vec<Ident>>,
+    idents: Arc<tokio::sync::Mutex<Vec<Ident>>>,
     /// Unbound connection for lookups that need no identity (roster, status).
     anon: Arc<NodeClient>,
     instructions: String,
@@ -199,15 +199,16 @@ pub async fn serve(home: PathBuf, agent: Option<String>, runner: Option<Runner>,
         runner: cell.clone(),
         codex_thread: codex_thread.clone(),
         live_tx,
-        idents: tokio::sync::Mutex::new(idents),
+        idents: Arc::new(tokio::sync::Mutex::new(idents)),
         anon,
         instructions,
         worker,
     };
+    let idents = adapter.idents.clone();
     let service = adapter.serve(rmcp::transport::stdio()).await.map_err(|e| anyhow::anyhow!("mcp init failed: {e}"))?;
     // Point this session at new mail as it arrives (woken workers are prompted by the node).
     if !worker {
-        tokio::spawn(live::run(live_rx, service.peer().clone(), cell, codex_thread));
+        tokio::spawn(live::run(live_rx, service.peer().clone(), cell, codex_thread, idents));
     }
     service.waiting().await?;
     Ok(())

@@ -1202,6 +1202,47 @@ Where the code differs from this spec, and why:
   - When a real window closes, its server exits: only the open session's server remained under a daemon that had hosted earlier sessions.
   - A conversation started over the daemon API and abandoned without unsubscribing kept its server running until it was stopped.
 
+**v0.2.0-beta.6 (in progress): seeing what happens (user request: "some logs or anything that we can observe and view interactions").**
+- **Activity table (`node.db`):** each node records sent, received, state (seen/handled/expired), session (connected/role change/disconnected), wake (started/finished/skipped), pause/resume, and node start/stop.
+  - **Self-contained rows:** sender, intent, subject and thread are copied in, because messages expire.
+  - **Best-effort:** a failed insert never fails the operation it describes.
+  - **Pruned to 14 days / 100,000 rows.**
+- **Live deliveries:** the adapter reports them with the new `Report { kind: "live" }` IPC op.
+  - **Attribution:** sent on the identity's own connection, so it's attributed to the attached agent.
+  - **Limits:** fields are whitelisted and bounded. The report is detached, with a 3 s timeout. Older nodes answer `BAD_REQUEST`, which is ignored.
+  - **Failures:** the hourly cap and an unknown Codex thread are recorded too.
+  - **Honest label:** Claude is recorded as "pointer sent", not "woke".
+- **`agentlan log`:** reads the databases read-only, without migrating them.
+  - **Options:** `-f`, `--agent`, `--thread`, `--since`, `-n`, `--body`, `--json`.
+  - **`--network` (server PC):** reads `hub.db`: messages, each recipient's latest delivery state, and roster changes. Read/handled receipts from other PCs reach only the hub.
+  - **Terminal safety:** peer text is stripped of control characters and bidi overrides.
+- **`agentlan dashboard`:** a minimal HTTP/1.1 server with no new HTTP dependency. It listens on 127.0.0.1 and serves GET only, with a 16 KB request limit and a 15 s timeout.
+  - **Endpoints:** `/api/status`, `/api/agents` and `/api/activity` (the same reader as `agentlan log`).
+  - **Access key:** 128 bits from `getrandom`, carried in the URL fragment and sent as `Authorization: Bearer`, compared in constant time.
+  - **Host check:** the `Host` header must be `127.0.0.1:PORT` or `localhost:PORT`.
+  - **Headers:** CSP `default-src 'none'; script-src 'self'; …`, `nosniff`, `no-referrer` and `X-Frame-Options: DENY`.
+  - **Page:** vanilla JS that inserts peer text only with `textContent`.
+- **Codex review of the log:** 7 of 8 findings fixed.
+  - **Writes:** activity is buffered and written once per tick, so there's no extra disk sync per event.
+  - **Network follow:** time-bounded queries and a cursor, instead of rebuilding all history.
+  - **Live reports:** sent only over the live connection, so they can't restart a stopped node.
+  - **Thread ids:** shortened on character boundaries.
+  - **Following:** drains pages from a cursor, and agent filters page back as far as needed.
+  - **Server answers:** recorded as `remote` (accepted, rejected or queued).
+  - **Expired messages:** their text isn't shown.
+  - **Read-only:** the reader no longer falls back to a read-write open.
+  - **Not a bug:** that same-PC deliveries aren't recorded as received. The `sent` row lists the local recipients.
+- **Codex security review of the dashboard:** 8 findings. Seven are fixed; one is documented.
+  - **Connection flooding:** at most 32 connections at once, a 5 s header deadline, and the server keeps running after a failed accept.
+  - **Memory:** network reads take only the fields shown from each message, via `json_extract`. The full envelope is read only for message text, which is capped at 20,000 characters; subjects are capped at 300.
+  - **Network cursor:** follows the hub's order (message rowid, delivery update time, event seq) instead of the sender's `createdAt`, and the thread filter runs in SQL.
+  - **Local follow:** reads forward from the cursor with no `MAX(seq)` shortcut, and `incremental` is its own flag, so cursor 0 works.
+  - **Page:** one poll at a time; replies from an older view or filter, or for another conversation, are dropped; peer ids are kept in a `Map`.
+  - **Ids:** message, thread, reply and task ids are capped at 256 bytes (`MAX_ID_LEN`).
+  - **Parsing:** strict request line, a repeated `Host` or `Authorization` is refused, the size is checked at the end of the headers, and leftover input is drained before a 431 so Windows doesn't reset the connection.
+  - **Documented, not fixed:** a fixed `--port` shares one browser origin across runs, so a tab left open from an earlier run could read the new link. The default random port avoids this.
+- **Found while testing the dashboard:** `send --reply-to` started a new thread. The node now continues the original's thread when the caller didn't choose one; the MCP `reply` tool always did.
+
 **v0.2.0-beta.5 (2026-11-27), fixes from the real test:**
 - **Answers are marked handled once returned.** Previously answers piled up in the inbox.
   - **`request`:** the reply it returns is acked unless it asks something back (`ask`, `request`, `handoff`) or uses a custom intent. The node has already matched that reply to the question, so a plain `chat` reply counts.

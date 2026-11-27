@@ -385,6 +385,11 @@ fn queued_while_hub_down_then_delivered() {
     wait_until("delivered to reviewer", T, || {
         e.json("n2", &["inbox", "--as", "reviewer", "--json"])["messages"].as_array().unwrap().iter().any(|m| m["id"] == wire_id.as_str())
     });
+    // The log shows it queued while the server was down, then taken once it was back.
+    let rows = log_rows(&e, "n1", &["--json"]);
+    let outcome = |st: &str| rows.iter().position(|r| r["kind"] == "remote" && r["msgId"] == wire_id.as_str() && r["body"]["result"]["status"] == st);
+    let (q, a) = (outcome("queued"), outcome("accepted"));
+    assert!(q.is_some() && a.is_some() && q < a, "queued, then accepted: {rows:?}");
 }
 
 /// A spawned `agentlan mcp` speaking JSON-RPC (newline-delimited) over stdio.
@@ -826,6 +831,7 @@ fn request_reply_ignores_unrelated_mail() {
     let r: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(r["status"], "replied", "{r}");
     assert_eq!(r["reply"]["inReplyTo"], qid.as_str());
+    assert_eq!(r["reply"]["threadId"], q["message"]["threadId"], "a `send --reply-to` continues the request's conversation");
     assert_eq!(r["reply"]["parts"][0]["text"], "yes, 30s covers clock drift");
     assert_eq!(r["autoAck"], true, "a reply (plain `send --reply-to` is chat) is marked handled once returned: {r}");
     assert_eq!(q["autoAck"], false, "a request stays open until it's answered: {q}");
@@ -1337,6 +1343,164 @@ fn live_delivery_pushes_a_channel_pointer() {
     assert!(content.contains("1 new message for lead") && content.contains("peer@pc-one") && content.contains("intent request"), "{content}");
     assert!(!content.contains("SECRET BODY"), "pointer only: {content}");
     assert_eq!(n["params"]["meta"]["from"], "peer@pc-one", "{n}");
+
+    // The adapter reported it to the node: it's in the activity log, labelled honestly.
+    wait_until("live delivery in the log", T, || {
+        log_rows(&e, "n1", &["--json"]).iter().any(|r| r["kind"] == "live" && r["body"]["ok"] == true && r["body"]["how"] == "claude channel (pointer sent)")
+    });
+    let txt = String::from_utf8(e.run("n1", &["log"]).stdout).unwrap();
+    assert!(txt.contains("⚡ live → lead@pc-one: 1 new (claude channel (pointer sent))"), "{txt}");
+}
+
+/// `agentlan log --json` (or `--network`) as parsed rows.
+fn log_rows(e: &Env, home: &str, args: &[&str]) -> Vec<Value> {
+    let mut a = vec!["log"];
+    a.extend_from_slice(args);
+    let out = e.run(home, &a);
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// The activity log: each PC's timeline of a request/reply across PCs, filters, the
+/// server's network view, and peer text that can't drive the terminal.
+#[test]
+fn log_shows_the_timeline() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one"), ("n2", "pc-two")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code"]);
+    e.run("n2", &["agent", "add", "reviewer", "--role", "reviewer", "--runner", "codex"]);
+    e.start_node("n1");
+    e.start_node("n2");
+    wait_until("both nodes ready", T, || e.status("n1")["hub"] == "ready" && e.status("n2")["hub"] == "ready");
+    let mut back = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    back.init();
+    let mut rev = Mcp::spawn(&mut e, "n2", "reviewer", "codex");
+    rev.init();
+    wait_until("reviewer online on n1", T, || {
+        e.json("n1", &["ls", "--json"])["agents"].as_array().unwrap().iter().any(|a| a["handle"] == "reviewer@pc-two" && a["state"] == "online")
+    });
+    let rid = back.start("tools/call", serde_json::json!({"name": "request", "arguments": {"to": "@reviewer@pc-two", "subject": "PR 12\u{1b}[2J", "text": "approve PR 12?", "waitS": 20}}));
+    let got = rev.tool("wait_for_message", serde_json::json!({"timeoutS": 15}));
+    let qid = got["structuredContent"]["messages"][0]["id"].as_str().unwrap().to_string();
+    rev.tool("reply", serde_json::json!({"messageId": qid, "text": "approved"}));
+    let res = back.finish(rid);
+    let thread = res["structuredContent"]["sent"]["threadId"].as_str().unwrap().to_string();
+
+    // pc-one: the request going out, the answer coming back, seen and handled.
+    wait_until("pc-one's timeline", T, || {
+        let rows = log_rows(&e, "n1", &["--json"]);
+        let has = |k: &str, f: &dyn Fn(&Value) -> bool| rows.iter().any(|r| r["kind"] == k && f(r));
+        has("node", &|r| r["body"]["status"] == "started")
+            && has("session", &|r| r["body"]["status"] == "attached" && r["body"]["handle"] == "backend@pc-one")
+            && has("sent", &|r| r["msgId"] == qid.as_str() && r["body"]["to"]["handle"] == "reviewer@pc-two" && r["body"]["remote"] == true)
+            && has("received", &|r| r["body"]["from"] == "reviewer@pc-two" && r["body"]["inReplyTo"] == qid.as_str())
+            && has("state", &|r| r["body"]["state"] == "acked" && r["body"]["from"] == "reviewer@pc-two")
+    });
+    // pc-two: the request arriving, seen, handled by the reply.
+    wait_until("pc-two's timeline", T, || {
+        let rows = log_rows(&e, "n2", &["--json"]);
+        rows.iter().any(|r| r["kind"] == "received" && r["msgId"] == qid.as_str())
+            && rows.iter().any(|r| r["kind"] == "state" && r["msgId"] == qid.as_str() && r["body"]["state"] == "acked")
+            && rows.iter().any(|r| r["kind"] == "sent" && r["body"]["inReplyTo"] == qid.as_str())
+    });
+
+    // The server's answer to a send is recorded: taken for the request, rejected for nobody.
+    back.tool("send", serde_json::json!({"to": "@ghost@pc-two", "subject": "nobody home", "text": "hello?"}));
+    wait_until("server answers in the log", T, || {
+        let rows = log_rows(&e, "n1", &["--json"]);
+        rows.iter().any(|r| r["kind"] == "remote" && r["msgId"] == qid.as_str() && r["body"]["result"]["status"] == "accepted")
+            && rows.iter().any(|r| r["kind"] == "remote" && r["body"]["subject"] == "nobody home" && r["body"]["result"]["status"] == "rejected")
+    });
+
+    // Human-readable, with the peer's escape sequence stripped.
+    let txt = String::from_utf8(e.run("n1", &["log", "--body"]).stdout).unwrap();
+    assert!(txt.contains("backend@pc-one → reviewer@pc-two  request  \"PR 12[2J\"  (via server)"), "{txt}");
+    assert!(txt.contains("✓✓ handled by backend@pc-one") && txt.contains("approve PR 12?"), "{txt}");
+    assert!(txt.contains("↗ the server took it for 1 recipient(s)") && txt.contains("✗ the server rejected it  \"nobody home\""), "{txt}");
+    assert!(!txt.contains('\u{1b}'), "no escape sequences reach the terminal: {txt:?}");
+
+    // Filters.
+    let only = log_rows(&e, "n2", &["--json", "--thread", &thread]);
+    assert!(!only.is_empty() && only.iter().all(|r| r["threadId"] == thread.as_str()), "{only:?}");
+    let about = log_rows(&e, "n1", &["--json", "--agent", "reviewer"]);
+    assert!(!about.is_empty() && about.iter().all(|r| r.to_string().contains("reviewer")), "{about:?}");
+    assert_eq!(log_rows(&e, "n1", &["--json", "-n", "2"]).len(), 2);
+
+    // The server's network view: both messages with each recipient's delivery state.
+    wait_until("network view", T, || {
+        let rows = log_rows(&e, "hub", &["--network", "--json"]);
+        rows.iter().any(|r| r["kind"] == "message" && r["msgId"] == qid.as_str() && r["body"]["recipients"][0] == "reviewer@pc-two")
+            && rows.iter().any(|r| r["kind"] == "delivery" && r["msgId"] == qid.as_str() && r["body"]["state"] == "acked")
+            && rows.iter().any(|r| r["kind"] == "roster")
+    });
+    let not_server = e.cmd("n1", &["log", "--network"]).output().unwrap();
+    assert!(!not_server.status.success() && String::from_utf8_lossy(&not_server.stderr).contains("isn't the server"));
+
+    // Follow: new activity shows up while it runs.
+    let mut f = e.cmd("n1", &["log", "--follow", "--json", "-n", "1"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let out = f.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(700));
+    back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "subject": "followed", "text": "hi"}));
+    let t0 = Instant::now();
+    let mut found = false;
+    while t0.elapsed() < T {
+        if let Ok(v) = rx.recv_timeout(Duration::from_millis(500))
+            && v["kind"] == "sent"
+            && v["body"]["subject"] == "followed"
+        {
+            found = true;
+            break;
+        }
+    }
+    let _ = f.kill();
+    let _ = f.wait();
+    assert!(found, "--follow printed the new send");
+
+    // The network view: a thread filter, and following new traffic by the hub's order.
+    let net = log_rows(&e, "hub", &["--network", "--json", "--thread", &thread]);
+    assert!(!net.is_empty() && net.iter().all(|r| r["threadId"] == thread.as_str()), "{net:?}");
+    let mut nf = e.cmd("hub", &["log", "--network", "--follow", "--json", "-n", "1"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let out = nf.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    let first = rx.recv_timeout(T).expect("the newest network row");
+    std::thread::sleep(Duration::from_millis(700));
+    back.tool("send", serde_json::json!({"to": "@reviewer@pc-two", "subject": "network-followed", "text": "hi"}));
+    let t0 = Instant::now();
+    let (mut msg, mut extra) = (false, 0);
+    let mut first_key = first.clone();
+    first_key["seq"] = Value::Null;
+    let mut printed = std::collections::HashSet::from([first_key.to_string()]);
+    let mut repeats = vec![];
+    while t0.elapsed() < Duration::from_secs(4) || (!msg && t0.elapsed() < T) {
+        if let Ok(v) = rx.recv_timeout(Duration::from_millis(500)) {
+            msg |= v["kind"] == "message" && v["body"]["subject"] == "network-followed";
+            extra += usize::from(v["ts"].as_str() < first["ts"].as_str());
+            let mut k = v.clone();
+            k["seq"] = Value::Null; // page-local numbering
+            if !printed.insert(k.to_string()) {
+                repeats.push(v);
+            }
+        }
+    }
+    assert!(repeats.is_empty(), "no row printed twice: {repeats:?}");
+    let _ = nf.kill();
+    let _ = nf.wait();
+    assert!(msg, "--network --follow printed the new message");
+    assert_eq!(extra, 0, "following doesn't replay older history");
 }
 
 /// After an upgrade the old node keeps running. A newer adapter restarts it on the new
@@ -1450,4 +1614,64 @@ fn outdated_node_inside_up_is_only_reported() {
     let note = w["structuredContent"]["nodeNote"].as_str().unwrap_or("");
     assert!(note.contains("restart `agentlan up`"), "{w}");
     assert_eq!(e.status("srv")["version"], "0.0.1", "left running");
+}
+
+/// One raw HTTP/1.1 exchange: (status line, headers, body).
+fn http(port: u16, req: &str) -> (String, String, String) {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = c.read_to_string(&mut out);
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let (status, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    (status.to_string(), headers.to_string(), body.to_string())
+}
+
+/// The dashboard: served on 127.0.0.1 only, data only with the access key, only for its
+/// own Host (no DNS rebinding), GET only, under a strict CSP.
+#[test]
+fn dashboard_serves_only_this_pc() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code"]);
+    e.start_node("n1");
+    let mut d = e.cmd("n1", &["dashboard"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut out = BufReader::new(d.stdout.take().unwrap());
+    let mut first = String::new();
+    out.read_line(&mut first).unwrap();
+    e.kids.push(d);
+    // Keep draining its output (a closed pipe would stop it at its next line).
+    std::thread::spawn(move || for _ in out.lines().map_while(Result::ok) {});
+    let url = first.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).expect("printed a link").to_string();
+    let (addr, key) = url.trim_start_matches("http://").split_once("/#").unwrap();
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    let get = |path: &str, host: &str, auth: Option<&str>| {
+        let a = auth.map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
+        http(port, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{a}\r\n"))
+    };
+    let (st, hd, body) = get("/", addr, None);
+    assert!(st.contains("200") && hd.contains("Content-Security-Policy: default-src 'none'; script-src 'self'") && body.contains("/app.js"), "{st}\n{hd}");
+    assert!(get("/app.js", addr, None).2.contains("textContent"), "the page script");
+    assert!(get("/api/activity", addr, None).0.contains("401"), "no key, no data");
+    assert!(get("/api/activity", addr, Some("0000")).0.contains("401"), "wrong key");
+    assert!(get("/api/activity", &format!("evil.example:{port}"), Some(key)).0.contains("403"), "foreign Host");
+    let (st, _, _) = http(port, &format!("POST /api/activity HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Length: 0\r\n\r\n"));
+    assert!(st.contains("405"), "{st}");
+    let (st, _, _) = http(port, &format!("GET /api/activity HTTP/1.1\r\nHost: {addr}\r\nHost: evil.example\r\nAuthorization: Bearer {key}\r\n\r\n"));
+    assert!(st.contains("400"), "a repeated Host is refused: {st}");
+    let (st, _, _) = http(port, &format!("GET / HTTP/1.1\r\nHost: {addr}\r\nX-Pad: {}\r\n\r\n", "a".repeat(20_000)));
+    assert!(st.contains("431"), "oversized headers: {st}");
+    let mut b = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    b.init();
+    let (st, _, body) = get("/api/activity?limit=50", addr, Some(key));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(st.contains("200") && v["rows"].as_array().is_some_and(|r| r.iter().any(|r| r["kind"] == "node")) && v["cursor"].as_i64().unwrap() > 0, "{body}");
+    wait_until("agents via the dashboard", T, || {
+        let (st, _, body) = get("/api/agents", addr, Some(key));
+        st.contains("200") && body.contains("backend@pc-one")
+    });
+    let (st, _, body) = get("/api/status", addr, Some(key));
+    assert!(st.contains("200") && body.contains("\"network\":false") && body.contains("pc-one"), "{body}");
 }

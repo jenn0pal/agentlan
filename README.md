@@ -305,6 +305,49 @@ agentlan hooks print claude   # prints a snippet for .claude/settings.local.json
   - **Check the result** with `claude auto-mode critique` and `claude auto-mode config`. See [auto mode configuration](https://code.claude.com/docs/en/auto-mode-config).
   - **Add it yourself.** Auto mode blocks an agent from widening its own permissions.
 
+**See what's happening.** `agentlan log` shows one timeline of what happened on this PC:
+- messages sent and received, and when each was seen and handled;
+- live deliveries into open sessions, including failed ones and why;
+- agents connecting and disconnecting, worker wakes, and loop-guard pauses.
+
+```sh
+agentlan log                      # the last 50 entries
+agentlan log -f                   # keep following
+agentlan log --agent codex --since 2h --body   # one agent, with message text
+agentlan log --thread thr_…       # one conversation
+agentlan log --network            # on the server PC: traffic between PCs, each recipient's state, who came and went
+agentlan log --json               # one JSON object per line, for scripts
+```
+
+```text
+17:04:09    ● backend@pc-one connected (claude-code · role backend)
+17:04:10  backend@pc-one → reviewer@pc-two  request  "PR 12"  (via server)  thr_…5GV6QV
+17:04:10    ↳ backend@pc-one got it from reviewer@pc-two  "Re: PR 12" (via server)
+17:04:10    ✓✓ handled by backend@pc-one  "Re: PR 12"
+17:05:31    ⚡ live → codex@pc-one: 1 new (codex turn/start)
+```
+
+- **Where the record lives:** each PC keeps its own activity record for 14 days, at most 100,000 entries.
+- **Other PCs:** whether an agent on another PC has seen or handled a message is known only to the server, so it shows in `--network` there.
+- **Message text** appears only with `--body`.
+- **Peer-written text** has control characters stripped before it reaches the terminal.
+
+**Dashboard.** `agentlan dashboard` serves the same data as a local web page:
+- who's online;
+- a live timeline you can filter by agent;
+- each conversation as a chat, with when each message was seen and handled;
+- on the server PC, a **Network** view of traffic between PCs.
+
+```sh
+agentlan dashboard            # prints a link like http://127.0.0.1:52817/#3f9c…; open it in a browser
+```
+
+- **Only this PC can reach it.** It listens on 127.0.0.1, every data request needs the random key from the printed link, and requests for any other host name are refused, which stops DNS rebinding.
+- **The key stays in the link.** It sits in the part after `#`, so the browser never sends it anywhere on its own.
+- **Peer text is shown as text,** never HTML, under a strict Content-Security-Policy.
+- **It changes nothing:** it only reads (GET), so it can't send messages or change anything.
+- **It stops** when you stop the command.
+
 **Scripts and other agents** use the CLI:
 
 ```sh
