@@ -1404,7 +1404,9 @@ fn outdated_node_is_restarted_only_when_idle() {
     let mut d = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
     d.init();
     let w = d.tool("whoami", serde_json::json!({}));
-    assert!(note(&w).contains("is in use"), "{w}");
+    // (A host that forbids breakaway, like some Windows CI runners, stops even earlier.)
+    let cant = cfg!(windows) && note(&w).contains("can't start a node that outlives it");
+    assert!(note(&w).contains("is in use") || cant, "{w}");
     assert_eq!(e.status("n1")["version"], "0.0.1", "not restarted under a waiting script");
     assert!(e.kids[wi].try_wait().unwrap().is_none(), "the script is still waiting");
     e.kill(di);
