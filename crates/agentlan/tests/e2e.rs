@@ -385,11 +385,14 @@ fn queued_while_hub_down_then_delivered() {
     wait_until("delivered to reviewer", T, || {
         e.json("n2", &["inbox", "--as", "reviewer", "--json"])["messages"].as_array().unwrap().iter().any(|m| m["id"] == wire_id.as_str())
     });
-    // The log shows it queued while the server was down, then taken once it was back.
-    let rows = log_rows(&e, "n1", &["--json"]);
-    let outcome = |st: &str| rows.iter().position(|r| r["kind"] == "remote" && r["msgId"] == wire_id.as_str() && r["body"]["result"]["status"] == st);
-    let (q, a) = (outcome("queued"), outcome("accepted"));
-    assert!(q.is_some() && a.is_some() && q < a, "queued, then accepted: {rows:?}");
+    // The log shows it queued while the server was down, then taken once it was back. The node
+    // writes its log in batches (every 100 ms), and the server's answer can reach n1 after the
+    // message reaches n2, so poll rather than read once.
+    wait_until("queued, then accepted, in n1's log", T, || {
+        let rows = log_rows(&e, "n1", &["--json"]);
+        let outcome = |st: &str| rows.iter().position(|r| r["kind"] == "remote" && r["msgId"] == wire_id.as_str() && r["body"]["result"]["status"] == st);
+        matches!((outcome("queued"), outcome("accepted")), (Some(q), Some(a)) if q < a)
+    });
 }
 
 /// A spawned `agentlan mcp` speaking JSON-RPC (newline-delimited) over stdio.
