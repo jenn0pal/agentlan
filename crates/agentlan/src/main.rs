@@ -1,5 +1,6 @@
 //! `agentlan` — one binary: hub, node daemon and CLI client.
 
+mod dashboard;
 mod hooks;
 mod logcli;
 mod wakecli;
@@ -139,6 +140,14 @@ enum Cmd {
         /// One JSON object per line.
         #[arg(long)]
         json: bool,
+    },
+    /// A local web page over the same data as `agentlan log`: who's online, a live
+    /// timeline, conversations, and (on the server PC) the network view. Reachable only
+    /// from this PC, through the link it prints.
+    Dashboard {
+        /// Port on 127.0.0.1 (default: any free port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
     },
     /// Send a message. TARGET: @name@machine | agt_… | role:R[@project] | project:P | machine:M | all.
     /// With --stdin, read an AMF draft (JSON) from stdin.
@@ -676,6 +685,7 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             stream(home, Some(IpcOp::Attach { agent, runner: Some("cli".into()), pid: Some(std::process::id()), host_pid: None, takeover }), json).await?
         }
         Cmd::Watch { as_agent, json } => stream(home, Some(IpcOp::Watch { agent: as_agent }), json).await?,
+        Cmd::Dashboard { port } => dashboard::run(home, port).await?,
         Cmd::Log { follow, network, agent, thread, since, limit, body, json } => {
             logcli::run(home, logcli::LogArgs { follow, network, agent, thread, since, limit, body, json }).await?
         }

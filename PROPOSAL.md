@@ -1216,6 +1216,23 @@ Where the code differs from this spec, and why:
   - **Options:** `-f`, `--agent`, `--thread`, `--since`, `-n`, `--body`, `--json`.
   - **`--network` (server PC):** reads `hub.db`: messages, each recipient's latest delivery state, and roster changes. Read/handled receipts from other PCs reach only the hub.
   - **Terminal safety:** peer text is stripped of control characters and bidi overrides.
+- **`agentlan dashboard`:** a minimal HTTP/1.1 server with no new HTTP dependency. It listens on 127.0.0.1 and serves GET only, with a 16 KB request limit and a 15 s timeout.
+  - **Endpoints:** `/api/status`, `/api/agents` and `/api/activity` (the same reader as `agentlan log`).
+  - **Access key:** 128 bits from `getrandom`, carried in the URL fragment and sent as `Authorization: Bearer`, compared in constant time.
+  - **Host check:** the `Host` header must be `127.0.0.1:PORT` or `localhost:PORT`.
+  - **Headers:** CSP `default-src 'none'; script-src 'self'; …`, `nosniff`, `no-referrer` and `X-Frame-Options: DENY`.
+  - **Page:** vanilla JS that inserts peer text only with `textContent`.
+- **Codex review of the log:** 7 of 8 findings fixed.
+  - **Writes:** activity is buffered and written once per tick, so there's no extra disk sync per event.
+  - **Network follow:** time-bounded queries and a cursor, instead of rebuilding all history.
+  - **Live reports:** sent only over the live connection, so they can't restart a stopped node.
+  - **Thread ids:** shortened on character boundaries.
+  - **Following:** drains pages from a cursor, and agent filters page back as far as needed.
+  - **Server answers:** recorded as `remote` (accepted, rejected or queued).
+  - **Expired messages:** their text isn't shown.
+  - **Read-only:** the reader no longer falls back to a read-write open.
+  - **Not a bug:** that same-PC deliveries aren't recorded as received. The `sent` row lists the local recipients.
+- **Found while testing the dashboard:** `send --reply-to` started a new thread. The node now continues the original's thread when the caller didn't choose one; the MCP `reply` tool always did.
 
 **v0.2.0-beta.5 (2026-11-27), fixes from the real test:**
 - **Answers are marked handled once returned.** Previously answers piled up in the inbox.

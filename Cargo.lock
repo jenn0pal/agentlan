@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "agentlan-hub",
  "agentlan-mcp",
@@ -51,6 +51,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "getrandom 0.3.4",
  "interprocess",
  "serde",
  "serde_json",
@@ -61,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-hub"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "agentlan-net",
  "agentlan-proto",
@@ -79,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-mcp"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "agentlan-node",
  "agentlan-proto",
@@ -97,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-net"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "agentlan-proto",
  "anyhow",
@@ -112,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-node"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "agentlan-net",
  "agentlan-proto",
@@ -134,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-proto"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -145,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-store"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 dependencies = [
  "anyhow",
  "rusqlite",

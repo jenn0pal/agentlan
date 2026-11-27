@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>AgentLAN</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header>
+  <div class="brand">AgentLAN</div>
+  <div id="summary" class="summary"></div>
+  <nav class="views" aria-label="View">
+    <button id="view-pc" class="on" type="button">This PC</button>
+    <button id="view-net" type="button" hidden>Network</button>
+  </nav>
+</header>
+<div id="banner" class="banner" role="status" hidden></div>
+<main id="main">
+  <aside id="agents-pane">
+    <h2>Agents</h2>
+    <ul id="agents"></ul>
+    <p class="hint">Click an agent to filter the timeline.</p>
+  </aside>
+  <section id="timeline-pane">
+    <div class="toolbar">
+      <h2 id="timeline-title">Timeline</h2>
+      <button id="filter" class="chip" type="button" hidden></button>
+      <label class="toggle"><input type="checkbox" id="pause"> Pause</label>
+    </div>
+    <ol id="timeline"></ol>
+    <p id="empty" class="empty" hidden>Nothing recorded yet.</p>
+  </section>
+  <section id="thread-pane" hidden>
+    <div class="toolbar">
+      <h2>Conversation</h2>
+      <button id="close-thread" class="close" type="button" aria-label="Close conversation">×</button>
+    </div>
+    <div id="thread"></div>
+  </section>
+</main>
+</body>
+</html>

@@ -61,13 +61,15 @@ pub fn pointer(name: &str, count: u32, from: Option<&str>, intent: Option<&str>)
 }
 
 /// Record a live-delivery attempt in the node's activity log (`agentlan log`), on the
-/// identity's own connection. Detached and time-limited: never holds up delivery. An
-/// older node answers an error for the unknown op, which is ignored.
+/// identity's own connection, and only while it's still connected (it never reconnects,
+/// so it can't restart a stopped node or land on a later session). Detached and
+/// time-limited: never holds up delivery. An older node answers an error for the
+/// unknown op, which is ignored.
 async fn report(idents: &Arc<tokio::sync::Mutex<Vec<crate::Ident>>>, name: &str, data: Value) {
     let client = idents.lock().await.iter().find(|i| i.name == name).map(|i| i.client.clone());
     if let Some(c) = client {
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(Duration::from_secs(3), c.call(agentlan_proto::ipc::IpcOp::Report { kind: "live".into(), data })).await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), c.call_if_connected(agentlan_proto::ipc::IpcOp::Report { kind: "live".into(), data })).await;
         });
     }
 }

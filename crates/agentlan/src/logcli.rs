@@ -66,9 +66,12 @@ fn time(ts: &str) -> String {
     }
 }
 
+/// `thr_…ABCDEF`: the last six characters (on character boundaries: thread ids are
+/// caller-supplied and may hold any text).
 fn short_thread(t: &str) -> String {
     let t = clean(t, false);
-    if t.len() > 12 { format!("thr_…{}", &t[t.len() - 6..]) } else { t }
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() > 12 { format!("thr_…{}", chars[chars.len() - 6..].iter().collect::<String>()) } else { t }
 }
 
 fn target(to: &Value, local: &[String]) -> String {
@@ -109,6 +112,15 @@ pub fn render(r: &ActivityRow) -> String {
                 subject(b),
                 r.thread_id.as_deref().map(short_thread).unwrap_or_default()
             )
+        }
+        "remote" => {
+            let res = &b["result"];
+            match s(res, "status") {
+                "accepted" => format!("{t}    ↗ the server took it for {} recipient(s){}", res["count"].as_u64().unwrap_or(0), subject(b)),
+                "rejected" => format!("{t}    ✗ the server rejected it{}: {}", subject(b), clean(s(res, "msg"), false)),
+                "queued" => format!("{t}    … the server didn't answer; queued to send later{}", subject(b)),
+                other => format!("{t}    server: {}{}", clean(other, false), subject(b)),
+            }
         }
         "received" => format!("{t}    ↳ {who} got it from {}{}{}", clean(s(b, "from"), false), subject(b), if b["remote"] == true { " (via server)" } else { "" }),
         "state" | "delivery" => {
@@ -182,38 +194,49 @@ pub async fn run(home: &Path, a: LogArgs) -> Result<()> {
             println!("{}", render(r));
         }
     };
-    let rows = read(&f)?;
-    if rows.is_empty() && !a.follow && !a.json {
+    let page = read(&f)?;
+    if page.rows.is_empty() && !a.follow && !a.json {
         println!("(nothing recorded{})", if f.since.is_some() || f.agent.is_some() || f.thread.is_some() { " that matches" } else { " yet" });
     }
-    // The network view re-derives its rows (a delivery's state changes in place), so follow
-    // it by content; this PC's log is append-only, so follow it by sequence number.
-    let mut seen: HashSet<String> = HashSet::new();
+    // The network view: a delivery's state changes in place, so follow it by time and drop
+    // repeats at the boundary. Intermediate states between two polls aren't kept by the hub.
     let key = |r: &ActivityRow| format!("{}|{}|{}|{}|{}", r.kind, r.ts, r.msg_id.as_deref().unwrap_or(""), r.agent.as_deref().unwrap_or(""), r.body["state"]);
-    for r in &rows {
+    let mut seen: HashSet<String> = page.rows.iter().map(key).collect();
+    for r in &page.rows {
         print(r);
-        seen.insert(key(r));
-        f.after_seq = f.after_seq.max(r.seq);
     }
     if !a.follow {
         return Ok(());
     }
-    f.limit = 10_000;
+    let (mut cursor, mut cursor_ts) = (page.cursor, page.cursor_ts);
+    f.limit = 1000;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if a.network {
-            f.after_seq = 0;
-        }
-        let rows = match read(&f) {
-            Ok(r) => r,
-            Err(_) => continue, // e.g. the node restarting
-        };
-        for r in rows {
-            if a.network && !seen.insert(key(&r)) {
-                continue;
+            f.since = Some(cursor_ts.clone());
+            let Ok(p) = read(&f) else { continue };
+            for r in &p.rows {
+                if seen.insert(key(r)) {
+                    print(r);
+                }
             }
-            print(&r);
-            f.after_seq = f.after_seq.max(r.seq);
+            if p.cursor_ts > cursor_ts {
+                cursor_ts = p.cursor_ts;
+                seen.retain(|k| k.split('|').nth(1).is_some_and(|ts| ts >= cursor_ts.as_str()));
+            }
+        } else {
+            // Drain everything after the cursor, a page at a time (none skipped).
+            loop {
+                f.after_seq = cursor.max(1);
+                let Ok(p) = read(&f) else { break }; // e.g. the node restarting
+                for r in &p.rows {
+                    print(r);
+                }
+                if p.cursor <= cursor {
+                    break;
+                }
+                cursor = p.cursor;
+            }
         }
     }
 }
@@ -243,6 +266,14 @@ mod tests {
         assert!(!out.contains('\u{1b}'), "{out:?}");
         assert!(out.contains("lead@pc[31m → codex@pc  request  \"hi there[0m\""), "{out}");
         assert!(out.contains("\n          line1\n          [2Jline2"), "{out}");
+    }
+
+    #[test]
+    fn thread_ids_shorten_on_character_boundaries() {
+        assert_eq!(short_thread("thr_01M8DBW56GEM66Q6Q9W0EDWFHB"), "thr_…EDWFHB");
+        let emoji = "my-thread-🚀🚀🚀🚀🚀🚀🚀";
+        assert_eq!(short_thread(emoji), "thr_…🚀🚀🚀🚀🚀🚀");
+        assert_eq!(short_thread("x🚀"), "x🚀");
     }
 
     #[test]

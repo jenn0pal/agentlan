@@ -826,6 +826,7 @@ fn request_reply_ignores_unrelated_mail() {
     let r: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(r["status"], "replied", "{r}");
     assert_eq!(r["reply"]["inReplyTo"], qid.as_str());
+    assert_eq!(r["reply"]["threadId"], q["message"]["threadId"], "a `send --reply-to` continues the request's conversation");
     assert_eq!(r["reply"]["parts"][0]["text"], "yes, 30s covers clock drift");
     assert_eq!(r["autoAck"], true, "a reply (plain `send --reply-to` is chat) is marked handled once returned: {r}");
     assert_eq!(q["autoAck"], false, "a request stays open until it's answered: {q}");
@@ -1397,10 +1398,19 @@ fn log_shows_the_timeline() {
             && rows.iter().any(|r| r["kind"] == "sent" && r["body"]["inReplyTo"] == qid.as_str())
     });
 
+    // The server's answer to a send is recorded: taken for the request, rejected for nobody.
+    back.tool("send", serde_json::json!({"to": "@ghost@pc-two", "subject": "nobody home", "text": "hello?"}));
+    wait_until("server answers in the log", T, || {
+        let rows = log_rows(&e, "n1", &["--json"]);
+        rows.iter().any(|r| r["kind"] == "remote" && r["msgId"] == qid.as_str() && r["body"]["result"]["status"] == "accepted")
+            && rows.iter().any(|r| r["kind"] == "remote" && r["body"]["subject"] == "nobody home" && r["body"]["result"]["status"] == "rejected")
+    });
+
     // Human-readable, with the peer's escape sequence stripped.
     let txt = String::from_utf8(e.run("n1", &["log", "--body"]).stdout).unwrap();
     assert!(txt.contains("backend@pc-one → reviewer@pc-two  request  \"PR 12[2J\"  (via server)"), "{txt}");
     assert!(txt.contains("✓✓ handled by backend@pc-one") && txt.contains("approve PR 12?"), "{txt}");
+    assert!(txt.contains("↗ the server took it for 1 recipient(s)") && txt.contains("✗ the server rejected it  \"nobody home\""), "{txt}");
     assert!(!txt.contains('\u{1b}'), "no escape sequences reach the terminal: {txt:?}");
 
     // Filters.
@@ -1560,4 +1570,57 @@ fn outdated_node_inside_up_is_only_reported() {
     let note = w["structuredContent"]["nodeNote"].as_str().unwrap_or("");
     assert!(note.contains("restart `agentlan up`"), "{w}");
     assert_eq!(e.status("srv")["version"], "0.0.1", "left running");
+}
+
+/// One raw HTTP/1.1 exchange: (status line, headers, body).
+fn http(port: u16, req: &str) -> (String, String, String) {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = c.read_to_string(&mut out);
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let (status, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    (status.to_string(), headers.to_string(), body.to_string())
+}
+
+/// The dashboard: served on 127.0.0.1 only, data only with the access key, only for its
+/// own Host (no DNS rebinding), GET only, under a strict CSP.
+#[test]
+fn dashboard_serves_only_this_pc() {
+    let mut e = Env::new();
+    e.network(&[("n1", "pc-one")]);
+    e.run("n1", &["agent", "add", "backend", "--role", "backend", "--runner", "claude-code"]);
+    e.start_node("n1");
+    let mut d = e.cmd("n1", &["dashboard"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut first = String::new();
+    BufReader::new(d.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    e.kids.push(d);
+    let url = first.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).expect("printed a link").to_string();
+    let (addr, key) = url.trim_start_matches("http://").split_once("/#").unwrap();
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    let get = |path: &str, host: &str, auth: Option<&str>| {
+        let a = auth.map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
+        http(port, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{a}\r\n"))
+    };
+    let (st, hd, body) = get("/", addr, None);
+    assert!(st.contains("200") && hd.contains("Content-Security-Policy: default-src 'none'; script-src 'self'") && body.contains("/app.js"), "{st}\n{hd}");
+    assert!(get("/app.js", addr, None).2.contains("textContent"), "the page script");
+    assert!(get("/api/activity", addr, None).0.contains("401"), "no key, no data");
+    assert!(get("/api/activity", addr, Some("0000")).0.contains("401"), "wrong key");
+    assert!(get("/api/activity", &format!("evil.example:{port}"), Some(key)).0.contains("403"), "foreign Host");
+    let (st, _, _) = http(port, &format!("POST /api/activity HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Length: 0\r\n\r\n"));
+    assert!(st.contains("405"), "{st}");
+    let mut b = Mcp::spawn(&mut e, "n1", "backend", "claude-code");
+    b.init();
+    let (st, _, body) = get("/api/activity?limit=50", addr, Some(key));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(st.contains("200") && v["rows"].as_array().is_some_and(|r| r.iter().any(|r| r["kind"] == "node")) && v["cursor"].as_i64().unwrap() > 0, "{body}");
+    wait_until("agents via the dashboard", T, || {
+        let (st, _, body) = get("/api/agents", addr, Some(key));
+        st.contains("200") && body.contains("backend@pc-one")
+    });
+    let (st, _, body) = get("/api/status", addr, Some(key));
+    assert!(st.contains("200") && body.contains("\"network\":false") && body.contains("pc-one"), "{body}");
 }

@@ -297,6 +297,21 @@ impl NodeClient {
         self.call_with_id(id, op).await
     }
 
+    /// Call over the current connection only: never reconnects or starts a node (so a
+    /// background report can't bring back a node that was stopped meanwhile). `None` when
+    /// there's no live connection or the session ended.
+    pub async fn call_if_connected(&self, op: IpcOp) -> Option<std::result::Result<Value, CallError>> {
+        if self.ended.lock().await.is_some() {
+            return None;
+        }
+        let live = {
+            let guard = self.live.lock().await;
+            guard.as_ref().filter(|l| l.alive.load(Ordering::SeqCst)).cloned()?
+        };
+        let id = self.reserve_id();
+        Some(self.raw_id(&live, id, op).await.map_err(|e| CallError { code: e.code, msg: e.msg }))
+    }
+
     pub async fn call_with_id(&self, id: u64, op: IpcOp) -> std::result::Result<Value, CallError> {
         if let Some(why) = self.ended.lock().await.clone() {
             return Err(CallError { code: "SESSION_ENDED".into(), msg: why });

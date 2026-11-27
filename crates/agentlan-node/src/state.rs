@@ -36,11 +36,24 @@ CREATE TABLE IF NOT EXISTS request_recipients(msg_id TEXT NOT NULL, agent_id TEX
 CREATE TABLE IF NOT EXISTS activity(seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, kind TEXT NOT NULL,
   agent TEXT, msg_id TEXT, thread_id TEXT, body TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS activity_thread ON activity(thread_id);
+CREATE INDEX IF NOT EXISTS activity_ts ON activity(ts);
 "#;
 
 /// How long and how much activity history a node keeps (`agentlan log`).
 const ACTIVITY_DAYS: i64 = 14;
 const ACTIVITY_MAX_ROWS: i64 = 100_000;
+/// Activity rows waiting to be written (flushed every tick); beyond this the oldest go.
+const ACTIVITY_BUFFER: usize = 10_000;
+
+/// One activity row not yet written.
+struct PendingActivity {
+    ts: String,
+    kind: String,
+    agent: Option<String>,
+    msg_id: Option<String>,
+    thread_id: Option<String>,
+    body: String,
+}
 
 /// Loop-guard limits (cost/safety brake; agents run as the same OS user, so this is
 /// not a security boundary). Overridable via env for tests and tuning.
@@ -195,6 +208,9 @@ pub struct NodeState {
     pub(crate) with_hub: bool,
     /// When the activity log was last pruned.
     activity_pruned: Instant,
+    /// Activity rows recorded since the last flush (written in one transaction per tick,
+    /// so recording never adds a disk sync to the operation it describes).
+    activity_buf: std::cell::RefCell<Vec<PendingActivity>>,
     /// Worker wake: due time per agent (debounced), in-flight wakes, and agents that got
     /// new mail while their wake was running.
     wake_due: HashMap<String, Instant>,
@@ -290,6 +306,7 @@ impl NodeState {
             stopping: false,
             with_hub: false,
             activity_pruned: Instant::now(),
+            activity_buf: std::cell::RefCell::new(Vec::new()),
             wake_due: HashMap::new(),
             wake_inflight: HashMap::new(),
             wake_again: HashSet::new(),
@@ -307,6 +324,7 @@ impl NodeState {
             if self.stopping {
                 info!("node: stopping (requested over IPC)");
                 self.activity("node", None, None, json!({"status": "stopped"}));
+                self.flush_activity();
                 // Stop running wakes (dropping a wake kills its agent process).
                 for (_, (_, h)) in self.wake_inflight.drain() {
                     h.abort();
@@ -607,6 +625,10 @@ impl NodeState {
                 return Err(e);
             }
         }
+        match self.envelope(msg_id) {
+            Some(env) => self.activity("remote", Some(&env.from.agent), Some(&env), json!({"result": remote})),
+            None => self.activity("remote", None, None, json!({"result": remote, "msgId": msg_id})),
+        }
         self.finish_pending(msg_id, remote);
         Ok(())
     }
@@ -808,6 +830,7 @@ impl NodeState {
 
     fn tick(&mut self) {
         let now_i = Instant::now();
+        self.flush_activity();
         if now_i.duration_since(self.activity_pruned) >= Duration::from_secs(60) {
             self.activity_pruned = now_i;
             self.prune_activity();
@@ -849,12 +872,39 @@ impl NodeState {
         {
             o.insert("handle".into(), json!(self.handle_of(p)));
         }
-        let r = self.db.execute(
-            "INSERT INTO activity(ts, kind, agent, msg_id, thread_id, body) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![now().to_rfc3339(), kind, agent, msg.map(|m| m.id.as_str()), msg.map(|m| m.thread_id.as_str()), body.to_string()],
-        );
+        let mut buf = self.activity_buf.borrow_mut();
+        if buf.len() >= ACTIVITY_BUFFER {
+            buf.remove(0);
+        }
+        buf.push(PendingActivity {
+            ts: now().to_rfc3339(),
+            kind: kind.to_string(),
+            agent: agent.map(String::from),
+            msg_id: msg.map(|m| m.id.clone()),
+            thread_id: msg.map(|m| m.thread_id.clone()),
+            body: body.to_string(),
+        });
+    }
+
+    /// Write buffered activity rows in one transaction (best-effort).
+    pub(crate) fn flush_activity(&self) {
+        let rows = std::mem::take(&mut *self.activity_buf.borrow_mut());
+        if rows.is_empty() {
+            return;
+        }
+        let r = (|| -> Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            {
+                let mut st = tx.prepare_cached("INSERT INTO activity(ts, kind, agent, msg_id, thread_id, body) VALUES(?1,?2,?3,?4,?5,?6)")?;
+                for a in &rows {
+                    st.execute(params![a.ts, a.kind, a.agent, a.msg_id, a.thread_id, a.body])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })();
         if let Err(e) = r {
-            debug!("activity: couldn't record {kind}: {e}");
+            debug!("activity: couldn't write {} row(s): {e:#}", rows.len());
         }
     }
 
@@ -1719,6 +1769,13 @@ impl NodeState {
                 return Ok(Err((canon, serde_json::to_value(res)?)));
             }
             draft.id = Some(canon);
+        }
+        // A reply continues the conversation it answers, unless the caller chose a thread
+        // (the MCP `reply` tool always did; `send --reply-to` started a new one).
+        if draft.thread_id.is_none()
+            && let Some(orig) = draft.in_reply_to.as_deref().and_then(|rt| self.envelope(rt))
+        {
+            draft.thread_id = Some(orig.thread_id);
         }
         let from = From { agent: sender.agent_id.clone(), handle: Some(self.handle_of(&sender)), role: Some(sender.role.clone()), origin: Origin::Agent };
         let env = draft.into_amf(from, DEFAULT_TTL_HOURS).map_err(|e| IpcErr("INVALID", e.to_string()))?;

@@ -332,6 +332,22 @@ agentlan log --json               # one JSON object per line, for scripts
 - **Message text** appears only with `--body`.
 - **Peer-written text** has control characters stripped before it reaches the terminal.
 
+**Dashboard.** `agentlan dashboard` serves the same data as a local web page:
+- who's online;
+- a live timeline you can filter by agent;
+- each conversation as a chat, with when each message was seen and handled;
+- on the server PC, a **Network** view of traffic between PCs.
+
+```sh
+agentlan dashboard            # prints a link like http://127.0.0.1:52817/#3f9c…; open it in a browser
+```
+
+- **Only this PC can reach it.** It listens on 127.0.0.1, every data request needs the random key from the printed link, and requests for any other host name are refused, which stops DNS rebinding.
+- **The key stays in the link.** It sits in the part after `#`, so the browser never sends it anywhere on its own.
+- **Peer text is shown as text,** never HTML, under a strict Content-Security-Policy.
+- **It changes nothing:** it only reads (GET), so it can't send messages or change anything.
+- **It stops** when you stop the command.
+
 **Scripts and other agents** use the CLI:
 
 ```sh
