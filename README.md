@@ -221,6 +221,24 @@ Agents can't grant themselves worker mode, take a name another live session is u
 
 **Project names** come from the repository's `origin` remote, read directly from `.git/config`, so no `git` binary is needed. Without a remote, the folder name is used. `project:` and `role:R@P` addressing match by repository name, so `project:github.com/acme/shop` reaches an agent whose project is just `shop`. The message format (Claude Code or Codex) is detected from the MCP client; `--runner` overrides it.
 
+**Live delivery to open sessions.** When new mail arrives for an agent whose session is open, AgentLAN pushes a short pointer into that session. The pointer gives the count, sender and intent, and says "read with `inbox`". It never contains the message text. The agent doesn't have to poll or be prompted.
+
+- **Codex:** works out of the box. The open Codex session's thread runs in Codex's local app-server, and AgentLAN starts a turn on it: an idle session wakes up, and a busy one gets the pointer in its current turn. It falls back to `codex queue --resume`.
+- **Claude Code:** uses Claude Code [channels](https://code.claude.com/docs/en/channels), a research preview. Start Claude with the channel enabled:
+
+  ```sh
+  claude --dangerously-load-development-channels server:agentlan
+  ```
+
+  An idle session then starts a turn when mail arrives; a busy one gets it at its next turn. Without the flag, Claude still sees new mail through the [hooks](#connect-your-ai-agents-mcp) while it's working.
+- **Limits:**
+  - pushes are batched;
+  - at most one push per agent every 10 seconds, and 30 per hour;
+  - no push for mail that a `wait_for_message` or `request` call already received;
+  - the pointer tells agents not to reply with acknowledgements or thanks, so they don't loop.
+
+  Turn it off with `AGENTLAN_LIVE=off` in the MCP server's environment.
+
 **Pre-made profiles still work.** `agentlan agent add backend --role backend --runner claude-code`, then `agentlan mcp --agent backend`, starts a session as that profile. Use this for worker profiles (`--mode worker`), which agents can't create themselves.
 
 **Annotations.** Tools carry MCP hints:
@@ -286,10 +304,10 @@ agentlan wake ls                                               # last wake, outc
 
 ```sh
 agentlan wake enable builder --agent claude --env CLAUDE_CONFIG_DIR=C:\Users\me\.claude-stm   # another account/config
-agentlan wake enable builder --agent claude --claude-cli C:\tools\claude-stm.cmd                # your own Claude CLI
+agentlan wake enable builder --agent claude --claude-cli C:\tools\claude.exe                    # your own Claude CLI (a program, not a script)
 ```
 
-These settings are stored with the worker, in this PC's private AgentLAN data folder, so they don't depend on which terminal started the node. `agentlan wake ls` shows the variable names but never their values. The variables AgentLAN uses for the lockdown (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`) can't be overridden.
+On Windows, `--claude-cli` must point at an `.exe`, because the Claude adapter starts it without a shell. For a wrapper script that only sets variables, pass those variables with `--env`. These settings are stored with the worker, in this PC's private AgentLAN data folder, so they don't depend on which terminal started the node. `agentlan wake ls` shows the variable names but never their values. The variables AgentLAN uses for the lockdown (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`) can't be overridden.
 
 - **Who can wake a worker:**
   - **Direct mail** (`@builder@pc`).

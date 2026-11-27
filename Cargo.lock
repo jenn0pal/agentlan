@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "agentlan-hub",
  "agentlan-mcp",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-hub"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "agentlan-net",
  "agentlan-proto",
@@ -79,23 +79,25 @@ dependencies = [
 
 [[package]]
 name = "agentlan-mcp"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "agentlan-node",
  "agentlan-proto",
  "anyhow",
  "chrono",
+ "futures-util",
  "interprocess",
  "rmcp",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
 ]
 
 [[package]]
 name = "agentlan-net"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "agentlan-proto",
  "anyhow",
@@ -110,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-node"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "agentlan-net",
  "agentlan-proto",
@@ -131,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-proto"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -142,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "agentlan-store"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -801,6 +803,22 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "http"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
+dependencies = [
+ "bytes",
+ "itoa",
+]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hybrid-array"
@@ -1466,6 +1484,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1674,6 +1703,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1785,6 +1826,22 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand",
+ "sha1",
+ "thiserror",
 ]
 
 [[package]]

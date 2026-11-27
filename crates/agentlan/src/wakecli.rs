@@ -83,7 +83,9 @@ pub fn enable(
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || k.starts_with(|c: char| c.is_ascii_digit()) {
             bail!("--env: '{k}' isn't a valid variable name");
         }
-        if RESERVED_ENV.contains(&k) {
+        // Windows environment names are case-insensitive; elsewhere they're exact.
+        let reserved = if cfg!(windows) { RESERVED_ENV.iter().any(|r| r.eq_ignore_ascii_case(k)) } else { RESERVED_ENV.contains(&k) };
+        if reserved {
             bail!("--env: {k} is set by AgentLAN for the worker's lockdown and can't be overridden");
         }
         vars.insert(k.to_string(), v.to_string());
@@ -93,6 +95,17 @@ pub fn enable(
             bail!("--claude-cli is for --agent claude");
         }
         let p = canonical(&cli).map_err(|e| anyhow!("--claude-cli {}: {e}", cli.display()))?;
+        // The adapter starts this file directly (no shell); Windows can't start scripts that way.
+        let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if !p.is_file() {
+            bail!("--claude-cli {} is not a file", p.display());
+        }
+        if cfg!(windows) && ext != "exe" {
+            bail!(
+                "--claude-cli must be a program (.exe) on Windows: the Claude adapter starts it without a shell, so a script (.{ext}) can't run. If {} only sets variables (such as CLAUDE_CONFIG_DIR) and runs claude, pass those with --env instead.",
+                p.display()
+            );
+        }
         vars.insert("CLAUDE_CODE_EXECUTABLE".into(), p.to_string_lossy().to_string());
     }
     let shown: Vec<String> = vars.keys().cloned().collect();

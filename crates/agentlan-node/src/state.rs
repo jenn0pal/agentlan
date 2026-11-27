@@ -560,7 +560,6 @@ impl NodeState {
         Ok(())
     }
 
-    /// Terminal outcome for a submit: update the cached result and drop the row together.
     /// A request's send result as it stands now (the hub's verdict may have arrived since
     /// the request was committed).
     fn current_sent(&self, r: &SendResult) -> SendResult {
@@ -575,6 +574,7 @@ impl NodeState {
         }
     }
 
+    /// Terminal outcome for a submit: update the cached result and drop the row together.
     fn settle_submit(&mut self, msg_id: &str, remote: RemoteResult) -> Result<()> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let r = (|| -> Result<()> {
@@ -954,12 +954,14 @@ impl NodeState {
 
     fn notify(&mut self, agent: &str, env: &Amf) -> Result<()> {
         self.maybe_wake(agent, env)?;
-        self.offer_to_waiters(agent, env)?;
+        // `surfaced`: a waiting call (wait_for_message / request) already took it, so the
+        // agent has it in hand and live delivery needn't point at it.
+        let surfaced = self.offer_to_waiters(agent, env)?;
         let handle = self.profiles.iter().find(|p| p.agent_id == agent).map(|p| self.handle_of(p)).unwrap_or_default();
         for (id, c) in &self.conns {
             let wants = c.attached.as_deref() == Some(agent) || matches!(&c.watch, Some(None)) || matches!(&c.watch, Some(Some(a)) if a == agent);
             if wants {
-                self.push(*id, "message", json!({"recipient": agent, "recipientHandle": handle, "message": env}));
+                self.push(*id, "message", json!({"recipient": agent, "recipientHandle": handle, "message": env, "surfaced": surfaced}));
             }
         }
         Ok(())
@@ -1618,16 +1620,23 @@ impl NodeState {
                 Some(_) => (vec![], true),
                 None => return Err(IpcErr("INVALID", format!("bad handle '{handle}'"))),
             },
-            Target::Role { role, project, .. } => (
-                self.profiles
+            Target::Role { role, project, .. } => {
+                let c: Vec<AgentProfile> = self
+                    .profiles
                     .iter()
                     .filter(|p| attached_match(p, &|p| &p.role == role && project.as_ref().is_none_or(|pr| agentlan_proto::ids::project_matches(p.project.as_deref(), pr))))
                     .cloned()
-                    .collect(),
-                true,
-            ),
+                    .collect();
+                let c = match project {
+                    Some(pr) => agentlan_proto::ids::prefer_exact_project(c, pr, |p| p.project.as_deref()),
+                    None => c,
+                };
+                (c, true)
+            }
             Target::Project { project, .. } => {
-                (self.profiles.iter().filter(|p| attached_match(p, &|p| agentlan_proto::ids::project_matches(p.project.as_deref(), project))).cloned().collect(), true)
+                let c: Vec<AgentProfile> =
+                    self.profiles.iter().filter(|p| attached_match(p, &|p| agentlan_proto::ids::project_matches(p.project.as_deref(), project))).cloned().collect();
+                (agentlan_proto::ids::prefer_exact_project(c, project, |p| p.project.as_deref()), true)
             }
             Target::Machine { machine } => {
                 if machine == &self.cfg.machine_id || machine == &self.cfg.alias {
@@ -1677,6 +1686,13 @@ impl NodeState {
                 let mut cands: Vec<AgentProfile> =
                     self.profiles.iter().filter(|p| p.agent_id != sender.agent_id && matches(p) && self.wake_enabled(&p.agent_id).is_some()).cloned().collect();
                 cands.retain(|p| self.pair_paused(&sender.agent_id, &p.agent_id).ok().flatten().is_none());
+                let want = match &env.to {
+                    Target::Role { project: Some(pr), .. } | Target::Project { project: pr, .. } => Some(pr.clone()),
+                    _ => None,
+                };
+                if let Some(w) = want {
+                    cands = agentlan_proto::ids::prefer_exact_project(cands, &w, |p| p.project.as_deref());
+                }
                 if let Some(p) = cands.into_iter().next() {
                     local = vec![p];
                 }

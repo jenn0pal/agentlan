@@ -271,7 +271,8 @@ enum WakeCmd {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
         /// Claude Code only: run your own Claude CLI (sets CLAUDE_CODE_EXECUTABLE). It must take
-        /// Claude's normal arguments (an .exe/.cmd or script that passes them through).
+        /// Claude's normal arguments. On Windows it must be an .exe (scripts can't be started
+        /// without a shell); for a wrapper that only sets variables, use --env instead.
         #[arg(long, value_name = "PATH")]
         claude_cli: Option<PathBuf>,
     },
@@ -292,6 +293,13 @@ enum DevCmd {
     FakeAcp {
         #[arg(long)]
         log: PathBuf,
+    },
+    /// Live delivery into a Codex thread (the same path the MCP adapter uses).
+    CodexInject {
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        text: String,
     },
 }
 
@@ -713,6 +721,10 @@ async fn run(cmd: Cmd, home: &Path) -> Result<()> {
             WakeCmd::Now { name } => wakecli::now(home, &name).await?,
         },
         Cmd::Dev { cmd: DevCmd::FakeAcp { log } } => wakecli::fake_acp(&log)?,
+        Cmd::Dev { cmd: DevCmd::CodexInject { thread, text } } => {
+            let how = agentlan_mcp::live::codex_inject(&thread, &text).await?;
+            println!("delivered via {how}");
+        }
         Cmd::Thread { cmd: ThreadCmd::Ls } => {
             let v = call(home, IpcOp::Status).await?;
             let p = v["pausedThreads"].as_array().cloned().unwrap_or_default();
